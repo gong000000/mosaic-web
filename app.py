@@ -1,13 +1,14 @@
+"""개인정보 보호 선택적 모자이크 웹 앱 (Streamlit + YOLO11-seg + VLM)
+영상을 업로드하면 VLM이 개인정보 항목(얼굴, 차량번호판, 주소, 차량동승자 등)을
+탐지하고, 사용자가 선택한 항목에만 모자이크를 적용한다."""
 import os
 import time
-import itertools
 import tempfile
 import cv2
 import streamlit as st
 
-from src.config import CANDS, OUTPUT_DIR
-from src.prompts import parse_korean_prompt, warn_abstract, GUIDE
-from src.clothing import hist_corr
+from src.config import CANDS, PRESETS, OUTPUT_DIR, KO
+from src.prompts import warn_abstract, GUIDE
 from src.preview import analyze_first_frame
 from src.render import trim_video, cleanup_tmp
 from src.models import get_model
@@ -15,46 +16,261 @@ from src.pipeline import mosaic_video
 from src import history as H
 from src import retention as RT
 
-KO = {
-    "green shirt": "초록 셔츠",
-    "white sleeveless vest": "흰 민소매",
-    "white blazer": "흰 재킷",
-    "beige plaid shirt": "베이지 체크",
-    "striped sweater": "줄무늬 니트",
-    "red shirt": "빨간 셔츠",
-    "blue shirt": "파란 셔츠",
-    "black shirt": "검정 셔츠",
-    "dark navy uniform": "짙은 제복",
-    "light skin": "흰 피부",
-    "dark skin": "검은 피부",
-    "yellow skin": "노란 피부",
-}
 
-WORLD_KO = {
-    "hat": "모자", "cap": "모자", "beanie": "비니",
-    "glasses": "안경", "sunglasses": "선글라스",
-    "umbrella": "우산", "safety helmet": "안전모", "hard hat": "안전모",
-    "helmet": "헬멧", "red helmet": "빨간 안전모",
-    "face mask": "마스크", "scarf": "목도리", "gloves": "장갑",
-    "backpack": "가방", "bag": "가방", "handbag": "가방",
-    "tie": "넥타이", "necktie": "넥타이",
-    "headphones": "이어폰", "earphones": "이어폰",
-    "green shirt": "초록 셔츠", "red shirt": "빨간 셔츠", "blue shirt": "파란 셔츠",
-    "black shirt": "검정 셔츠", "white vest": "흰 조끼", "white blazer": "흰 재킷",
-    "plaid shirt": "체크 셔츠", "striped sweater": "줄무늬 니트", "navy uniform": "짙은 제복",
-}
+st.set_page_config(
+    page_title="개인정보 보호 모자이크",
+    page_icon="🔒",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-
-def _ko(name):
-    return KO.get(name, WORLD_KO.get(name, name))
-
-st.set_page_config(page_title="프롬프트 모자이크", layout="wide")
 st.markdown(
-    "<style>"
-    ".block-container{max-width:1080px;padding-top:2rem}"
-    "video{border-radius:12px}"
-    ".stButton>button[kind='primary']{border-radius:10px;padding:.6rem 1.4rem}"
-    "</style>",
+    """
+    <style>
+    :root {
+        --primary: #8b5cf6;
+        --primary-hover: #7c3aed;
+        --accent: #06b6d4;
+        --bg: #0b0f19;
+        --card: #131a2b;
+        --text: #f1f5f9;
+        --muted: #94a3b8;
+        --border: #334155;
+        --success: #22c55e;
+        --warning: #f59e0b;
+    }
+
+    .block-container {
+        max-width: 1150px;
+        padding-top: 1.5rem;
+        padding-bottom: 3rem;
+    }
+
+    .stApp {
+        background: #0a0a0f;
+        background-image:
+          linear-gradient(rgba(18, 16, 16, 0.5) 50%, transparent 50%),
+          linear-gradient(90deg, rgba(18, 16, 16, 0.5) 50%, transparent 50%);
+        background-size: 20px 20px;
+        background-attachment: fixed;
+    }
+
+    .main {
+        background: transparent;
+    }
+
+    h1, h2, h3 {
+        color: var(--text) !important;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+    }
+
+    /* 헤더 카드 */
+    .header-card {
+        background: rgba(15, 15, 25, 0.8);
+        border: 1px solid rgba(99, 102, 241, 0.3);
+        border-radius: 16px;
+        padding: 2rem;
+        margin-bottom: 2rem;
+        box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3), 0 8px 10px -6px rgba(99, 102, 241, 0.2);
+        position: relative;
+    }
+
+    .header-title {
+        font-size: 2rem;
+        font-weight: 800;
+        color: var(--text);
+        margin: 0 0 0.5rem 0;
+        position: relative;
+        z-index: 1;
+        text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+    }
+
+    .header-subtitle {
+        color: var(--muted);
+        font-size: 1rem;
+        margin: 0;
+        position: relative;
+        z-index: 1;
+    }
+
+    /* 사이드바 */
+    .stSidebar {
+        background: var(--card) !important;
+        border-right: 1px solid var(--border);
+    }
+
+    .stSidebar .stMarkdown, .stSidebar .stCaption {
+        color: var(--muted) !important;
+    }
+
+    .stSidebar h2, .stSidebar h3 {
+        color: var(--text) !important;
+        font-size: 0.85rem;
+        margin-top: 1.5rem;
+        margin-bottom: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-weight: 600;
+    }
+
+    .stSidebar .stSelectbox, .stSidebar .stMultiselect, .stSidebar .stSlider, .stSidebar .stRadio {
+        margin-bottom: 1rem;
+    }
+
+    .stSidebar .stButton > button {
+        background: var(--primary);
+        color: white;
+        border: none;
+        border-radius: 8px;
+        padding: 0.6rem 1rem;
+        font-weight: 600;
+        width: 100%;
+    }
+
+    .stSidebar .stButton > button:hover {
+        background: var(--primary-hover);
+    }
+
+    .stSidebar .stTextInput > div > div > input {
+        background: #0f172a;
+        border: 1px solid var(--border);
+        color: var(--text);
+        border-radius: 8px;
+    }
+
+    .stSidebar .stTextInput > div > div > input:focus {
+        border-color: var(--primary);
+        box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
+    }
+
+    .stSidebar .stCheckbox > div {
+        color: var(--text);
+    }
+
+    /* 버튼 */
+    .stButton > button[kind="primary"] {
+        background: linear-gradient(135deg, var(--primary) 0%, var(--accent) 100%);
+        color: white;
+        border: none;
+        border-radius: 10px;
+        padding: 0.75rem 1.5rem;
+        font-weight: 600;
+        font-size: 1rem;
+        width: 100%;
+        box-shadow: 0 4px 6px -1px rgba(99, 102, 241, 0.3);
+    }
+
+    .stButton > button[kind="primary"]:hover {
+        background: linear-gradient(135deg, var(--primary-hover) 0%, #0891b2 100%);
+        box-shadow: 0 8px 10px -6px rgba(99, 102, 241, 0.4);
+    }
+
+    .stButton > button[kind="primary"]:disabled {
+        background: var(--border);
+        color: var(--muted);
+        box-shadow: none;
+    }
+
+    /* 카드 */
+    .info-card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 1.25rem;
+        margin-bottom: 1rem;
+        transition: all 0.2s ease;
+    }
+
+    .info-card:hover {
+        border-color: var(--primary);
+        box-shadow: 0 4px 6px -1px rgba(99, 102, 241, 0.2);
+    }
+
+    .info-card h3 {
+        color: var(--text);
+        margin: 0 0 0.5rem 0;
+        font-size: 1rem;
+    }
+
+    .info-card p {
+        color: var(--muted);
+        margin: 0;
+        font-size: 0.9rem;
+    }
+
+    /* 타겟 선택 */
+    .stMultiSelect > div > div {
+        background: #0f172a;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+    }
+
+    .stMultiSelect > div > div > div {
+        color: var(--text);
+    }
+
+    /* 파일 업로더 */
+    .stFileUploader {
+        background: var(--card);
+        border: 2px dashed var(--border);
+        border-radius: 12px;
+        padding: 2rem;
+        text-align: center;
+        margin-bottom: 1rem;
+        transition: all 0.2s ease;
+    }
+
+    .stFileUploader:hover {
+        border-color: var(--primary);
+        background: #131a2b;
+    }
+
+    .stFileUploader > div {
+        color: var(--text);
+    }
+
+    /* 진행률 */
+    .stProgress > div > div {
+        background: linear-gradient(90deg, var(--primary) 0%, var(--accent) 100%);
+    }
+
+    /* 비디오 */
+    .stVideo > div {
+        border-radius: 12px;
+        overflow: hidden;
+        border: 1px solid var(--border);
+        background: #000;
+        box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3);
+    }
+
+    /* 구분선 */
+    .stDivider {
+        margin: 1.5rem 0;
+        border-color: var(--border);
+    }
+
+    /* expander */
+    .streamlit-expanderHeader {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        color: var(--text);
+    }
+
+    .streamlit-expanderContent {
+        background: #0f172a;
+        border: 1px solid var(--border);
+        border-top: none;
+        border-radius: 0 0 8px 8px;
+    }
+
+    /* 숨길 요소 */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    </style>
+    """,
     unsafe_allow_html=True,
 )
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -65,53 +281,56 @@ def load_model_cached(name):
     return get_model(name)
 
 
-st.title("프롬프트 모자이크")
-st.caption("문장으로 골라 가리는 영상 모자이크 · 외부 전송 없음, 이 PC에서만 처리")
+st.markdown(
+    """
+    <div class="header-card">
+        <h1 class="header-title">🔒 개인정보 보호 모자이크</h1>
+        <p class="header-subtitle">영상에서 개인정보(얼굴, 차량번호판, 주소, 차량동승자)를 자동 탐지하고 모자이크하는 웹 앱 · 이 PC에서만 처리</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 purged = RT.purge_old()
 if purged:
     st.caption(f"24시간 지난 결과 {purged}개 자동 삭제됨")
 
+
 with st.sidebar:
     st.header("설정")
 
-    def _fill_prompt(t):
-        st.session_state["prompt_raw"] = t
+    st.subheader("1. 영상 업로드")
+    uploaded = st.file_uploader("mp4, mov, avi", type=["mp4", "mov", "avi"])
 
-    if "prompt_raw" not in st.session_state:
-        st.session_state["prompt_raw"] = "초록 셔츠 입은 사람 모자이크해줘"
-    prompt_raw = st.text_input(
-        "지시문", key="prompt_raw",
-        help=GUIDE,
-    )
-    w = warn_abstract(prompt_raw)
-    if w:
-        st.warning(w)
-    with st.expander("지시문 예시"):
-        for ex in ("초록 셔츠 입은 사람 모자이크해줘",
-                   "빨간 옷 입은 사람만 모자이크해줘",
-                   "모자 쓴 사람 가려줘",
-                   "흰옷 입은 사람 제외하고 모두 가려줘"):
-            st.button(ex, key=f"ex_{ex}", on_click=_fill_prompt, args=(ex,))
-    st.divider()
-    auto_target, auto_inv, auto_note = parse_korean_prompt(prompt_raw)
-    if auto_note:
-        st.caption(auto_note)
-    from src.world import is_fallback_targets, open_phrases_for_raw
-    world_only = bool(open_phrases_for_raw(prompt_raw)) and is_fallback_targets(prompt_raw, auto_target)
-    if world_only:
-        st.caption("색 선택은 비워둬도 된다. 열린 말은 월드가 본다.")
+    st.subheader("2. 개인정보 탐지 방식")
+    use_vlm = st.checkbox("VLM 사용 (OpenAI API 키 필요)", value=True,
+                          help="OpenAI API 키를 입력하면 VLM이 영상을 보고 개인정보를 더 정확히 탐지합니다.")
+    api_key = ""
+    if use_vlm:
+        api_key = st.text_input("OpenAI API 키", type="password", key="vlm_key",
+                                help="영상은 절대 외부로 전송되지 않으며, 첫 프레임만 전송됩니다.")
+
+    st.subheader("3. 가릴 항목 선택")
+    st.caption("VLM이 탐지한 항목 중에서 가릴 대상을 선택하세요.")
     targets = st.multiselect(
-        "가릴 옷 (여러 개 가능)", CANDS,
-        default=[] if world_only else ([t for t in auto_target if t in CANDS] or [CANDS[0]]),
+        "가릴 항목 (여러 개 가능)",
+        CANDS,
+        default=["face", "license_plate"],
         format_func=lambda x: KO.get(x, x),
     )
-    if not targets and not world_only:
-        targets = [CANDS[0]]
-    target = targets
-    invert = st.checkbox("고른 옷 제외하고 모두 가리기", value=auto_inv)
-    judge_label = st.radio("판정 방식", ["자동(권장)", "색 규칙", "월드 검출"], index=0,
-                           help="자동: 색·피부는 규칙, 안경·우산·모자·안전모는 월드 검출. 모두 이 PC에서 돈다.")
-    world_mode = {"자동(권장)": "auto", "색 규칙": "heuristic", "월드 검출": "world"}[judge_label]
+    if not targets:
+        targets = ["face"]
+
+    st.subheader("4. 속도 모드")
+    speed_label = st.radio("속도", ["빠름", "보통", "정밀"], index=1,
+                           help="빠름: 키프레임 1개만 탐지 / 보통: 간격 탐지 / 정밀: 모든 프레임 탐지")
+    speed_map = {
+        "빠름": ("yolo11n-seg.pt", 480, "veryfast", 1),
+        "보통": ("yolo11m-seg.pt", 640, "veryfast", 5),
+        "정밀": ("yolo11x-seg.pt", 960, "slow", 1),
+    }
+    model_name, imgsz, encode_preset, keyframe_stride = speed_map[speed_label]
+
+    st.subheader("5. 모자이크 설정")
     area_label = st.selectbox("가리는 범위", ["전체", "상반신", "얼굴만"], index=0)
     area_mode = {"전체": "full", "상반신": "upper", "얼굴만": "face_only"}[area_label]
     style_label = st.selectbox("모자이크 모양", ["모자이크", "흐리게", "검게"], index=0)
@@ -124,27 +343,10 @@ with st.sidebar:
         blur = st.slider("흐림 정도", 21, 101, 61, step=2)
     else:
         blocks, blur = 30, 61
-    speed_label = st.radio("속도", ["빠름", "보통", "정밀"], index=1)
-    speed_map = {
-        "빠름": ("yolo11n-seg.pt", 480, "veryfast"),
-        "보통": ("yolo11m-seg.pt", 640, "veryfast"),
-        "정밀": ("yolo11x-seg.pt", 960, "slow"),
-    }
-    model_name, imgsz, encode_preset = speed_map[speed_label]
-    with st.expander("세부 조정"):
-        conf = st.slider("검출", 0.08, 0.60, 0.20,
-                         help="사람 찾기 민감도. 낮추면 멀리·작게 보이는 사람도 찾는데 "
-                              "간판 속 인물까지 사람으로 볼 수 있다.")
-        margin = st.slider("판정", 0.01, 0.20, 0.04,
-                           help="색 1등과 2등의 점수 차이. 낮추면 많이 가려지고(오탐↑), "
-                                "높이면 확실할 때만 가린다(미탐↑).")
-        key_stride = st.slider("키프레임 간격 (클수록 빠름)", 1, 10, 3,
-                               help="몇 프레임마다 판정할지. 클수록 1패스가 빠르다. "
-                                    "최종 렌더는 매 프레임이라 가림 품질은 같다.")
+
+    st.divider()
     auto_del = st.checkbox("받으면 결과 자동 삭제", value=False)
 
-st.subheader("1. 영상 올리기")
-uploaded = st.file_uploader("mp4, mov, avi", type=["mp4", "mov", "avi"])
 if not uploaded:
     st.stop()
 
@@ -179,28 +381,24 @@ with st.spinner("준비 중..."):
     ok, first = cap.read()
     cap.release()
 
-st.subheader("2. 대상 확인")
-ref_hists, ref_flags = [], []
-ref_bank, n_checked, ref_thresh_auto = None, 0, 0.82
+st.subheader("2. 개인정보 항목 확인")
 if ok:
     det = load_model_cached(model_name)
-    anno, persons = analyze_first_frame(first, det, conf, imgsz, targets, margin,
-                                        query_raw=prompt_raw, world_mode=world_mode)
+    anno, persons = analyze_first_frame(
+        first, det, conf=0.20, imgsz=imgsz,
+        query_raw="", targets=targets,
+        api_key=api_key if use_vlm else None,
+        vlm_model="gpt-4o-mini",
+        use_vlm=use_vlm,
+    )
     if persons:
-        st.write(f"사람 {len(persons)}명 찾음. 직접 고르면 그 사람만 처리한다.")
-        st.caption("첫 화면에 없어도 뒤에 나오는 사람은 처리 때 자동으로 판단한다.")
-        try:
-            from src.world import open_phrases_for_raw as _ops
-            _w = _ops(prompt_raw)
-            if _w and world_mode != "heuristic":
-                st.caption(f"‘{','.join(_w)}’는 월드 검출로 판단한다. 이 PC에서만 돈다.")
-        except Exception:
-            pass
-        st.image(cv2.cvtColor(anno, cv2.COLOR_BGR2RGB), caption="첫 화면 전체 (초록 번호=가려짐 후보)")
+        st.write(f"사람 {len(persons)}명 찾음. 아래에서 개인정보 항목을 선택하세요.")
+        st.image(cv2.cvtColor(anno, cv2.COLOR_BGR2RGB),
+                 caption="첫 화면 전체 (초록 번호=개인정보 탐지 후보)")
         for p in persons:
-            bi, crop, is_t, top1, hh = p["bi"], p["crop"], p["is_t"], p["top1"], p["hh"]
-            hits = p.get("hits", [])
-            badge = "가려짐" if ((not is_t) if invert else is_t) else "유지"
+            bi, crop, is_t, top1, hits = p["bi"], p["crop"], p["is_t"], p["top1"], p["hits"]
+            badge = "가려짐" if is_t else "유지"
+            hits_str = ", ".join([KO.get(h, h) for h in hits]) if hits else "탐지 안 됨"
             c1, c2 = st.columns([1, 2])
             with c1:
                 try:
@@ -211,30 +409,11 @@ if ok:
                 st.image(cv2.cvtColor(disp, cv2.COLOR_BGR2RGB), width=200)
             with c2:
                 st.markdown(f"**사람 {bi+1} · {badge}**")
-                st.caption(f"추정: {_ko(top1)}" + (f" (해당: {', '.join(_ko(h) for h in hits)})" if hits else ""))
-                ck = st.checkbox(f"{bi+1}번 직접 지정", value=False, key=f"ck_{uploaded.name}_{bi}")
-            ref_hists.append(hh)
-            ref_flags.append(bool(ck))
-        n_checked = sum(1 for c in ref_flags if c)
-        if n_checked:
-            ref_bank = [(h, c) for h, c in zip(ref_hists, ref_flags)]
-            checked_hists = [h for h, c in ref_bank if c]
-            maxc = 0.0
-            nums = [i + 1 for i, c in enumerate(ref_flags) if c]
-            for a, b in itertools.combinations(range(len(checked_hists)), 2):
-                c = hist_corr(checked_hists[a], checked_hists[b])
-                maxc = max(maxc, c)
-                if c >= 0.82:
-                    st.warning(f"{nums[a]}번과 {nums[b]}번이 비슷하다. 한 명만 고르는 게 낫다.")
-            ref_thresh_auto = min(0.95, max(0.82, maxc + 0.05))
-            st.info(f"직접 지정 {n_checked}명 적용된다. 안 고른 사람은 제외 기준으로 함께 본다.")
-        else:
-            ref_thresh_auto = 0.82
+                st.caption(f"탐지 항목: {hits_str}")
     else:
-        st.warning("사람을 못 찾았다. 다른 영상으로 해봐라.")
-        ref_thresh_auto = 0.82
+        st.warning("사람을 찾지 못했다. 다른 영상으로 해봐라.")
 else:
-    ref_thresh_auto = 0.82
+    st.warning("영상을 읽을 수 없습니다.")
 
 st.subheader("3. 처리")
 run = st.button("모자이크 시작", type="primary")
@@ -257,14 +436,18 @@ def _pg(p, d, t, el):
 t_start = time.time()
 stats = {}
 with st.spinner("처리 중..."):
-    stats = mosaic_video(proc_in, out_path, target=targets, invert=invert, conf=conf,
-                 margin=margin, model_name=model_name, imgsz=imgsz,
-                 blocks=blocks, style=style, blur=blur,
-                 ultra=(speed_label == "정밀"), area_mode=area_mode,
-                 ref_bank=ref_bank,
-                 ref_thresh=ref_thresh_auto, keyframe_stride=key_stride,
-                 encode_preset=encode_preset, progress_fn=_pg, query_raw=prompt_raw,
-                 world_mode=world_mode) or {}
+    stats = mosaic_video(
+        proc_in, out_path,
+        targets=targets, invert=False, conf=0.20,
+        model_name=model_name, imgsz=imgsz,
+        blocks=blocks, style=style, blur=blur,
+        ultra=(speed_label == "정밀"), area_mode=area_mode,
+        keyframe_stride=keyframe_stride,
+        encode_preset=encode_preset, progress_fn=_pg,
+        query_raw="", api_key=api_key if use_vlm else None,
+        vlm_model="gpt-4o-mini",
+        use_vlm=use_vlm,
+    ) or {}
 elapsed = time.time() - t_start
 
 st.success(f"완료 · {elapsed:.1f}초 걸림")
@@ -280,21 +463,25 @@ for tid, v in sorted(stats.items()):
             except Exception:
                 pass
     with c2:
-        st.write(f"사람 {tid} · {'가려짐' if v.get('mosaic') else '유지'}")
-try:
-    _sels = [v.get("selector", "heuristic") for v in stats.values()]
-    _sel = max(set(_sels), key=_sels.count) if _sels else "heuristic"
-except Exception:
-    _sel = "heuristic-ref" if ref_bank else "heuristic"
-H.add(uploaded.name, prompt_raw, target, invert, out_name, elapsed,
-      query_raw=prompt_raw, selector=_sel,
+        st.write(f"추적 {tid} · {'가려짐' if v.get('mosaic') else '유지'}")
+H.add(uploaded.name, "", target, False, out_name, elapsed,
+      query_raw="",
+      selector=("vlm" if use_vlm else "world"),
       summary=f"{final_n}명 가려짐")
+st.markdown(
+    """
+    <div class="info-card">
+        <h3 style="margin-top:0;">📊 결과 비교</h3>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 c1, c2 = st.columns(2)
 with c1:
-    st.write("원본")
+    st.markdown("**📹 원본**")
     st.video(proc_in, format="video/mp4")
 with c2:
-    st.write("결과")
+    st.markdown("**🔒 모자이크 적용**")
     st.video(out_path, format="video/mp4")
 clicked = False
 with open(out_path, "rb") as f:

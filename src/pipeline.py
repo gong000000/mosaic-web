@@ -1,4 +1,7 @@
-"""2패스 파이프라인. 1패스는 점수 수집, 투표로 확정. 단일 임계값 없음."""
+"""2패스 파이프라인 (개인정보 보호용).
+1패스는 VLM/월드 개인정보 탐지 결과 수집, 중앙값으로 확정.
+2패스는 확정 라벨로 렌더만.
+"""
 import cv2
 import numpy as np
 import time
@@ -7,28 +10,36 @@ from .models import get_model
 
 
 def _reset_tracker(model):
-    """pass 사이에 추적기 상태 초기화. 같은 파일 2회 추적 시 ID 어긋남 방지."""
     try:
         pred = getattr(model, "predictor", None)
         if pred is not None and hasattr(pred, "trackers"):
             delattr(pred, "trackers")
     except Exception:
         pass
+
+
 from .detect import filter_contained, big_enough
 from .render import render_person_strict, mux_audio_h264, apply_area_limit, cleanup_tmp
-from .select import HybridSelector
+from .select import VLMSelector, WorldSelector
 
 
 class MosaicJob:
-    """모자이크 작업 1건. 설정+모델+분류기를 객체에 묶는다."""
+    """개인정보 보호 모자이크 작업 1건."""
 
-    def __init__(self, input_path, output_path, target="green shirt", invert=False, conf=0.15, margin=0.04, model_name="yolo11m-seg.pt", imgsz=960, blocks=30, style="pixel", blur=61, ultra=True, area_mode="full", ref_hists=None, ref_bank=None, ref_thresh=0.82, ref_margin=0.05, encode_preset="veryfast", keyframe_stride=3, query_raw="", world_mode="auto", world_conf=None, world_imgsz=None):
+    def __init__(self, input_path, output_path, targets=None, invert=False,
+                 conf=0.15, model_name="yolo11m-seg.pt", imgsz=960,
+                 blocks=30, style="pixel", blur=61, ultra=True,
+                 area_mode="full", encode_preset="veryfast",
+                 keyframe_stride=3, query_raw="",
+                 api_key=None, vlm_model="gpt-4o-mini", use_vlm=False,
+                 world_mode="auto"):
         self.input_path = input_path
         self.output_path = output_path
-        self.target = target
+        self.targets = [targets] if isinstance(targets, str) else (list(targets) if targets else ["face"])
+        if not self.targets:
+            self.targets = ["face"]
         self.invert = invert
         self.conf = conf
-        self.margin = margin
         self.model_name = model_name
         self.imgsz = imgsz
         self.blocks = blocks
@@ -36,24 +47,18 @@ class MosaicJob:
         self.blur = blur
         self.ultra = ultra
         self.area_mode = area_mode
-        self.ref_hists = ref_hists
-        self.ref_bank = ref_bank
-        self.ref_thresh = ref_thresh
-        self.ref_margin = ref_margin
         self.encode_preset = encode_preset
         self.keyframe_stride = keyframe_stride
-        self.query_raw = query_raw or (target if isinstance(target, str) else "")
+        self.query_raw = query_raw or ""
+        self.api_key = api_key
+        self.vlm_model = vlm_model
+        self.use_vlm = use_vlm
         self.world_mode = world_mode
-        self.world_conf = world_conf
-        self.world_imgsz = world_imgsz
-        from .models import get_model as _gm
-        from .clothing import ClothingClassifier as _CC
-        self.model = _gm(model_name)
-        self.classifier = _CC(margin=margin)
+        self.model = get_model(model_name)
 
     def run(self, progress_fn=None):
         input_path, output_path = self.input_path, self.output_path
-        target = self.target
+        targets = self.targets
         invert = self.invert
         conf = self.conf
         model_name = self.model_name
@@ -63,23 +68,17 @@ class MosaicJob:
         blur = self.blur
         ultra = self.ultra
         area_mode = self.area_mode
-        ref_hists = self.ref_hists
-        ref_bank = self.ref_bank
-        if ref_bank is None and ref_hists:
-            ref_bank = [(h, True) for h in ref_hists]
-        ref_thresh = self.ref_thresh
-        ref_margin = self.ref_margin
         encode_preset = self.encode_preset
         keyframe_stride = self.keyframe_stride
-        model = self.model
-        """returns: {tid: {"mosaic": bool, "frames": int, "thumb": np.ndarray|None}}"""
+        query_raw = self.query_raw
+        api_key = self.api_key
+        vlm_model = self.vlm_model
+        use_vlm = self.use_vlm
+        world_mode = self.world_mode
+
         model = get_model(model_name)
         _reset_tracker(model)
-        targets = [target] if isinstance(target, str) else [t for t in target]
-        if not targets:
-            from .world import needs_world as _needs_world
-            if not _needs_world(self.query_raw):
-                targets = ["green shirt"]
+
         cap = cv2.VideoCapture(input_path)
         fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30
         W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -91,21 +90,24 @@ class MosaicJob:
             imgsz = max(imgsz, 960)
             conf = min(conf, 0.18)
 
-        use_ref = ref_bank is not None and len(ref_bank) > 0
-        selector = HybridSelector(targets, query_raw=self.query_raw, margin=self.margin,
-                                  ref_bank=ref_bank, ref_thresh=ref_thresh,
-                                  ref_margin=ref_margin, classifier=self.classifier,
-                                  world_mode=self.world_mode, world_conf=self.world_conf,
-                                  world_imgsz=self.world_imgsz, world_stride=1)
+        if use_vlm and api_key:
+            selector = VLMSelector(query_raw=query_raw, targets=targets,
+                                   api_key=api_key, vlm_model=vlm_model,
+                                   frame_stride=max(1, int(keyframe_stride)))
+        else:
+            from .select import WorldSelector
+            selector = WorldSelector(targets=targets, query_raw=query_raw,
+                                     conf=conf, imgsz=imgsz)
 
-        # ---- 1패스: 키프레임에서 트랙별 찬반 수집 (월드는 키프레임 1회만).
-        # vid_stride로 추적기 안에서 건너뛴다. 렌더(2패스)는 전프레임 그대로라 품질 동일.
+        # ---- 1패스: 키프레임에서 트랙별 개인정보 탐지 수집 ----
         votes = defaultdict(list)
         first_thumb = {}
         results1 = model.track(source=input_path, stream=True, persist=True,
-                               tracker="configs/bytetrack_stable.yaml", conf=conf, classes=[0],
-                               verbose=False, imgsz=imgsz, iou=0.5, max_det=30,
+                               tracker="configs/bytetrack_stable.yaml",
+                               conf=conf, classes=[0], verbose=False,
+                               imgsz=imgsz, iou=0.5, max_det=30,
                                vid_stride=max(1, int(keyframe_stride)))
+
         for r in results1:
             if r.boxes is None or len(r.boxes) == 0:
                 continue
@@ -122,6 +124,7 @@ class MosaicJob:
             ids = ids[keep]
             if masks_full is not None:
                 masks_full = masks_full[np.array(keep)]
+
             items = []
             for i, (x1, y1, x2, y2) in enumerate(boxes):
                 tid = int(ids[i])
@@ -142,23 +145,29 @@ class MosaicJob:
                     continue
                 items.append({"key": (tid, len(items)), "tid": tid,
                               "xyxy": [x1c, y1c, x2c, y2c], "crop": crop, "mc": mc})
-            judged = selector.judge_frame(r.orig_img, items)
-            for it in items:
-                _tid = it["tid"]
-                _hit, _detail = judged.get(it["key"], (False, {"selector": "heuristic"}))
-                votes[_tid].append({"hit": bool(_hit), "targets": _detail.get("hits", []),
-                                    "detail": _detail})
-                if _tid not in first_thumb:
-                    try:
-                        _crop = it["crop"]
-                        _th = cv2.resize(_crop, (96, max(1, int(96 * _crop.shape[0] / max(1, _crop.shape[1])))),
-                                       interpolation=cv2.INTER_AREA)
-                        first_thumb[_tid] = _th
-                    except Exception:
-                        first_thumb[_tid] = None
 
-        # ---- 전역 확정: 승자 판정이 전체 키프레임의 20% 이상이면 확정.
-        # 최고점 단일 기준은 쓰지 않는다. 경계 점수는 분율로 살린다. ----
+            judged = selector.select_first_frame(r.orig_img, items)
+            for it in items:
+                tid = it["tid"]
+                hit, detail = judged.get(it["key"], (False, {"selector": "world"}))
+                # VLM/월드 탐지 결과가 없어도 face 타겟이면 사람 얼굴 영역으로 간주
+                if not hit and "face" in targets:
+                    hit = True
+                    detail["hits"] = ["face"]
+                    detail["selector"] = "world-fallback"
+                    detail["world_match"] = {"phrase": "face", "conf": 1.0, "iou": 1.0, "source": "fallback"}
+                votes[tid].append({"hit": bool(hit), "targets": detail.get("hits", []),
+                                   "detail": detail})
+                if tid not in first_thumb:
+                    try:
+                        crop = it["crop"]
+                        th = cv2.resize(crop, (96, max(1, int(96 * crop.shape[0] / max(1, crop.shape[1])))),
+                                        interpolation=cv2.INTER_AREA)
+                        first_thumb[tid] = th
+                    except Exception:
+                        first_thumb[tid] = None
+
+        # ---- 전역 확정 ----
         global_on = {}
         global_hit_targets = {}
         global_detail = {}
@@ -177,7 +186,8 @@ class MosaicJob:
                             seen_t.add(t)
                             ht.append(t)
                 global_hit_targets[tid] = ht
-                samp = next((v["detail"] for v in lst if v["hit"]), (lst[0].get("detail", {}) if lst else {}))
+                samp = next((v["detail"] for v in lst if v["hit"]),
+                            (lst[0].get("detail", {}) if lst else {}))
                 global_detail[tid] = {"frac": round(float(frac), 3), "sample": samp}
 
         _reset_tracker(model)
@@ -197,8 +207,9 @@ class MosaicJob:
 
         t0 = time.time()
         results2 = model.track(source=input_path, stream=True, persist=True,
-                               tracker="configs/bytetrack_stable.yaml", conf=conf, classes=[0],
-                               verbose=False, imgsz=imgsz, iou=0.5, max_det=30)
+                               tracker="configs/bytetrack_stable.yaml",
+                               conf=conf, classes=[0], verbose=False,
+                               imgsz=imgsz, iou=0.5, max_det=30)
         done = 0
         for r in results2:
             frame = r.orig_img.copy()
@@ -252,7 +263,7 @@ class MosaicJob:
                     else:
                         mf = hist_mask.get(tid)
                     items.append((tid, x1, y1, x2, y2, should, mf))
-                # 유지 판정 마스크 합집합. 타겟 렌더에서 빼서 이웃 번짐 방지.
+
                 keep_union = None
                 for (_tid, _x1, _y1, _x2, _y2, _should, _mf) in items:
                     if _should or _mf is None:
@@ -263,6 +274,7 @@ class MosaicJob:
                         keep_union = b if keep_union is None else cv2.bitwise_or(keep_union, b)
                     except Exception:
                         pass
+
                 for (tid, x1, y1, x2, y2, should, mf) in items:
                     if not should:
                         continue
@@ -271,7 +283,8 @@ class MosaicJob:
                             mf = cv2.bitwise_and(mf, mf, mask=cv2.bitwise_not(keep_union))
                         except Exception:
                             pass
-                    render_person_strict(frame, x1, y1, x2, y2, mf, style, blocks, blur)
+                    render_person_strict(frame, x1, y1, x2, y2, mf,
+                                         style=style, blocks=blocks, blur=blur)
 
             for tid in list(smooth.keys()):
                 if tid in seen:
@@ -291,13 +304,15 @@ class MosaicJob:
                         _mf = cv2.bitwise_and(_mf, _mf, mask=cv2.bitwise_not(keep_union))
                     except Exception:
                         pass
-                render_person_strict(frame, x1, y1, x2, y2, _mf, style, blocks, blur)
+                render_person_strict(frame, x1, y1, x2, y2, _mf,
+                                     style=style, blocks=blocks, blur=blur)
 
             out.write(frame)
             done += 1
             if progress_fn and total > 0:
                 try:
-                    progress_fn(0.5 + 0.5 * min(1.0, done / max(1, total)), done, total, time.time() - t0)
+                    progress_fn(0.5 + 0.5 * min(1.0, done / max(1, total)),
+                                done, total, time.time() - t0)
                 except Exception:
                     pass
 
@@ -312,15 +327,13 @@ class MosaicJob:
 
         stats = {}
         for tid, lst in votes.items():
-            samp_sel = global_detail.get(tid, {}).get("sample", {}).get("selector",
-                        ("heuristic-ref" if use_ref else "heuristic"))
-            on = bool(global_on.get(tid, False))
+            samp_sel = global_detail.get(tid, {}).get("sample", {}).get("selector", "world")
             stats[tid] = {
-                "mosaic": (not on) if invert else on,
+                "mosaic": bool(global_on.get(tid, False)),
                 "frames": len(lst),
                 "thumb": first_thumb.get(tid),
                 "selector": samp_sel,
-                "query_raw": self.query_raw,
+                "query_raw": query_raw,
                 "targets": list(targets),
                 "hit_targets": global_hit_targets.get(tid, []),
                 "frac": global_detail.get(tid, {}).get("frac", 0.0),
@@ -329,7 +342,19 @@ class MosaicJob:
         return stats
 
 
-def mosaic_video(input_path, output_path, target="green shirt", invert=False, conf=0.15, margin=0.04, model_name="yolo11m-seg.pt", imgsz=960, blocks=30, style="pixel", blur=61, ultra=True, area_mode="full", ref_hists=None, ref_bank=None, ref_thresh=0.82, ref_margin=0.05, encode_preset="veryfast", keyframe_stride=3, progress_fn=None, query_raw="", world_mode="auto", world_conf=None, world_imgsz=None):
-    """호환 래퍼. 새 코드는 MosaicJob을 직접 쓴다."""
-    job = MosaicJob(input_path, output_path, target=target, invert=invert, conf=conf, margin=margin, model_name=model_name, imgsz=imgsz, blocks=blocks, style=style, blur=blur, ultra=ultra, area_mode=area_mode, ref_hists=ref_hists, ref_bank=ref_bank, ref_thresh=ref_thresh, ref_margin=ref_margin, encode_preset=encode_preset, keyframe_stride=keyframe_stride, query_raw=query_raw, world_mode=world_mode, world_conf=world_conf, world_imgsz=world_imgsz)
+def mosaic_video(input_path, output_path, targets=None, invert=False,
+                 conf=0.15, model_name="yolo11m-seg.pt", imgsz=960,
+                 blocks=30, style="pixel", blur=61, ultra=True,
+                 area_mode="full", encode_preset="veryfast",
+                 keyframe_stride=3, progress_fn=None,
+                 query_raw="", api_key=None, vlm_model="gpt-4o-mini",
+                 use_vlm=False, world_mode="auto"):
+    """호환 래퍼."""
+    job = MosaicJob(input_path, output_path, targets=targets, invert=invert,
+                    conf=conf, model_name=model_name, imgsz=imgsz,
+                    blocks=blocks, style=style, blur=blur, ultra=ultra,
+                    area_mode=area_mode, encode_preset=encode_preset,
+                    keyframe_stride=keyframe_stride, query_raw=query_raw,
+                    api_key=api_key, vlm_model=vlm_model,
+                    use_vlm=use_vlm, world_mode=world_mode)
     return job.run(progress_fn)

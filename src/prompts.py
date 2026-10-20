@@ -1,11 +1,9 @@
-"""한국어 프롬프트 파싱. 외부 전송 없음, 전부 로컬.
-LLM 없음. 정규화+유사어 사전+퍼지 매칭으로 오타·붙여쓰기까지 처리.
-반환: (target, invert, note)
-"""
-from .config import KOR2ENG, CANDS
+"""개인정보 보호 모자이크 - 지시문 파싱 (개인정보 항목만)
+외부 전송 없음, 전부 로컬."""
+from .config import CANDS
 
 INVERT_KEYS = ["제외", "빼고", "말고", "외에는", "외에", "빼고는", "남기고",
-               "안쓴", "없는", "미착용"]
+               "안쓴", "없는", "미탐지"]
 
 ABSTRACT_WORDS = [
     "수상한", "이상한", "위험한", "불량", "나쁜", "좋은", "예쁜", "멋진",
@@ -13,41 +11,31 @@ ABSTRACT_WORDS = [
 ]
 
 DOMAIN_PRESETS = {
-    "건설 현장": "안전모 안 쓴 사람 모자이크해줘",
-    "병원": "흰옷 입은 사람 제외하고 모두 가려줘",
-    "바디캠/공공": "경찰 제복 입은 사람 제외하고 모두 가려줘",
-    "크리에이터": "초록 셔츠 입은 사람 모자이크해줘",
+    "도로 CCTV": "차량번호판과 얼굴을 모자이크해줘",
+    "건설 현장": "근로자 얼굴을 모자이크해줘",
+    "병원": "환자 얼굴과 진료기록을 모자이크해줘",
+    "주차장": "차량번호판과顔を 모자이크해줘",
 }
 
 EXAMPLES = [
-    "초록 셔츠 입은 사람 모자이크해줘",
-    "빨간 옷 입은 사람만 모자이크해줘",
-    "흰옷 입은 사람 제외하고 모두 가려줘",
-    "줄무늬 입은 사람 모자이크해줘",
+    "얼굴과 차량번호판을 모자이크해줘",
+    "얼굴만 가려줘",
+    "주소가 적힌 간판을 가려줘",
+    "차량동승자 얼굴을 모자이크해줘",
 ]
 
 GUIDE = (
-    "색(초록/빨강/파랑/검정/흰)으로 쓰면 잘 맞는다. "
-    "예: '파란 셔츠 입은 사람'. 모자·안경·우산·안전모도 된다. "
+    "개인정보 항목을 선택해서 가립니다. "
+    "예: '얼굴과 차량번호판을 모자이크해줘'. "
     "추상적인 말(수상한, 이상한 행동)은 눈으로 못 구분해서 안 된다."
 )
 
-# 타겟별 유사어. 띄어쓰기 없는 형태도 자동 생성해서 붙여쓰기 대응.
 _SYN = {
-    "green shirt": ["초록", "그린", "녹색", "연두", "청록", "그린셔츠", "초록셔츠"],
-    "white sleeveless vest": ["흰", "하양", "하얀", "하얗", "화이트", "흰옷", "흰조끼", "민소매", "백의"],
-    "white blazer": ["블레이저", "정장", "자켓", "양복", "흰자켓"],
-    "beige plaid shirt": ["체크", "격자", "플래드", "격무늬", "체크셔츠"],
-    "striped sweater": ["줄무늬", "스트라이프", "단가라", "줄무늬니트"],
-    "red shirt": ["빨강", "빨간", "레드", "빨간옷", "적색"],
-    "blue shirt": ["파랑", "파란", "블루", "청색", "남색"],
-    "black shirt": ["검정", "까망", "블랙", "흑색", "검은"],
-    "dark navy uniform": ["제복", "유니폼", "경찰", "군인", "작업복", "유니폼옷"],
-    "light skin": ["백인", "흰피부", "하얀피부", "백피부", "화이트인"],
-    "dark skin": ["흑인", "검은피부", "흑피부", "블랙인"],
-    "yellow skin": ["황인", "황색피부", "노란피부", "동양인"],
+    "face": ["얼굴", "얼굴모자이크", "인물", "사람얼굴"],
+    "license_plate": ["차량번호", "번호판", "차번호", "차량번호판"],
+    "address": ["주소", "간판", "도로명", "건물번호", "주택번호"],
+    "passenger": ["동승자", "탑승자", "차안사람", "차량동승자"],
 }
-# 안전모/헬멧/모자/안경/우산은 색이 아니라 월드 검출로 본다. red로 매핑하지 않는다.
 
 
 def _norm(s: str) -> str:
@@ -62,10 +50,6 @@ def _expand_keywords():
             bag.add(k)
             bag.add(_norm(k))
         table[target] = sorted(bag, key=len, reverse=True)
-    # 구 KOR2ENG도 합치기 (호환)
-    for k, v in KOR2ENG.items():
-        if v in table and k not in table[v]:
-            table[v].append(k)
     return table
 
 
@@ -75,7 +59,7 @@ _SYN_TABLE = _expand_keywords()
 def warn_abstract(text: str):
     hits = [w for w in ABSTRACT_WORDS if w in (text or "")]
     if hits:
-        return f"추상적인 말({', '.join(hits)})은 영상으로 구분이 안 된다. 색·옷모양으로 바꿔봐라."
+        return f"추상적인 말({', '.join(hits)})은 영상으로 구분이 안 된다. 개인정보 항목으로 바꿔봐라."
     return ""
 
 
@@ -117,23 +101,13 @@ def parse_korean_prompt(text: str):
     invert = any(_norm(k) in ntext for k in INVERT_KEYS)
     found = targets_from_text(raw)
     if not found:
-        try:
-            from .world import open_phrases_for_raw
-            ops = open_phrases_for_raw(raw)
-        except Exception:
-            ops = []
-        if ops:
-            return ["green shirt"], invert, f"'{','.join(ops)}'는 월드 검출로 본다. 색 기본값(초록)은 무시된다."
-        return ["green shirt"], invert, "못 알아들었다. 아래 '가릴 옷'에서 직접 골라라."
+        return ["face"], invert, "못 알아들었다. 아래 '가릴 항목'에서 직접 골라라."
     targets = [t for t, _ in found]
     for t in targets:
         if t not in CANDS:
             CANDS.append(t)
     kws = ",".join(k for _, k in found)
-    if any(t in ("light skin", "dark skin", "yellow skin") for t, _ in found):
-        note = f"'{kws}'를 피부색으로 이해함."
-    else:
-        note = f"'{kws}'를 {','.join(targets)}로 이해함."
+    note = f"'{kws}'를 {','.join(targets)}로 이해함."
     return targets, invert, note
 
 
@@ -156,7 +130,7 @@ class PromptParser:
     def warn(self, text):
         hits = [w for w in self.abstract_words if w in (text or "")]
         if hits:
-            return f"추상적인 말({', '.join(hits)})은 영상으로 구분이 안 된다. 색·옷모양으로 바꿔봐라."
+            return f"추상적인 말({', '.join(hits)})은 영상으로 구분이 안 된다. 개인정보 항목으로 바꿔봐라."
         return ""
 
     def parse(self, text):
@@ -164,7 +138,7 @@ class PromptParser:
 
 
 def make_query(text, targets=None, invert=None, note="", used_llm=False):
-    """원문 보존용 쿼리. VLM은 매핑 결과가 아니라 이 raw를 본다."""
+    """원문 보존용 쿼리."""
     from .select import PromptQuery
     raw = text or ""
     if targets is None or invert is None:

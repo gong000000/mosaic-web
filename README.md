@@ -43,6 +43,9 @@ docs/
    ```
    py -m streamlit run app.py
    ```
+  cd C:\Users\gong0000\Desktop\mosaic-web
+  .\.venv\Scripts\Activate.ps1
+  py -m streamlit run app.py --server.port 8501
 
 중요:
 - `.venv/`는 이미 `.gitignore`에 있어 올리지 않는다. 팀원 각자 2번에서 생성한다.
