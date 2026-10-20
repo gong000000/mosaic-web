@@ -464,7 +464,7 @@ for tid, v in sorted(stats.items()):
                 pass
     with c2:
         st.write(f"추적 {tid} · {'가려짐' if v.get('mosaic') else '유지'}")
-H.add(uploaded.name, "", target, False, out_name, elapsed,
+H.add(uploaded.name, "", targets[0] if targets else "", False, out_name, elapsed,
       query_raw="",
       selector=("vlm" if use_vlm else "world"),
       summary=f"{final_n}명 가려짐")
