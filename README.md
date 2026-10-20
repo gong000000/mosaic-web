@@ -26,10 +26,25 @@ docs/
   night-street-table.md 밤 영상 HSV 쏠림 기록
 ```
 
-## 실행 (Python 3.12 고정. 시스템 3.13 `py`로는 안 된다)
-```
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-py -m streamlit run app.py
-```
+## 실행 (팀원 공유 절차)
+
+1. 이 저장소를 clone 또는 다운로드 받는다.
+2. Python 3.12 가상환경을 만든다. (팀원 각자 로컬에서 생성, git에 올리지 않음)
+   ```
+   py -3.12 -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   ```
+3. 필요한 라이브러리를 설치한다.
+   ```
+   pip install -r requirements.txt
+   ```
+   (GPU가 없는 저사양 PC는 `requirements-cpu.txt`를 대신 사용)
+4. 실행한다.
+   ```
+   py -m streamlit run app.py
+   ```
+
+중요:
+- `.venv/`는 이미 `.gitignore`에 있어 올리지 않는다. 팀원 각자 2번에서 생성한다.
+- `src/retention.py` 같은 `src/` 안 파일은 직접 실행하지 않는다. `app.py`를 통해 streamlit으로 실행한다.
+- 첫 실행에 YOLO-World 가중치(약 370MB)를 자동으로 받아온다. 로컬에서만 처리되며 영상은 외부로 전송되지 않는다.

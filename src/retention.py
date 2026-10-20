@@ -2,7 +2,11 @@
 영상 프레임 외부 전송 없음. 전부 로컬 처리."""
 import os
 import time
-from .config import OUTPUT_DIR
+try:
+    from .config import OUTPUT_DIR
+except ImportError:
+    # src/retention.py를 직접 실행할 때를 위한 절대 import fallback
+    from config import OUTPUT_DIR
 
 
 class RetentionPolicy:

@@ -3,3 +3,4 @@ __pycache__/
 *.pt
 outputs/*.mp4
 outputs/jobs.json
+/docs/
