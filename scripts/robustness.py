@@ -71,14 +71,6 @@ def t_black_video():
     os.remove(path)
 
 
-def t_parse_edges():
-    from src.prompts import parse_korean_prompt as p
-    for q in ["", "ㅁㄴㅇㄹ", "모자이크해줘", "초록, 빨강", "안전모 안 쓴 사람",
-              "흰옷 입은 사람 제외하고 모두 가려줘", "백화점 앞에서 춤추는 사람"]:
-        t, i, n = p(q)
-        assert isinstance(t, list) and len(t) >= 1 and isinstance(n, str)
-
-
 def t_world_only_empty_targets():
     from src.select import HybridSelector
     import numpy as np
@@ -101,7 +93,6 @@ def main():
     fails += check("preview-0person", t_preview_no_person)
     fails += check("preview-closeup", t_preview_closeup)
     fails += check("black-video", t_black_video)
-    fails += check("parse-edges", t_parse_edges)
     fails += check("world-empty-targets", t_world_only_empty_targets)
     fails += check("vlm-package-empty", t_vlm_package_empty)
     print("ROBUSTNESS_PASS" if fails == 0 else f"ROBUSTNESS_FAIL {fails}건")

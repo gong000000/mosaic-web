@@ -8,7 +8,6 @@ import cv2
 import streamlit as st
 
 from src.config import CANDS, PRESETS, OUTPUT_DIR, KO
-from src.prompts import warn_abstract, GUIDE
 from src.preview import analyze_first_frame
 from src.render import trim_video, cleanup_tmp
 from src.models import get_model
@@ -302,12 +301,9 @@ with st.sidebar:
     uploaded = st.file_uploader("mp4, mov, avi", type=["mp4", "mov", "avi"])
 
     st.subheader("2. 개인정보 탐지 방식")
-    use_vlm = st.checkbox("VLM 사용 (OpenAI API 키 필요)", value=True,
-                          help="OpenAI API 키를 입력하면 VLM이 영상을 보고 개인정보를 더 정확히 탐지합니다.")
-    api_key = ""
-    if use_vlm:
-        api_key = st.text_input("OpenAI API 키", type="password", key="vlm_key",
-                                help="영상은 절대 외부로 전송되지 않으며, 첫 프레임만 전송됩니다.")
+    use_vlm = True
+    api_key = st.text_input("OpenAI API 키", type="password", key="vlm_key",
+                            help="영상은 절대 외부로 전송되지 않으며, 첫 프레임만 전송됩니다.")
 
     st.subheader("3. 가릴 항목 선택")
     st.caption("VLM이 탐지한 항목 중에서 가릴 대상을 선택하세요.")
@@ -387,9 +383,9 @@ if ok:
     anno, persons = analyze_first_frame(
         first, det, conf=0.20, imgsz=imgsz,
         query_raw="", targets=targets,
-        api_key=api_key if use_vlm else None,
+        api_key=api_key,
         vlm_model="gpt-4o-mini",
-        use_vlm=use_vlm,
+        use_vlm=True,
     )
     if persons:
         st.write(f"사람 {len(persons)}명 찾음. 아래에서 개인정보 항목을 선택하세요.")
@@ -446,7 +442,7 @@ with st.spinner("처리 중..."):
         encode_preset=encode_preset, progress_fn=_pg,
         query_raw="", api_key=api_key if use_vlm else None,
         vlm_model="gpt-4o-mini",
-        use_vlm=use_vlm,
+        use_vlm=True,
     ) or {}
 elapsed = time.time() - t_start
 
@@ -466,7 +462,7 @@ for tid, v in sorted(stats.items()):
         st.write(f"추적 {tid} · {'가려짐' if v.get('mosaic') else '유지'}")
 H.add(uploaded.name, "", targets[0] if targets else "", False, out_name, elapsed,
       query_raw="",
-      selector=("vlm" if use_vlm else "world"),
+      selector="vlm",
       summary=f"{final_n}명 가려짐")
 st.markdown(
     """
