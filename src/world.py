@@ -3,12 +3,14 @@
 
 - 로컬 실행. 외부 전송 없음.
 - 사람 마스크는 seg 모델이 맡고, 월드는 문구에 해당하는 박스만 찾는다.
-- 키프레임·첫 화면 1회에만 ground()를 호출한다.
-- 가중치 로드 실패 시 available()=False를 반환하고 폴백한다.
+- VLM을 쓸 수 없을 때(키 없음/호출 실패) 폴백으로 호출된다.
+- 가중치 로드 실패 시 available()=False를 반환하고 빈 결과를 준다.
 """
 import os
 
-WORLD_WEIGHTS = os.path.join("weights", "yolov8s-world.pt")
+WORLD_WEIGHTS = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "weights", "yolov8s-world.pt")
 WORLD_IMGSZ = 640
 WORLD_CONF = 0.20
 
@@ -18,53 +20,38 @@ PRIVACY_PHRASES = {
     "license_plate": ["license plate", "car plate", "number plate"],
     "address": ["address plate", "signboard", "door plate", "street sign"],
     "passenger": ["passenger", "person in car", "person inside vehicle"],
+    "name_tag": ["name tag", "badge", "employee badge"],
+    "id_card": ["id card", "identity card", "document"],
+    "tattoo": ["tattoo"],
+    "phone_screen": ["cell phone screen", "smartphone screen"],
 }
 
-# 한국어 조각 → 월드 문구
-OPEN_KEYWORDS = [
-    ("얼굴", ["face", "person face"]),
-    ("차량번호", ["license plate", "car plate"]),
-    ("번호판", ["license plate", "number plate"]),
-    ("주소", ["address", "signboard"]),
-    ("간판", ["signboard"]),
-    ("동승자", ["passenger"]),
-    ("탑승자", ["passenger"]),
-]
+_PHRASE_TO_CAT = {}
+for _cat, _phrases in PRIVACY_PHRASES.items():
+    for _p in _phrases:
+        _PHRASE_TO_CAT[_p.lower()] = _cat
 
 
-def _norm(s):
-    return (s or "").replace(" ", "").replace(" ", "")
+def category_for_phrase(phrase):
+    """월드가 돌려준 문구를 표준 카테고리로 되돌린다."""
+    return _PHRASE_TO_CAT.get(str(phrase or "").lower())
 
 
-def open_phrases_for_raw(raw):
-    """원문에서 열린 문구 추출. [(한국어, [영문...])]."""
-    ntext = _norm(raw).replace("모자이크", "")
-    out, seen = [], set()
-    for ko, ens in sorted(OPEN_KEYWORDS, key=lambda x: -len(x[0])):
-        if ko and _norm(ko) in ntext:
-            for e in ens:
-                if e not in seen:
-                    seen.add(e)
-                    out.append(e)
-    return out
-
-
-def needs_world(query_raw, targets=None):
-    """자동 모드에서 월드를 쓸지."""
-    return len(open_phrases_for_raw(query_raw)) > 0
-
-
-def phrases_for_query(query_raw, targets=None, world_mode="auto"):
-    """월드 set_classes에 넣을 문구 목록. 최대 8개."""
-    ops = open_phrases_for_raw(query_raw)
-    if world_mode == "world":
-        extra = []
-        for t in targets or []:
-            for e in PRIVACY_PHRASES.get(t, []):
-                if e not in ops and e not in extra:
-                    extra.append(e)
-        return (ops + extra)[:8]
-    return ops[:8]
+def phrases_for_categories(cats, limit=10):
+    """카테고리 목록 → 월드 문구 목록.
+    카테고리마다 첫 문구를 먼저 넣어 모든 카테고리가 최소 1개씩 포함되게 한다.
+    """
+    cats = list(cats or [])
+    out = []
+    for cat in cats:
+        ps = PRIVACY_PHRASES.get(cat, [])
+        if ps and ps[0] not in out:
+            out.append(ps[0])
+    for cat in cats:
+        for p in PRIVACY_PHRASES.get(cat, []):
+            if p not in out:
+                out.append(p)
+    return out[:limit]
 
 
 class WorldStore:
@@ -74,6 +61,7 @@ class WorldStore:
         self.weights = weights
         self._model = None
         self._ok = None
+        self._classes = None
 
     def available(self):
         if self._ok is not None:
@@ -89,10 +77,14 @@ class WorldStore:
 
     def ground(self, frame_bgr, phrases, conf=WORLD_CONF, imgsz=WORLD_IMGSZ):
         """returns [{xyxy:[x1,y1,x2,y2], conf, phrase}]."""
+        phrases = list(phrases or [])
         if not phrases or not self.available():
             return []
         try:
-            self._model.set_classes(list(phrases))
+            # 같은 문구 조합이면 텍스트 임베딩을 다시 만들지 않는다.
+            if tuple(phrases) != self._classes:
+                self._model.set_classes(phrases)
+                self._classes = tuple(phrases)
             r = list(self._model.predict(source=frame_bgr, conf=conf,
                                          verbose=False, imgsz=imgsz))[0]
             if r.boxes is None or len(r.boxes) == 0:
@@ -106,7 +98,8 @@ class WorldStore:
                 x1, y1, x2, y2 = (int(v) for v in xy[i])
                 out.append({"xyxy": [x1, y1, x2, y2],
                             "conf": round(float(cf[i]), 3),
-                            "phrase": str(names.get(int(cl[i]), int(cl[i])))})
+                            "phrase": str(names.get(int(cl[i]), int(cl[i]))),
+                            "source": "world"})
             return out
         except Exception:
             return []
@@ -150,11 +143,10 @@ def match_box(person_xyxy, world_boxes, iou_thresh=0.12, expand=0.03):
         iou = _iou(person_xyxy, wb["xyxy"])
         inside = (ex1 <= cx <= ex2) and (ey1 <= cy <= ey2)
         if inside or iou >= iou_thresh:
-            if wb["conf"] >= (best["conf"] if best else -1.0):
+            wc = float(wb.get("conf", 0.0) or 0.0)
+            bc = float(best.get("conf", 0.0) or 0.0) if best else -1.0
+            if wc >= bc:
                 best, best_iou = wb, iou
     if best is None:
         return False, None, 0.0
     return True, best, round(float(best_iou), 3)
-
-
-FACE_ITEMS = {"face", "person face", "human face"}

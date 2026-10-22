@@ -37,7 +37,7 @@ class JobHistory:
             "invert": bool(invert),
             "file": out_name,
             "sec": round(float(seconds), 1),
-            "selector": selector or "heuristic",
+            "selector": selector or "vlm",
             "summary": summary or "",
         })
         self._save(rows)

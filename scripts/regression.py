@@ -25,7 +25,7 @@ def main():
         s = mosaic_video(FACE, TMP, targets=[tgt], conf=0.20,
                          model_name="yolo11m-seg.pt", imgsz=640,
                          ultra=False, keyframe_stride=3, query_raw="회귀")
-        got = {k: v["mosaic"] for k, v in sorted(s.items())}
+        got = {k: v["mosaic"] for k, v in s.items() if isinstance(k, int)}
         if got == exp:
             print(f"OK {tgt} {got}")
         else:

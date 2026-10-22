@@ -1,199 +1,119 @@
-"""개인정보 보호 판정 인터페이스. VLM(개인정보 탐지)이 중심이다.
-- VLMSelector: OpenAI VLM 기반 개인정보 탐지. 첫 프레임 1회 또는 모든 프레임.
-- WorldSelector: YOLO-World 폴백. 외부 전송 없음.
-- HybridSelector: VLM 우선, 실패 시 월드 폴백.
-판정 결과는 (hit: bool, detail: dict). detail은 JSON 직렬화 가능해야 함.
+"""VLM 기반 판정 인터페이스.
+영상 프레임을 VLM에 전송하여 개인정보 항목을 탐지하고, 사람 박스와 매칭한다.
+API 키가 없거나 VLM 호출이 실패하면 로컬 YOLO-World로 폴백한다.
 """
-from dataclasses import dataclass, field
+from .config import (CATEGORY_TYPE, VLM_MODEL, canon_category, category_type,
+                     label_ko)
 
 
-@dataclass
-class PromptQuery:
-    """원문 보존용. VLM은 매핑된 CANDS가 아니라 raw를 본다."""
-    raw: str = ""
-    targets: list = field(default_factory=lambda: ["face"])
-    invert: bool = False
-    note: str = ""
-    used_vlm: bool = False
+class VLMSelector:
+    """VLM 기반 판정기.
 
-
-class BaseSelector:
-    name = "base"
-
-    def judge(self, crop_bgr, mask_crop=None):
-        """returns (hit: bool, detail: dict)."""
-        raise NotImplementedError
-
-
-class VLMSelector(BaseSelector):
-    """VLM 기반 개인정보 판정. 첫 프레임 1회 또는 모든 프레임 탐지."""
+    API 키가 있으면 VLM(OpenAI)이 판단하고, 없거나 실패하면
+    로컬 YOLO-World로 폴백한다. 두 결과 모두 사람 박스와 매칭해 사용한다.
+    """
 
     name = "vlm"
-    FIRST_FRAME_ONLY = True
 
     def __init__(self, query_raw="", targets=None, api_key=None,
-                 vlm_model="gpt-4o-mini", frame_stride=1):
+                 vlm_model=VLM_MODEL, include_all=True):
         self.query_raw = query_raw or ""
         self.targets = [targets] if isinstance(targets, str) else (list(targets) if targets else ["face"])
-        self.api_key = api_key
+        self.api_key = str(api_key or "").strip()
         self.vlm_model = vlm_model
-        self.frame_stride = max(1, int(frame_stride))
-        self._calls = 0
-        self._last_boxes = []
-        self._vlm_available = bool(api_key)
+        self.include_all = bool(include_all)
+        self._vlm_available = bool(self.api_key)
 
-    def judge(self, crop_bgr, mask_crop=None):
-        raise NotImplementedError("VLMSelector는 judge_frame을 사용해야 합니다.")
-
-    def select_first_frame(self, frame_bgr, items):
-        """첫 프레임에서 VLM으로 개인정보 항목을 탐지한다.
-        returns {key: (hit: bool, detail: dict)}
-        """
+    def detect_boxes(self, frame_bgr):
+        """프레임 1장에서 프롬프트 대상 + 추가 개인정보 후보 박스를 모두 얻는다."""
         from .vlm_package import detect_with_vlm, fallback_world
-        from .world import match_box
 
-        out = {}
-        if not items:
-            return out
-
-        self._calls += 1
-        world_boxes = []
-        if self._vlm_available and self.api_key:
-            world_boxes = detect_with_vlm(frame_bgr, self.targets, self.api_key,
-                                          model=self.vlm_model)
-            if not world_boxes:
-                world_boxes = fallback_world(frame_bgr, self.targets)
+        if self._vlm_available:
+            boxes = detect_with_vlm(frame_bgr, self.targets, self.api_key,
+                                    model=self.vlm_model,
+                                    query_raw=self.query_raw,
+                                    include_all=self.include_all)
+            if not boxes:
+                boxes = fallback_world(frame_bgr, self.targets,
+                                       query_raw=self.query_raw,
+                                       include_all=self.include_all)
         else:
-            world_boxes = fallback_world(frame_bgr, self.targets)
+            boxes = fallback_world(frame_bgr, self.targets,
+                                   query_raw=self.query_raw,
+                                   include_all=self.include_all)
+        return boxes
 
-        self._last_boxes = world_boxes
-
-        for it in items:
-            key = it["key"]
-            hit, best, iou = match_box(it["xyxy"], world_boxes)
-
-            detail = {
-                "selector": "vlm" if self._vlm_available else "world",
-                "targets": list(self.targets),
-                "hits": [],
-                "world_hit": bool(hit),
-                "world_boxes": len(world_boxes),
-            }
-            if best is not None:
-                detail["world_match"] = {
-                    "phrase": best["phrase"],
-                    "conf": best["conf"],
-                    "iou": iou,
-                    "source": best.get("source", "world")
-                }
-                if hit:
-                    detail["hits"].append(best["phrase"])
-
-            out[key] = (bool(hit), detail)
-
-        return out
-
-    def judge_frame(self, frame_bgr, items, frame_idx=0):
-        """frame 단위 판정. frame_stride마다 VLM 호출.
-        returns {key: (hit, detail)}
+    def match_items(self, items, world_boxes):
+        """이미 얻은 VLM/월드 박스를 사람 아이템에 매칭한다.
+        배경(region) 박스는 사람 카테고리 판정에서 제외한다.
+        items: [{key, xyxy, ...}]. returns {key: (hit, detail)}.
         """
         out = {}
         if not items:
             return out
 
-        self._calls += 1
-        world_boxes = []
-        if (self._calls - 1) % self.frame_stride == 0:
-            if self._vlm_available and self.api_key:
-                world_boxes = detect_with_vlm(frame_bgr, self.targets, self.api_key,
-                                              model=self.vlm_model)
-                if not world_boxes:
-                    world_boxes = fallback_world(frame_bgr, self.targets)
-            else:
-                world_boxes = fallback_world(frame_bgr, self.targets)
-            self._last_boxes = world_boxes
-        else:
-            world_boxes = self._last_boxes
-
         from .world import match_box
         for it in items:
-            key = it["key"]
-            hit, best, iou = match_box(it["xyxy"], world_boxes)
+            hits = []
+            best = None
+            best_iou = 0.0
+            for box in world_boxes or []:
+                cat = canon_category(box.get("category") or box.get("phrase"))
+                rtype = box.get("region_type")
+                if cat in CATEGORY_TYPE:
+                    rtype = CATEGORY_TYPE[cat]     # 표준 카테고리는 설정이 우선
+                elif rtype not in ("person", "region"):
+                    rtype = category_type(cat)
+                if rtype != "person":
+                    continue
+                hit, matched, iou = match_box(it["xyxy"], [box])
+                if not hit:
+                    continue
+                if cat not in hits:
+                    hits.append(cat)
+                if best is None or (matched.get("conf", 0.5)
+                                    > best.get("conf", 0.5)):
+                    best = matched
+                    best_iou = iou
+
+            # 얼굴 타겟이면 다른 항목이 잡혔더라도 사람 얼굴 후보를 함께 올린다.
+            # (seg 모델이 사람을 찾았으면 얼굴도 있다고 보는 보수적 폴백)
+            if "face" in self.targets and "face" not in hits:
+                hits.append("face")
+                if best is None:
+                    best = {"xyxy": list(it["xyxy"]), "conf": 1.0,
+                            "phrase": "face", "category": "face",
+                            "source": "fallback"}
+                    best_iou = 1.0
 
             detail = {
-                "selector": "vlm" if self._vlm_available else "world",
+                "selector": ("vlm" if (self._vlm_available and
+                                       any(b.get("source") == "vlm"
+                                           for b in (world_boxes or [])))
+                             else "world"),
                 "targets": list(self.targets),
-                "hits": [],
-                "world_hit": bool(hit),
-                "world_boxes": len(world_boxes),
+                "hits": hits,
+                "world_hit": bool(hits),
+                "world_boxes": len(world_boxes or []),
             }
             if best is not None:
+                cat = canon_category(best.get("category") or best.get("phrase"))
                 detail["world_match"] = {
-                    "phrase": best["phrase"],
-                    "conf": best["conf"],
-                    "iou": iou,
-                    "source": best.get("source", "world")
+                    "phrase": best.get("phrase", ""),
+                    "category": cat,
+                    "label_ko": label_ko(cat),
+                    "conf": best.get("conf", 0.5),
+                    "iou": best_iou,
+                    "source": best.get("source", "world"),
                 }
-                if hit:
-                    detail["hits"].append(best["phrase"])
-
-            out[key] = (bool(hit), detail)
-
-        return out
-
-
-class WorldSelector(BaseSelector):
-    """YOLO-World 기반 판정 (VLM 폴백용)."""
-
-    name = "world"
-
-    def __init__(self, targets=None, query_raw="", conf=0.20, imgsz=640):
-        self.targets = [targets] if isinstance(targets, str) else (list(targets) if targets else ["face"])
-        self.query_raw = query_raw or ""
-        self.conf = conf
-        self.imgsz = imgsz
-        self._calls = 0
-        self._last_boxes = []
-
-    def judge(self, crop_bgr, mask_crop=None):
-        raise NotImplementedError("WorldSelector는 judge_frame을 사용해야 합니다.")
-
-    def select_first_frame(self, frame_bgr, items):
-        from .vlm_package import fallback_world
-        from .world import match_box
-
-        out = {}
-        if not items:
-            return out
-
-        self._calls += 1
-        world_boxes = fallback_world(frame_bgr, self.targets, conf=self.conf, imgsz=self.imgsz)
-        self._last_boxes = world_boxes
-
-        for it in items:
-            key = it["key"]
-            hit, best, iou = match_box(it["xyxy"], world_boxes)
-
-            detail = {
-                "selector": "world",
-                "targets": list(self.targets),
-                "hits": [],
-                "world_hit": bool(hit),
-                "world_boxes": len(world_boxes),
-            }
-            if best is not None:
-                detail["world_match"] = {
-                    "phrase": best["phrase"],
-                    "conf": best["conf"],
-                    "iou": iou,
-                    "source": best.get("source", "world")
-                }
-                if hit:
-                    detail["hits"].append(best["phrase"])
-
-            out[key] = (bool(hit), detail)
+            out[it["key"]] = (bool(hits), detail)
 
         return out
 
     def judge_frame(self, frame_bgr, items):
-        return self.select_first_frame(frame_bgr, items)
+        """frame 1장에 대해 일괄 판정. items: [{key, xyxy}].
+        returns {key: (hit: bool, detail: dict)}.
+        """
+        if not items:
+            return {}
+        return self.match_items(items, self.detect_boxes(frame_bgr))

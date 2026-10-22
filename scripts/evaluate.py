@@ -4,7 +4,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import cv2
 from src.models import get_model
-from src.select import WorldSelector
+from src.select import VLMSelector
 
 
 def main(video, model_name="yolo11m-seg.pt", conf=0.20, target="face"):
@@ -21,25 +21,13 @@ def main(video, model_name="yolo11m-seg.pt", conf=0.20, target="face"):
     if n == 0:
         return 0
     boxes = pr.boxes.xyxy.cpu().numpy().astype(int)
-    masks = None
-    try:
-        if pr.masks is not None:
-            masks = pr.masks.data.cpu().numpy()
-    except Exception:
-        masks = None
-    sel = WorldSelector([target])
+    sel = VLMSelector(targets=[target], include_all=False)
     for bi, (x1, y1, x2, y2) in enumerate(boxes):
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(first.shape[1], x2), min(first.shape[0], y2)
-        crop = first[y1:y2, x1:x2]
-        if crop.size == 0:
+        if x2 - x1 < 4 or y2 - y1 < 4:
             continue
-        mc = None
-        if masks is not None and bi < len(masks):
-            m = cv2.resize(masks[bi], (first.shape[1], first.shape[0]))
-            m = (m > 0.5).astype("uint8") * 255
-            mc = m[y1:y2, x1:x2]
-        result = sel.judge_frame(first, [{"key": bi, "xyxy": [x1, y1, x2, y2], "crop": crop, "mc": mc}])
+        result = sel.judge_frame(first, [{"key": bi, "xyxy": [x1, y1, x2, y2]}])
         hit, detail = result.get(bi, (False, {"selector": "world"}))
         # VLM/월드 탐지 결과가 없어도 face 타겟이면 사람 얼굴 영역으로 간주
         if not hit and target == "face":
