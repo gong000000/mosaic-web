@@ -1,11 +1,11 @@
 """보관 정책. 업로드 24시간 경과/다운로드 시 자동 삭제.
-영상 프레임 외부 전송 없음. 전부 로컬 처리."""
+영상 파일은 로컬에만 저장된다. (VLM 사용 시 판정용 프레임만 외부 전송)"""
 import os
 import time
 try:
     from .config import OUTPUT_DIR
 except ImportError:
-    # src/retention.py를 직접 실행할 때를 위한 절대 import fallback
+    # src/retention.py를 직접 실행할 때를 위한 절대 import 처리
     from config import OUTPUT_DIR
 
 

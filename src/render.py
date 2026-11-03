@@ -6,8 +6,15 @@ import numpy as np
 import imageio_ffmpeg
 
 
+def mosaic_block_size(w, h, blocks=30):
+    """강도(blocks)에 따른 정사각 블록 크기(px). 클수록 더 강하게 가린다."""
+    strength = max(1, int(blocks))
+    div = max(2.0, 180.0 / strength)
+    return max(2, int(round(min(w, h) / div)))
+
+
 def render_mosaic(roi, style="pixel", blocks=30, blur=61):
-    """기본 모자이크 타일. 호환용으로 남김."""
+    """기본 모자이크 타일."""
     h, w = roi.shape[:2]
     if style == "solid":
         return np.zeros_like(roi)
@@ -18,8 +25,10 @@ def render_mosaic(roi, style="pixel", blocks=30, blur=61):
         return cv2.GaussianBlur(b, (k, k), 0)
     if h < 4 or w < 4:
         return roi
-    gw, gh = max(1, w // blocks), max(1, h // blocks)
-    small = cv2.resize(roi, (max(1, w // gw), max(1, h // gh)), interpolation=cv2.INTER_LINEAR)
+    # 가로로 긴 번호판도 세로 디테일이 남지 않도록 정사각 블록으로 만든다.
+    bs = mosaic_block_size(w, h, blocks)
+    sw, sh = max(1, w // bs), max(1, h // bs)
+    small = cv2.resize(roi, (sw, sh), interpolation=cv2.INTER_AREA)
     return cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
 
 
@@ -39,27 +48,53 @@ def feather_mask(mask_u8, guide_bgr=None):
 
 
 def mux_audio_h264(video_noaudio, audio_src, output_path, preset="veryfast"):
+    """무음 영상에 원본 오디오를 입혀 H.264 MP4로 저장한다.
+    실패하면 RuntimeError를 내서 호출부가 원본(무음)으로 대체하게 한다."""
     ff = imageio_ffmpeg.get_ffmpeg_exe()
+    cleanup_tmp(output_path)
     cmd = [ff, "-y", "-i", video_noaudio, "-i", audio_src,
            "-c:v", "libx264", "-preset", preset, "-crf", "20",
            "-pix_fmt", "yuv420p", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
            "-c:a", "aac", "-shortest", "-movflags", "+faststart", output_path]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       check=False)
+    if (r.returncode != 0 or not os.path.exists(output_path)
+            or os.path.getsize(output_path) == 0):
+        cleanup_tmp(output_path)
+        raise RuntimeError("ffmpeg 오디오 믹싱 실패")
+    return output_path
 
 
 def trim_video(input_path, output_path, start_sec=0.0, end_sec=None):
-    if (not start_sec or start_sec <= 0) and (end_sec is None or end_sec <= 0):
+    """구간 자르기. 스트림 복사(-c copy)는 키프레임 사이를 자르면
+    영상 트랙이 통째로 빠질 수 있어서 재인코딩한다.
+    실패하면 RuntimeError를 낸다(원본 전체를 처리하는 사고 방지)."""
+    start = max(0.0, float(start_sec or 0.0))
+    end = None if end_sec is None else float(end_sec)
+    if end is not None and end <= start:
+        end = None
+    if start <= 0 and (end is None or end <= 0):
         import shutil
         shutil.copy(input_path, output_path)
         return output_path
+
     ff = imageio_ffmpeg.get_ffmpeg_exe()
-    cmd = [ff, "-y", "-i", input_path]
-    if start_sec and start_sec > 0:
-        cmd += ["-ss", str(float(start_sec))]
-    if end_sec and end_sec > 0:
-        cmd += ["-to", str(float(end_sec))]
-    cmd += ["-c", "copy", output_path]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    cleanup_tmp(output_path)
+    cmd = [ff, "-y"]
+    if start > 0:
+        cmd += ["-ss", f"{start:.3f}"]
+    cmd += ["-i", input_path]
+    if end is not None and end > 0:
+        cmd += ["-t", f"{end - start:.3f}"]
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart",
+            output_path]
+    r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       check=False)
+    if (r.returncode != 0 or not os.path.exists(output_path)
+            or os.path.getsize(output_path) == 0):
+        cleanup_tmp(output_path)
+        raise RuntimeError("ffmpeg 구간 자르기 실패")
     return output_path
 
 
@@ -79,6 +114,28 @@ def cleanup_tmp(*paths):
                 os.unlink(p)
         except Exception:
             pass
+
+
+def render_region(frame, x1, y1, x2, y2, style="pixel", blocks=30, blur=61, pad=6):
+    """사람과 무관한 배경 영역(번호판·간판·문서 등)을 사각형으로 가린다."""
+    x1c, y1c = max(0, int(x1) - pad), max(0, int(y1) - pad)
+    x2c, y2c = min(frame.shape[1], int(x2) + pad), min(frame.shape[0], int(y2) + pad)
+    if x2c - x1c < 8 or y2c - y1c < 8:
+        return False
+    roi = frame[y1c:y2c, x1c:x2c]
+    mos = render_mosaic(roi, style=style, blocks=blocks, blur=blur)
+    # 경계가 튀지 않도록 1px 테두리만 부드럽게 섞는다.
+    try:
+        m = np.ones(roi.shape[:2], dtype=np.float32)
+        m[:1, :] = 0.6
+        m[-1:, :] = 0.6
+        m[:, :1] = 0.6
+        m[:, -1:] = 0.6
+        m = m[..., None]
+        frame[y1c:y2c, x1c:x2c] = (mos * m + roi * (1 - m)).astype(np.uint8)
+    except Exception:
+        frame[y1c:y2c, x1c:x2c] = mos
+    return True
 
 
 def render_person_strict(frame, x1, y1, x2, y2, mask_full_or_None, style="pixel", blocks=30, blur=61):
@@ -113,7 +170,7 @@ def render_person_strict(frame, x1, y1, x2, y2, mask_full_or_None, style="pixel"
                 0, 0, 360, 255, -1)
     fb = cv2.GaussianBlur(fb, (15, 15), 0)
     roi_f = frame[y1c:fy2, x1c:x2c]
-    mos = render_mosaic(roi_f, style=style, blocks=max(12, blocks // 2), blur=blur)
+    mos = render_mosaic(roi_f, style=style, blocks=blocks, blur=blur)
     mf = (fb.astype(float) / 255.0)[..., None]
     frame[y1c:fy2, x1c:x2c] = (mos * mf + roi_f * (1 - mf)).astype(np.uint8)
     return True

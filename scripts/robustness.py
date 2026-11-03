@@ -1,6 +1,8 @@
 """강건성 검사. 엣지 입력에도 죽지 않으면 통과. 전체 처리 없이 빠르게.
+VLM 호출은 스텁으로 바꿔 키 없이 검사한다.
 실행: .\\.venv\\Scripts\\python.exe scripts\\robustness.py
 """
+import contextlib
 import os
 import sys
 
@@ -8,6 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 FACE = r"C:\Users\gong0000\Downloads\face.mp4"
 YTDOWN = r"C:\Users\gong0000\Downloads\YTDown.com_YouTube_Media__VuJA-VQRcY_Central-Cee-Doja-Official-Music-Video_002_720p.mp4"
+TMP = os.path.join(os.environ.get("TEMP", "."), "mosaic_robust_black.mp4")
 
 
 def check(name, fn):
@@ -20,72 +23,306 @@ def check(name, fn):
     return 0
 
 
+@contextlib.contextmanager
+def fake_vlm(fn):
+    """preview/select가 참조하는 detect_with_vlm을 모두 스텁으로 바꾼다."""
+    import src.vlm_package as vp
+    import src.preview as pv
+    real_vp = vp.detect_with_vlm
+    real_pv = pv.detect_with_vlm
+    vp.detect_with_vlm = fn
+    pv.detect_with_vlm = fn
+    try:
+        yield
+    finally:
+        vp.detect_with_vlm = real_vp
+        pv.detect_with_vlm = real_pv
+
+
+def _empty(frame, phrases, api_key, **kwargs):
+    return []
+
+
+def _face_box(frame, phrases, api_key, **kwargs):
+    h, w = frame.shape[:2]
+    return [{
+        "category": "face", "label_ko": "얼굴",
+        "xyxy": [int(w * 0.10), int(h * 0.10),
+                 int(w * 0.40), int(h * 0.45)],
+        "conf": 0.9, "matches_prompt": True,
+        "region_type": "person", "source": "vlm",
+    }]
+
+
 def t_preview_no_person():
     import cv2
     from src.models import get_model
-    from src.preview import analyze_first_frame
+    from src.preview import analyze_first_frame_items
     if not os.path.exists(YTDOWN):
         return
     cap = cv2.VideoCapture(YTDOWN)
     ok, fr = cap.read()
     cap.release()
     assert ok
-    anno, persons = analyze_first_frame(fr, get_model("yolo11n-seg.pt"),
-                                        0.20, 480, ["green shirt"], 0.04,
-                                        query_raw="초록")
-    assert isinstance(anno, type(fr)) and isinstance(persons, list)
+    with fake_vlm(_empty):
+        anno, persons, items = analyze_first_frame_items(
+            fr, get_model("yolo11n-seg.pt"), 0.20, 480,
+            query_raw="초록", targets=["green shirt"], api_key="fake-key")
+    assert isinstance(anno, type(fr))
+    assert isinstance(persons, list) and isinstance(items, list)
 
 
 def t_preview_closeup():
     import cv2
     from src.models import get_model
-    from src.preview import analyze_first_frame
-    cap = cv2.VideoCapture(r"C:\Users\gong0000\Downloads\Video Project 6.mp4")
+    from src.preview import analyze_first_frame_items
+    if not os.path.exists(FACE):
+        return
+    cap = cv2.VideoCapture(FACE)
     ok, fr = cap.read()
     cap.release()
     assert ok
-    anno, persons = analyze_first_frame(fr, get_model("yolo11m-seg.pt"),
-                                        0.20, 640, ["white sleeveless vest"], 0.04,
-                                        query_raw="흰 나시")
+    with fake_vlm(_face_box):
+        anno, persons, items = analyze_first_frame_items(
+            fr, get_model("yolo11m-seg.pt"), 0.20, 640,
+            query_raw="얼굴", targets=["face"], api_key="fake-key")
+    assert isinstance(anno, type(fr)) and isinstance(persons, list)
     assert len(persons) >= 1
     assert all("detail" in p for p in persons)
+    # VLM이 찾은 얼굴만 체크리스트에 올라와야 한다.
+    assert any(it["category"] == "face" for it in items)
 
 
 def t_black_video():
     import cv2
     import numpy as np
-    from src.preview import analyze_first_frame
     from src.models import get_model
-    path = r"C:\Users\gong0000\AppData\Local\Temp\opencode\black.mp4"
-    out = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), 30, (320, 240))
-    for _ in range(10):
-        out.write(np.zeros((240, 320, 3), np.uint8))
-    out.release()
-    cap = cv2.VideoCapture(path)
-    ok, fr = cap.read()
-    cap.release()
-    assert ok
-    anno, persons = analyze_first_frame(fr, get_model("yolo11n-seg.pt"),
-                                        0.20, 480, ["green shirt"], 0.04)
+    from src.preview import analyze_video
+    os.makedirs(os.path.dirname(TMP), exist_ok=True)
+    vw = cv2.VideoWriter(TMP, cv2.VideoWriter_fourcc(*"mp4v"), 10.0,
+                         (100, 100))
+    for _ in range(5):
+        vw.write(np.zeros((100, 100, 3), np.uint8))
+    vw.release()
+    with fake_vlm(_empty):
+        anno, persons, items = analyze_video(
+            TMP, get_model("yolo11n-seg.pt"), 0.20, 480,
+            query_raw="아무것도", targets=["face"], api_key="fake-key")
+    assert anno is None or anno.shape[2] == 3
     assert persons == []
-    os.remove(path)
+    assert items == []
+    try:
+        os.remove(TMP)
+    except OSError:
+        pass
 
 
-def t_world_only_empty_targets():
-    from src.select import HybridSelector
+def t_vlm_parse_and_normalize():
+    from src.vlm_package import _normalize_item, _parse_json_array
+    assert _parse_json_array("") == []
+    assert _parse_json_array("```json\n[{\"a\": 1}]\n```") == [{"a": 1}]
+    assert _parse_json_array("설명 [1, 2] 뒤") == [1, 2]
+    assert _parse_json_array("not json") is None
+    # 출력 한도에서 잘린 배열은 완전한 객체만 살린다.
+    truncated = ('[{"category":"face","bbox":[0.1,0.2,0.3,0.4]},'
+                 '{"category":"license_plate","bbox":[0.5,0.6,0.7,0.8]},'
+                 '{"category":"face","bbox":[0.9,')
+    salvaged = _parse_json_array(truncated)
+    assert isinstance(salvaged, list) and len(salvaged) == 2
+    assert salvaged[1]["category"] == "license_plate"
+
+    item = {"category": "license_plate", "bbox": [0.1, 0.1, 0.5, 0.5],
+            "coord": "norm", "matches_prompt": "false",
+            "region_type": "REGION", "conf": "0.9"}
+    norm = _normalize_item(item, 100, 200, 1.0, "번호판")
+    assert norm is not None
+    assert norm["category"] == "license_plate"
+    assert norm["xyxy"] == [10, 20, 50, 100]
+    assert norm["matches_prompt"] is False
+    assert norm["region_type"] == "region"
+    assert abs(norm["conf"] - 0.9) < 1e-6
+
+    # Gemini식 0~1000 정규화 + box_2d([ymin,xmin,ymax,xmax])
+    item2 = {"category": "license_plate", "bbox": [100, 100, 500, 500],
+             "coord": "norm"}
+    assert _normalize_item(item2, 100, 200, 1.0, "")["xyxy"] == \
+        [10, 20, 50, 100]
+    item3 = {"category": "face", "box_2d": [100, 200, 500, 600]}
+    assert _normalize_item(item3, 1000, 1000, 1.0, "",
+                           coord_default="gemini")["xyxy"] == \
+        [200, 100, 600, 500]
+
+    # 축소 전송본 기준 픽셀 좌표는 scale을 곱한다.
+    item4 = {"category": "face", "bbox": [10, 20, 50, 60],
+             "coord": "pixel"}
+    assert _normalize_item(item4, 100, 200, 2.0, "")["xyxy"] == \
+        [20, 40, 100, 120]
+
+    # 문신은 어떤 응답이 와도 항목으로 만들지 않는다.
+    assert _normalize_item({"category": "tattoo",
+                            "bbox": [0.1, 0.1, 0.2, 0.2]},
+                           100, 100, 1.0, "") is None
+    assert _normalize_item({"bbox": [1, 2, 3]}, 100, 100, 1.0, "") is None
+    assert _normalize_item({"bbox": ["a", 1, 2, 3]},
+                           100, 100, 1.0, "") is None
+
+
+def _capture_call(frame, phrases, query_raw, include_all=True,
+                  base_url=None):
+    """detect_with_vlm 1회를 모의 실행하고 실제 요청 payload를 돌려준다."""
+    import src.vlm_package as vp
+
+    call = {}
+
+    class _Completions:
+        def create(self, **kw):
+            call.update(kw)
+
+            class _Msg:
+                content = "[]"
+
+            class _Choice:
+                message = _Msg()
+
+            class _Resp:
+                choices = [_Choice()]
+
+            return _Resp()
+
+    class _Chat:
+        completions = _Completions()
+
+    class _FakeClient:
+        chat = _Chat()
+
+    real_client_fn = vp._client
+
+    def _fake_client(api_key, timeout, base_url=None):
+        return _FakeClient()
+
+    vp._client = _fake_client
+    try:
+        out = vp.detect_with_vlm(
+            frame, phrases, "k", model="gemini-3-flash-preview",
+            query_raw=query_raw, include_all=include_all,
+            base_url=base_url)
+        assert out == []
+    finally:
+        vp._client = real_client_fn
+    return call
+
+
+def t_vlm_provider():
+    """OpenAI 호환 제공자(Gemini) 경로: base_url/모델/이미지 전송을 모의 검증."""
     import numpy as np
-    sel = HybridSelector([], query_raw="모자 쓴 사람", world_mode="auto")
-    assert sel.use_world
-    crop = np.zeros((100, 60, 3), np.uint8)
-    hit, _ = sel.judge(crop, None)
-    assert hit is False
+    import openai
+    import src.vlm_package as vp
+
+    captured = {}
+    real_openai = openai.OpenAI
+
+    class FakeOpenAI:
+        def __init__(self, **kw):
+            captured.update(kw)
+
+    openai.OpenAI = FakeOpenAI
+    try:
+        vp._CLIENTS.clear()
+        c = vp._client(
+            "k", 30,
+            "https://generativelanguage.googleapis.com/v1beta/openai/")
+        assert c is not None
+        assert captured["base_url"].endswith("/openai/")
+        assert captured["api_key"] == "k"
+    finally:
+        openai.OpenAI = real_openai
+        vp._CLIENTS.clear()
+
+    call = _capture_call(
+        np.zeros((64, 64, 3), np.uint8),
+        ["face", "license_plate"],
+        "얼굴과 차량번호판만 가려줘",
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/")
+    assert call["model"] == "gemini-3-flash-preview"
+    assert call["max_tokens"] == 8192
+    assert call["reasoning_effort"] == "low"
+    parts = call["messages"][1]["content"]
+    assert any(p.get("type") == "image_url"
+               and p["image_url"]["url"].startswith(
+                   "data:image/jpeg;base64,")
+               for p in parts if isinstance(p, dict))
+    assert call["temperature"] == 0
+    prompt = parts[0]["text"]
+    assert "얼굴과 차량번호판만 가려줘" in prompt
+    assert "0~1 정규화 좌표" in prompt
+    assert "문신" not in prompt
+
+    # VLMSelector가 base_url을 detect_with_vlm까지 넘기는지
+    from src.select import VLMSelector
+    seen2 = {}
+    real_detect = vp.detect_with_vlm
+
+    def _fake_detect(frame, phrases, api_key, **kw):
+        seen2.update(kw)
+        return [{"xyxy": [0, 0, 1, 1], "category": "face", "conf": 1.0}]
+
+    vp.detect_with_vlm = _fake_detect
+    try:
+        sel = VLMSelector(api_key="k", targets=["face"],
+                          vlm_base_url="https://example.test/openai/")
+        boxes = sel.detect_boxes(np.zeros((32, 32, 3), np.uint8))
+        assert boxes
+        assert seen2.get("base_url") == "https://example.test/openai/"
+    finally:
+        vp.detect_with_vlm = real_detect
 
 
-def t_vlm_package_empty():
+def t_vlm_requires_key():
     import numpy as np
-    from src.vlm_package import build_first_frame_package
-    pkg = build_first_frame_package(np.zeros((100, 100, 3), np.uint8), [], query_raw="x")
-    assert pkg["persons"] == [] and pkg["first_frame_only"]
+    from src.vlm_package import VLMError, detect_with_vlm
+    try:
+        detect_with_vlm(np.zeros((8, 8, 3), np.uint8), ["face"], "")
+    except VLMError:
+        return
+    raise AssertionError("API 키 없이 VLM이 호출됨")
+
+
+def t_selector_requires_key():
+    from src.select import VLMSelector
+    try:
+        VLMSelector(api_key="")
+    except ValueError:
+        return
+    raise AssertionError("API 키 없이 VLMSelector가 생성됨")
+
+
+def str_prompt_has_no_tattoo():
+    from src.config import CANDS
+    from src.vlm_package import TARGET_EN, _build_prompt
+    assert "tattoo" not in CANDS
+    assert "tattoo" not in TARGET_EN
+    text = _build_prompt(CANDS, "얼굴과 번호판", True, None)
+    assert "문신" not in text and "tattoo" not in text.lower()
+    assert "차량이 보이면 앞/뒤 번호판" in text
+
+
+def t_mosaic_blocks():
+    """가로로 긴 번호판도 정사각 블록으로 충분히 가려지는지 확인."""
+    import numpy as np
+    from src.render import mosaic_block_size, render_mosaic
+    w, h = 90, 30
+    roi = np.zeros((h, w, 3), np.uint8)
+    roi[:, ::2] = (255, 255, 255)
+    bs = mosaic_block_size(w, h, 30)
+    assert bs >= 4, bs
+    assert mosaic_block_size(h, w, 30) == bs
+    mos = render_mosaic(roi, "pixel", blocks=30)
+    assert mos.shape == roi.shape
+    assert np.array_equal(mos[:bs, :bs],
+                          np.full((bs, bs, 3), mos[0, 0], np.uint8))
+    # 1px 세로 줄무늬가 그대로 남으면 안 된다.
+    assert np.count_nonzero(np.diff(mos[0, :, 0])) < w // 2
+    assert np.count_nonzero(np.diff(mos[:, 0, 0])) < h // 2
 
 
 def main():
@@ -93,11 +330,15 @@ def main():
     fails += check("preview-0person", t_preview_no_person)
     fails += check("preview-closeup", t_preview_closeup)
     fails += check("black-video", t_black_video)
-    fails += check("world-empty-targets", t_world_only_empty_targets)
-    fails += check("vlm-package-empty", t_vlm_package_empty)
-    print("ROBUSTNESS_PASS" if fails == 0 else f"ROBUSTNESS_FAIL {fails}건")
+    fails += check("vlm-parse-normalize", t_vlm_parse_and_normalize)
+    fails += check("vlm-provider", t_vlm_provider)
+    fails += check("vlm-requires-key", t_vlm_requires_key)
+    fails += check("selector-requires-key", t_selector_requires_key)
+    fails += check("prompt-no-tattoo", str_prompt_has_no_tattoo)
+    fails += check("mosaic-blocks", t_mosaic_blocks)
+    print("ROBUSTNESS_PASS" if fails == 0 else f"ROBUSTNESS_FAIL {fails}")
     return 1 if fails else 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
