@@ -62,7 +62,9 @@ def _client(api_key, timeout, base_url=None):
         client = _CLIENTS.get(key)
         if client is None:
             kwargs = {"api_key": str(api_key), "timeout": timeout,
-                      "max_retries": 1}
+                      # SDK 자체 재시도를 끈다. 429/인증 오류에 호출을 더
+                      # 태우지 않고, 5xx만 detect_with_vlm이 직접 재시도한다.
+                      "max_retries": 0}
             if base_url:
                 kwargs["base_url"] = str(base_url)
             client = OpenAI(**kwargs)

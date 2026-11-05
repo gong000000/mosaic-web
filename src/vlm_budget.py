@@ -3,9 +3,7 @@
 무료 등급(Gemini 하루 20회 등)의 호출 한도를 초과하지 않도록 관리하고,
 호출 실패 시 지수 백오프로 재시도한다.
 """
-import os
 import threading
-import time
 
 
 class VLMBudget:
@@ -33,6 +31,19 @@ class VLMBudget:
         with self._lock:
             self.used_today += n
             self.used_this_video += n
+
+    def reserve(self) -> bool:
+        """호출 1회를 원자적으로 예약한다. 병렬 워커가 한도를 넘지 않게 한다."""
+        with self._lock:
+            if self.daily_limit is not None \
+                    and self.used_today >= self.daily_limit:
+                return False
+            if self.per_video_limit is not None \
+                    and self.used_this_video >= self.per_video_limit:
+                return False
+            self.used_today += 1
+            self.used_this_video += 1
+            return True
 
     def reset_video(self):
         with self._lock:

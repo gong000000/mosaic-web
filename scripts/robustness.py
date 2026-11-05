@@ -251,6 +251,8 @@ def t_vlm_provider():
         assert c is not None
         assert captured["base_url"].endswith("/openai/")
         assert captured["api_key"] == "k"
+        # SDK 자체 재시도를 끄고, 429에는 추가 호출을 하지 않는다.
+        assert captured["max_retries"] == 0
     finally:
         openai.OpenAI = real_openai
         vp._CLIENTS.clear()
@@ -323,6 +325,22 @@ def str_prompt_has_no_tattoo():
     assert "차량이 보이면 앞/뒤 번호판" in text
 
 
+def t_quota_no_retry():
+    """429/일일 한도는 재시도하지 않고 예산도 원자적으로 막는지 확인."""
+    from src.vlm_budget import (VLMBudget, VLMRetryPolicy,
+                                classify_vlm_error)
+    err = RuntimeError("429 quota exceeded: free tier per day")
+    assert classify_vlm_error(err) == "quota_exceeded"
+    policy = VLMRetryPolicy(max_retries=3)
+    assert policy.should_retry(err, 0) is False
+    assert policy.should_retry(RuntimeError("503 unavailable"), 0) is True
+    budget = VLMBudget(per_video_limit=2)
+    assert budget.reserve() is True
+    assert budget.reserve() is True
+    assert budget.reserve() is False
+    assert budget.remaining() == 0
+
+
 def t_mosaic_blocks():
     """가로로 긴 번호판도 정사각 블록으로 충분히 가려지는지 확인."""
     import numpy as np
@@ -352,6 +370,7 @@ def main():
     fails += check("vlm-requires-key", t_vlm_requires_key)
     fails += check("selector-requires-key", t_selector_requires_key)
     fails += check("prompt-no-tattoo", str_prompt_has_no_tattoo)
+    fails += check("quota-no-retry", t_quota_no_retry)
     fails += check("mosaic-blocks", t_mosaic_blocks)
     print("ROBUSTNESS_PASS" if fails == 0 else f"ROBUSTNESS_FAIL {fails}")
     return 1 if fails else 0

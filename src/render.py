@@ -6,6 +6,143 @@ import numpy as np
 import imageio_ffmpeg
 
 
+class FFmpegFrameWriter:
+    """프레임을 ffmpeg 파이프로 바로 넘겨 H.264 MP4를 한 번에 만든다.
+
+    기존 경로는 mp4v로 한 번 쓰고, 다시 H.264로 재인코딩하며 오디오를
+    믹싱했다(영상 인코딩 2회). 여기서는 raw BGR 프레임을 ffmpeg stdin으로
+    보내 원본 오디오와 함께 한 번만 인코딩한다.
+
+    width/height를 0으로 넘기면 첫 프레임에서 실제 크기를 정한다.
+    (미리보기 영상처럼 원본 크기를 알아야 할 때만 만들 수 있는 경우)
+    """
+
+    def __init__(self, output_path, width, height, fps,
+                 audio_src=None, preset="veryfast", crf=20, pix_fmt="yuv420p"):
+        self.output_path = output_path
+        # yuv420p는 짝수 해상도가 필요하다. 1px 잘라서 맞춘다.
+        if width and height:
+            self.width = max(2, int(width) - (int(width) % 2))
+            self.height = max(2, int(height) - (int(height) % 2))
+        else:
+            self.width = 0
+            self.height = 0
+        self.fps = float(fps or 30.0)
+        self.audio_src = audio_src
+        self.preset = preset
+        self.crf = crf
+        self.pix_fmt = pix_fmt
+        self._proc = None
+        self._closed = False
+        self._pending = None
+
+    def _start(self):
+        """첫 프레임 크기가 정해진 뒤 ffmpeg를 띄운다."""
+        if self._proc is not None:
+            return
+        ff = imageio_ffmpeg.get_ffmpeg_exe()
+        # 브라우저(Edge/Chrome/Windows Media Foundation) 호환을 위해
+        # H.264 Main 프로파일 + 고정 키프레임 + B프레임 없음 + yuv420p를
+        # 명시한다. 옵션이 없으면 오디오는 재생돼도 영상이 검게 나오는
+        # 증상이 있다.
+        cmd = [ff, "-hide_banner", "-loglevel", "error", "-y",
+               "-f", "rawvideo", "-vcodec", "rawvideo",
+               "-s", f"{self.width}x{self.height}",
+               "-pix_fmt", "bgr24", "-r", f"{self.fps:.6f}", "-i", "-"]
+        has_audio = bool(self.audio_src
+                         and os.path.exists(self.audio_src))
+        if has_audio:
+            cmd += ["-i", self.audio_src, "-map", "0:v:0", "-map", "1:a?",
+                    "-c:a", "aac"]
+        cmd += ["-c:v", "libx264", "-preset", str(self.preset),
+                "-crf", str(int(self.crf)), "-pix_fmt", "yuv420p",
+                "-profile:v", "main", "-level", "3.1",
+                "-g", "30", "-keyint_min", "30", "-bf", "0"]
+        if has_audio:
+            cmd += ["-shortest"]
+        cmd += ["-movflags", "+faststart", self.output_path]
+        self._proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def _set_size_from(self, frame):
+        h, w = frame.shape[:2]
+        self.width = max(2, int(w) - (int(w) % 2))
+        self.height = max(2, int(h) - (int(h) % 2))
+        self._start()
+
+    @property
+    def ok(self):
+        return self._proc is not None
+
+    def write(self, frame):
+        if self._proc is None:
+            if self.width == 0 or self.height == 0:
+                self._set_size_from(frame)
+                frame = self.resize_to(frame)
+            else:
+                self._start()
+                frame = self.resize_to(frame)
+        else:
+            frame = self.resize_to(frame)
+        try:
+            self._proc.stdin.write(
+                np.ascontiguousarray(frame, dtype=np.uint8).tobytes())
+        except (BrokenPipeError, OSError) as e:
+            raise RuntimeError(f"ffmpeg 프레임 쓰기 실패: {e}")
+
+    def resize_to(self, frame):
+        """프레임을 인코더 해상도에 맞게 자른다/채운다."""
+        if frame is None:
+            return frame
+        h, w = frame.shape[:2]
+        if (w, h) == (self.width, self.height):
+            return frame
+        if (w >= self.width and h >= self.height):
+            return frame[:self.height, :self.width]
+        return cv2.resize(frame, (self.width, self.height),
+                          interpolation=cv2.INTER_AREA)
+
+    def close(self):
+        if self._closed:
+            return self.output_path
+        self._closed = True
+        proc = self._proc
+        if proc is None:
+            raise RuntimeError("ffmpeg writer가 열리지 않았습니다.")
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+            code = proc.wait()
+        except Exception as e:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            raise RuntimeError(f"ffmpeg 종료 실패: {e}")
+        if (code != 0 or not os.path.exists(self.output_path)
+                or os.path.getsize(self.output_path) == 0):
+            cleanup_tmp(self.output_path)
+            raise RuntimeError("ffmpeg H.264 인코딩 실패")
+        return self.output_path
+
+    def abort(self):
+        self._closed = True
+        proc = self._proc
+        if proc is None:
+            return
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+        cleanup_tmp(self.output_path)
+
+
 def mosaic_block_size(w, h, blocks=30):
     """강도(blocks)에 따른 정사각 블록 크기(px). 클수록 더 강하게 가린다."""
     strength = max(1, int(blocks))
@@ -33,18 +170,11 @@ def render_mosaic(roi, style="pixel", blocks=30, blur=61):
 
 
 def feather_mask(mask_u8, guide_bgr=None):
+    """마스크 경계를 부드럽게 만든다. 성능을 위해 커널을 작게 유지한다."""
     m = mask_u8.astype(np.uint8)
-    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
-    m = cv2.dilate(m, np.ones((7, 7), np.uint8), iterations=1)
-    try:
-        if guide_bgr is not None and hasattr(cv2, "ximgproc"):
-            g = cv2.cvtColor(guide_bgr, cv2.COLOR_BGR2GRAY)
-            m32 = m.astype(np.float32) / 255.0
-            f = cv2.ximgproc.guidedFilter(g, m32, 8, 0.02)
-            return (np.clip(f, 0, 1) * 255).astype(np.uint8)
-        return cv2.GaussianBlur(m, (21, 21), 0)
-    except Exception:
-        return cv2.GaussianBlur(m, (21, 21), 0)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    m = cv2.dilate(m, np.ones((3, 3), np.uint8), iterations=1)
+    return cv2.GaussianBlur(m, (9, 9), 0)
 
 
 def mux_audio_h264(video_noaudio, audio_src, output_path, preset="veryfast"):
@@ -161,6 +291,76 @@ def render_region(frame, x1, y1, x2, y2, style="pixel", blocks=30, blur=61, pad=
     return True
 
 
+def render_person_ellipse(frame, x1, y1, x2, y2, style="pixel",
+                          blocks=30, blur=61, ratio=1.0):
+    """사람 마스크가 없을 때 얼굴/상반신 영역을 타원으로 가린다."""
+    x1c, y1c = max(0, int(x1)), max(0, int(y1))
+    x2c, y2c = min(frame.shape[1], int(x2)), min(frame.shape[0], int(y2))
+    if x2c - x1c < 20 or y2c - y1c < 20:
+        return False
+    h = y2c - y1c
+    fy2 = y1c + int(h * ratio)
+    if fy2 - y1c < 15:
+        return False
+    w_ = x2c - x1c
+    fb = np.zeros((fy2 - y1c, w_), dtype=np.uint8)
+    cv2.ellipse(fb, (w_ // 2, (fy2 - y1c) // 2),
+                (max(5, w_ // 2 - 2), max(5, (fy2 - y1c) // 2 - 2)),
+                0, 0, 360, 255, -1)
+    fb = cv2.GaussianBlur(fb, (9, 9), 0)
+    roi_f = frame[y1c:fy2, x1c:x2c]
+    mos = render_mosaic(roi_f, style=style, blocks=blocks, blur=blur)
+    mf = (fb.astype(float) / 255.0)[..., None]
+    frame[y1c:fy2, x1c:x2c] = (mos * mf + roi_f * (1 - mf)).astype(np.uint8)
+    return True
+
+
+def _area_ratio(area_mode):
+    if area_mode == "face_only":
+        return 0.32
+    if area_mode == "upper":
+        return 0.65
+    return 1.0
+
+
+def render_person_roi(frame, x1, y1, x2, y2, mask_roi, style="pixel",
+                      blocks=30, blur=61, area_mode="full"):
+    """ROI 크기에 맞춰 둔 마스크로 사람을 가린다.
+
+    pipeline이 전체 프레임 크기로 마스크를 매번 resize하지 않고, 사람
+    박스 영역만 잘라서 넘긴다. pixel 스타일은 경계 페더링을 생략해
+    CPU 렌더 시간을 크게 줄인다.
+    """
+    x1c, y1c = max(0, int(x1)), max(0, int(y1))
+    x2c, y2c = min(frame.shape[1], int(x2)), min(frame.shape[0], int(y2))
+    if x2c - x1c < 20 or y2c - y1c < 20:
+        return False
+    roi_f = frame[y1c:y2c, x1c:x2c]
+    if mask_roi is not None:
+        try:
+            m = mask_roi
+            if m.shape[:2] != roi_f.shape[:2]:
+                m = cv2.resize(m, (roi_f.shape[1], roi_f.shape[0]),
+                               interpolation=cv2.INTER_NEAREST)
+            if m.dtype != np.uint8:
+                m = (m > 0.5).astype(np.uint8) * 255
+            if m.mean() >= 8:
+                if style != "pixel":
+                    m = feather_mask(m, roi_f)
+                mos = render_mosaic(roi_f, style=style, blocks=blocks,
+                                    blur=blur)
+                mf = (m.astype(float) / 255.0)[..., None]
+                if mf.mean() >= 0.05:
+                    frame[y1c:y2c, x1c:x2c] = (mos * mf
+                                               + roi_f * (1 - mf)).astype(np.uint8)
+                    return True
+        except Exception:
+            pass
+    return render_person_ellipse(frame, x1c, y1c, x2c, y2c, style=style,
+                                 blocks=blocks, blur=blur,
+                                 ratio=_area_ratio(area_mode))
+
+
 def render_person_strict(frame, x1, y1, x2, y2, mask_full_or_None, style="pixel", blocks=30, blur=61, area_mode="full"):
     """마스크 있을 때만 마스크 영역. 없으면 area_mode에 따라 얼굴/상반신/전체 영역을 가린다.
     렌더했으면 True."""
@@ -172,7 +372,9 @@ def render_person_strict(frame, x1, y1, x2, y2, mask_full_or_None, style="pixel"
         try:
             mc = mask_full_or_None[y1c:y2c, x1c:x2c]
             if mc.size > 0 and mc.mean() >= 8:
-                m = feather_mask(mc, frame[y1c:y2c, x1c:x2c])
+                # pixel은 하드 경계가 자연스러워 페더링을 생략한다.
+                m = mc if style == "pixel" else feather_mask(
+                    mc, frame[y1c:y2c, x1c:x2c])
                 roi_f = frame[y1c:y2c, x1c:x2c]
                 mos = render_mosaic(roi_f, style=style, blocks=blocks, blur=blur)
                 mf = (m.astype(float) / 255.0)[..., None]
@@ -182,24 +384,6 @@ def render_person_strict(frame, x1, y1, x2, y2, mask_full_or_None, style="pixel"
                 return True
         except Exception:
             pass
-    h = y2c - y1c
-    if area_mode == "face_only":
-        ratio = 0.32
-    elif area_mode == "upper":
-        ratio = 0.65
-    else:
-        ratio = 1.0
-    fy2 = y1c + int(h * ratio)
-    if fy2 - y1c < 15:
-        return False
-    w_ = x2c - x1c
-    fb = np.zeros((fy2 - y1c, w_), dtype=np.uint8)
-    cv2.ellipse(fb, (w_ // 2, (fy2 - y1c) // 2),
-                (max(5, w_ // 2 - 2), max(5, (fy2 - y1c) // 2 - 2)),
-                0, 0, 360, 255, -1)
-    fb = cv2.GaussianBlur(fb, (15, 15), 0)
-    roi_f = frame[y1c:fy2, x1c:x2c]
-    mos = render_mosaic(roi_f, style=style, blocks=blocks, blur=blur)
-    mf = (fb.astype(float) / 255.0)[..., None]
-    frame[y1c:fy2, x1c:x2c] = (mos * mf + roi_f * (1 - mf)).astype(np.uint8)
-    return True
+    return render_person_ellipse(frame, x1c, y1c, x2c, y2c, style=style,
+                                 blocks=blocks, blur=blur,
+                                 ratio=_area_ratio(area_mode))

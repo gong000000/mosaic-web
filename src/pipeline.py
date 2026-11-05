@@ -17,14 +17,18 @@ import pickle
 import shutil
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 from .config import (CATEGORY_TYPE, ROOT_DIR, VLM_MODEL, canon_category,
                      category_type)
 from .models import get_model
 from .detect import filter_contained, big_enough, iou
-from .render import (render_person_strict, render_region, mux_audio_h264,
-                     apply_area_limit, cleanup_tmp)
+from .render import (render_person_strict, render_person_roi, render_region,
+                     mux_audio_h264, apply_area_limit, cleanup_tmp,
+                     FFmpegFrameWriter)
 from .select import VLMSelector
+from .vlm_budget import VLMBudget, classify_vlm_error
 
 _TRACKER_CFG = os.path.join(ROOT_DIR, "configs", "bytetrack_stable.yaml")
 
@@ -298,7 +302,8 @@ class MosaicJob:
                  keyframe_stride=3, query_raw="",
                  api_key=None, vlm_model=VLM_MODEL, vlm_base_url=None,
                  region_priors=None, person_priors=None,
-                 cache_path=None, use_cache=False):
+                 cache_path=None, use_cache=False,
+                 vlm_call_limit=None, mask_all_persons=False):
         self.input_path = input_path
         self.output_path = output_path
         self.targets = ([targets] if isinstance(targets, str)
@@ -322,6 +327,12 @@ class MosaicJob:
         self.person_priors = person_priors or {}
         self.cache_path = cache_path
         self.use_cache = bool(use_cache)
+        # 처리 단계 VLM 호출 상한(영상 1개 기준). None이면 키프레임마다 호출.
+        self.vlm_call_limit = (None if vlm_call_limit is None
+                               else max(0, int(vlm_call_limit)))
+        # 얼굴/동승자처럼 사람 전체에 적용해도 되는 항목은 트랙마다
+        # VLM 재탐지 없이 바로 가린다(누락 방지 + 속도).
+        self.mask_all_persons = bool(mask_all_persons)
 
     def run(self, progress_fn=None):
         input_path, output_path = self.input_path, self.output_path
@@ -344,15 +355,36 @@ class MosaicJob:
         region_priors = self.region_priors
         person_priors = self.person_priors
 
-        model = get_model(model_name)
-        _reset_tracker(model)
+        # 얼굴/동승자만 선택하고 모든 사람을 가리는 설정이면 VLM 재탐지와
+        # 1패스 추적이 필요 없다. 한 번의 추적 패스로 바로 렌더한다.
+        fast_person_only = bool(
+            self.mask_all_persons and not invert and targets
+            and all(c in CATEGORY_TYPE
+                    and CATEGORY_TYPE.get(c) == "person"
+                    and c != "name_tag" for c in targets))
+
+        model = None
+        # 사람 항목이 전혀 없으면 YOLO 모델 자체를 로드하지 않는다.
+        needs_person_pass1 = (
+            invert or bool(person_priors)
+            or any(c not in CATEGORY_TYPE
+                   or CATEGORY_TYPE.get(c) == "person" for c in targets))
+        if needs_person_pass1:
+            model = get_model(model_name)
+            _reset_tracker(model)
+
+        out_dir = os.path.dirname(os.path.abspath(output_path))
+        os.makedirs(out_dir, exist_ok=True)
 
         # ---- 1패스 결과 캐시 로드 (캐시 사용 시 1패스 건너뜀) ----
         cache_hit = False
-        if self.use_cache and self.cache_path and os.path.exists(self.cache_path):
+        if (not fast_person_only and self.use_cache and self.cache_path
+                and os.path.exists(self.cache_path)):
             try:
                 with open(self.cache_path, "rb") as f:
                     cache = pickle.load(f)
+                if cache.get("version") != 2:
+                    raise ValueError("cache version mismatch")
                 votes = cache["votes"]
                 person_box_samples = cache["person_box_samples"]
                 region_samples = cache["region_samples"]
@@ -376,7 +408,8 @@ class MosaicJob:
 
         # observed_types와 pending_person_priors는 캐시 미스/히트와
         # 무관하게 항상 정의돼야 한다 (후처리/2패스에서 참조).
-        observed_types = {}
+        if not cache_hit:
+            observed_types = {}
         pending_person_priors = defaultdict(lambda: defaultdict(list))
 
         if not cache_hit:
@@ -399,9 +432,6 @@ class MosaicJob:
                 raise RuntimeError("입력 영상에서 프레임을 읽지 못했습니다.")
             H, W = first.shape[:2]
             del first
-
-            out_dir = os.path.dirname(os.path.abspath(output_path))
-            os.makedirs(out_dir, exist_ok=True)
 
             if ultra:
                 imgsz = max(imgsz, 960)
@@ -432,49 +462,49 @@ class MosaicJob:
                 out.append(coords)
             return out
 
-        for cat, by_frame in (region_priors or {}).items():
-            if cat not in targets or _cat_type(cat) != "region":
-                continue
-            for fidx, boxes in (by_frame or {}).items():
-                try:
-                    fidx = int(fidx)
-                except (TypeError, ValueError):
+        # 캐시는 priors가 이미 반영된 1패스 결과다. 캐시 적중 시 다시 넣으면
+        # 같은 박스가 중복 저장되므로 건너뛴다. 캐시 키에 priors 해시가
+        # 포함돼 있어 priors가 달라지면 캐시도 새로 만든다.
+        if not cache_hit:
+            for cat, by_frame in (region_priors or {}).items():
+                if cat not in targets or _cat_type(cat) != "region":
                     continue
-                # sample_idx는 floor로 잡아 1패스 키프레임과 맞추되,
-                # 실제 렌더는 due(frame_idx) 이후에만 한다.
-                sidx = min(max_sidx, max(0, fidx // keyframe_stride))
-                for coords in _prior_coords(boxes):
-                    region_samples[cat][sidx].append({
-                        "xyxy": coords, "conf": 1.0, "category": cat,
-                        "region_type": "region", "source": "vlm",
-                        "matches_prompt": True, "due": fidx,
-                    })
+                for fidx, boxes in (by_frame or {}).items():
+                    try:
+                        fidx = int(fidx)
+                    except (TypeError, ValueError):
+                        continue
+                    # sample_idx는 floor로 잡아 1패스 키프레임과 맞추되,
+                    # 실제 렌더는 due(frame_idx) 이후에만 한다.
+                    sidx = min(max_sidx, max(0, fidx // keyframe_stride))
+                    for coords in _prior_coords(boxes):
+                        region_samples[cat][sidx].append({
+                            "xyxy": coords, "conf": 1.0, "category": cat,
+                            "region_type": "region", "source": "vlm",
+                            "matches_prompt": True, "due": fidx,
+                        })
 
-        # 명찰·얼굴처럼 사람에 붙은 체크리스트 박스도 처리 단계로 넘긴다.
-        # 1패스의 가장 가까운 키프레임에서 실제 사람 트랙과 매칭해
-        # 상대좌표로 바꾸고, 매칭 실패 시 절대좌표 fallback을 쓴다.
-        for cat, by_frame in (person_priors or {}).items():
-            if cat not in targets or _cat_type(cat) != "person":
-                continue
-            observed_types.setdefault(cat, "person")
-            for fidx, boxes in (by_frame or {}).items():
-                try:
-                    fidx = int(fidx)
-                except (TypeError, ValueError):
+            # 명찰·얼굴처럼 사람에 붙은 체크리스트 박스도 처리 단계로 넘긴다.
+            # 1패스의 가장 가까운 키프레임에서 실제 사람 트랙과 매칭해
+            # 상대좌표로 바꾸고, 매칭 실패 시 절대좌표 fallback을 쓴다.
+            for cat, by_frame in (person_priors or {}).items():
+                if cat not in targets or _cat_type(cat) != "person":
                     continue
-                sidx = min(max_sidx, max(0, fidx // keyframe_stride))
-                pending_person_priors[cat][sidx].extend(
-                    (coords, fidx) for coords in _prior_coords(boxes))
+                observed_types.setdefault(cat, "person")
+                for fidx, boxes in (by_frame or {}).items():
+                    try:
+                        fidx = int(fidx)
+                    except (TypeError, ValueError):
+                        continue
+                    sidx = min(max_sidx, max(0, fidx // keyframe_stride))
+                    pending_person_priors[cat][sidx].extend(
+                        (coords, fidx) for coords in _prior_coords(boxes))
 
         # ---- 1패스: 모든 프레임 추적 + 키프레임 VLM 탐지 ----
         # 1패스와 2패스가 같은 프레임 시퀀스를 추적해야 트랙 ID가 일치한다.
         # 캐시가 있으면 1패스를 건너뛴다.
         if cache_hit:
             _reset_tracker(model)
-            # priors는 캐시 로드 후에도 적용돼야 한다. region/person priors는
-            # region_samples/person_box_samples에 직접 쌓이므로 여기서
-            # pending_person_priors를 확정해 fallback으로 남긴다.
-            pass
         else:
             votes = defaultdict(lambda: defaultdict(list))
             first_thumb = {}
@@ -483,61 +513,71 @@ class MosaicJob:
             all_detail = defaultdict(dict)
         t0 = time.time()
 
-        if not cache_hit:
-            results1 = model.track(source=input_path, stream=True, persist=True,
-                                   tracker=_TRACKER_CFG,
-                                   conf=conf, classes=[0], verbose=False,
-                                   imgsz=imgsz, iou=0.5, max_det=30)
+        # VLM 호출은 영상 전체 키프레임에 고르게 배분한다. 무료 한도가
+        # 작아도 뒤쪽 구간을 통째로 건너뛰지 않게 하기 위함이다.
+        vlm_budget = VLMBudget(per_video_limit=self.vlm_call_limit)
+        vlm_targets = None
+        if self.vlm_call_limit is not None:
+            if self.vlm_call_limit <= 0:
+                vlm_targets = set()
+            else:
+                n_keyframes = max(
+                    1, (max(1, total) + keyframe_stride - 1)
+                    // keyframe_stride)
+                k = min(int(self.vlm_call_limit), n_keyframes)
+                if k <= 1:
+                    vlm_targets = {0}
+                else:
+                    vlm_targets = {
+                        int(round(i * (n_keyframes - 1) / float(k - 1)))
+                        for i in range(k)
+                    }
+        vlm_errors = 0
+        vlm_disabled = False
 
-            frame_idx = -1
-            for r in results1:
-                frame_idx += 1
-                if progress_fn and total > 0 and frame_idx % 5 == 0:
-                    try:
-                        progress_fn(0.5 * min(1.0, (frame_idx + 1) / total),
-                                    frame_idx + 1, total, time.time() - t0)
-                    except Exception:
-                        pass
+        def _process_chunk(chunk):
+            """키프레임 묶음의 VLM을 병렬 호출하고 순서대로 집계한다.
 
-                if frame_idx % keyframe_stride != 0:
-                    continue
-                sample_idx = frame_idx // keyframe_stride
-
-                frame = r.orig_img
-                boxes = np.zeros((0, 4), dtype=int)
-                ids = np.zeros((0,), dtype=int)
-                if r.boxes is not None and len(r.boxes) > 0:
-                    boxes = r.boxes.xyxy.cpu().numpy().astype(int)
-                    ids = (r.boxes.id.cpu().numpy().astype(int)
-                           if r.boxes.id is not None else [-1] * len(boxes))
-
-                keep = filter_contained(boxes) if len(boxes) else []
-                cand = []
-                for i, (x1, y1, x2, y2) in enumerate(boxes):
-                    if not keep[i]:
+            추적은 순차 스트림이지만 VLM 네트워크 대기는 병렬화할 수 있다.
+            프레임은 묶음 크기만큼만 들고 있어 메모리도 제한된다.
+            """
+            nonlocal vlm_errors, vlm_disabled
+            if not chunk:
+                return
+            vlm_results = {}
+            if not vlm_disabled and (vlm_targets is None or vlm_targets):
+                run_now = []
+                for rec in chunk:
+                    if (vlm_targets is not None
+                            and rec["sample_idx"] not in vlm_targets):
                         continue
-                    tid = int(ids[i])
-                    x1c, y1c = max(0, int(x1)), max(0, int(y1))
-                    x2c, y2c = (min(frame.shape[1], int(x2)),
-                                min(frame.shape[0], int(y2)))
-                    if not big_enough(x1c, y1c, x2c, y2c):
+                    if not vlm_budget.can_call():
                         continue
-                    cand.append({"key": (tid, len(cand)), "tid": tid,
-                                 "xyxy": [x1c, y1c, x2c, y2c]})
-                    if tid not in first_thumb:
-                        try:
-                            crop = frame[y1c:y2c, x1c:x2c]
-                            th = cv2.resize(
-                                crop,
-                                (96, max(1, int(96 * crop.shape[0]
-                                               / max(1, crop.shape[1])))),
-                                interpolation=cv2.INTER_AREA)
-                            first_thumb[tid] = th
-                        except Exception:
-                            first_thumb[tid] = None
+                    vlm_budget.record(1)
+                    run_now.append(rec)
+                if run_now:
+                    with ThreadPoolExecutor(
+                            max_workers=min(4, len(run_now))) as ex:
+                        futs = {id(rec): ex.submit(selector.detect_boxes,
+                                                   rec["frame"])
+                                for rec in run_now}
+                        for rec in run_now:
+                            try:
+                                vlm_results[id(rec)] = futs[id(rec)].result()
+                            except Exception as e:
+                                vlm_errors += 1
+                                vlm_results[id(rec)] = []
+                                # 한도/인증/모델 오류는 더 호출해도 실패한다.
+                                if classify_vlm_error(e) in (
+                                        "quota_exceeded", "auth_error",
+                                        "model_not_found"):
+                                    vlm_disabled = True
 
-                # 사람이 없어도 배경 개인정보를 찾아야 하므로 항상 호출한다.
-                vlm_boxes = selector.detect_boxes(frame)
+            for rec in chunk:
+                frame = rec["frame"]
+                cand = rec["cand"]
+                sample_idx = rec["sample_idx"]
+                vlm_boxes = vlm_results.get(id(rec), [])
 
                 # 체크리스트에서 넘어온 사람 부착 박스. 같은 위치를 이번
                 # 키프레임 VLM이 이미 찾았다면 중복 저장하지 않는다.
@@ -571,13 +611,10 @@ class MosaicJob:
                     detail_by_key[it["key"]] = _detail
 
                 # 사람별 카테고리 투표. 선택된 카테고리만 반영한다.
-                # 각 사람은 자기 자신과 매칭된 카테고리만 투표한다.
-                # (이전 사람을 통해 누적된 카테고리가 다른 사람에게 전이되지 않도록 함)
                 for it in cand:
                     tid = it["tid"]
                     hits = {c for c in hits_by_key.get(it["key"], set())
                             if c in targets}
-                    # 같은 키프레임에서 처음 발견된 자유 형식 카테고리도 즉시 투표한다.
                     person_cats_seen.update(hits)
                     for cat in hits:
                         votes[tid][cat].append(True)
@@ -597,6 +634,104 @@ class MosaicJob:
                         # 명찰·얼굴처럼 사람에 붙은 항목도 별도 박스로 저장한다.
                         _store_person_box(person_box_samples, cat, sample_idx,
                                           b, cand)
+                rec["frame"] = None
+
+        # 사람 항목이 전혀 없으면 1패스에서도 YOLO 추적을 하지 않는다.
+        # (번호판/간판만 가리는 영상은 키프레임 VLM 탐지와 렌더만 필요)
+        run_pass1_stream = (not fast_person_only
+                            and (needs_person_pass1 or vlm_targets is None
+                                 or bool(vlm_targets)))
+
+        if not cache_hit and run_pass1_stream:
+            cap1 = None
+            if needs_person_pass1:
+                _reset_tracker(model)
+                results1 = model.track(
+                    source=input_path, stream=True, persist=True,
+                    tracker=_TRACKER_CFG, conf=conf, classes=[0],
+                    verbose=False, imgsz=imgsz, iou=0.5, max_det=30)
+
+                def _iter1():
+                    idx = -1
+                    for res in results1:
+                        idx += 1
+                        yield idx, res
+            else:
+                cap1 = cv2.VideoCapture(input_path)
+
+                def _iter1():
+                    idx = -1
+                    while True:
+                        ok1, frm = cap1.read()
+                        if not ok1:
+                            break
+                        idx += 1
+                        yield idx, SimpleNamespace(
+                            orig_img=frm, boxes=None, masks=None)
+
+            try:
+                chunk = []
+                for frame_idx, r in _iter1():
+                    if progress_fn and total > 0 and frame_idx % 5 == 0:
+                        try:
+                            progress_fn(
+                                0.5 * min(1.0, (frame_idx + 1) / total),
+                                frame_idx + 1, total, time.time() - t0)
+                        except Exception:
+                            pass
+
+                    if frame_idx % keyframe_stride != 0:
+                        continue
+                    sample_idx = frame_idx // keyframe_stride
+
+                    frame = r.orig_img
+                    boxes = np.zeros((0, 4), dtype=int)
+                    ids = np.zeros((0,), dtype=int)
+                    if r.boxes is not None and len(r.boxes) > 0:
+                        boxes = r.boxes.xyxy.cpu().numpy().astype(int)
+                        ids = (r.boxes.id.cpu().numpy().astype(int)
+                               if r.boxes.id is not None else [-1] * len(boxes))
+
+                    keep = filter_contained(boxes) if len(boxes) else []
+                    cand = []
+                    for i, (x1, y1, x2, y2) in enumerate(boxes):
+                        if not keep[i]:
+                            continue
+                        tid = int(ids[i])
+                        x1c, y1c = max(0, int(x1)), max(0, int(y1))
+                        x2c, y2c = (min(frame.shape[1], int(x2)),
+                                    min(frame.shape[0], int(y2)))
+                        if not big_enough(x1c, y1c, x2c, y2c):
+                            continue
+                        cand.append({"key": (tid, len(cand)), "tid": tid,
+                                     "xyxy": [x1c, y1c, x2c, y2c]})
+                        if tid not in first_thumb:
+                            try:
+                                crop = frame[y1c:y2c, x1c:x2c]
+                                th = cv2.resize(
+                                    crop,
+                                    (96, max(1, int(
+                                        96 * crop.shape[0]
+                                        / max(1, crop.shape[1])))),
+                                    interpolation=cv2.INTER_AREA)
+                                first_thumb[tid] = th
+                            except Exception:
+                                first_thumb[tid] = None
+
+                    chunk.append({
+                        "frame_idx": frame_idx,
+                        "sample_idx": sample_idx,
+                        "cand": cand,
+                        # VLM 작업이 추적 버퍼를 참조하지 않도록 복사한다.
+                        "frame": frame.copy(),
+                    })
+                    if len(chunk) >= 6:
+                        _process_chunk(chunk)
+                        chunk = []
+                _process_chunk(chunk)
+            finally:
+                if cap1 is not None:
+                    cap1.release()
 
             # 사람 트랙과 한 번도 매칭되지 않은 체크리스트 박스도 절대좌표로
             # 남겨, 트랙 ID가 바뀌거나 사람 검출이 약한 구간에서도 가린다.
@@ -607,13 +742,16 @@ class MosaicJob:
                             {"tid": -1, "rel": None, "abs": coords,
                              "due": int(due)})
 
+
         # 1패스 결과 캐시 저장 (캐시 사용 시 재실행 때 1패스 생략 가능)
-        if self.use_cache and self.cache_path and not cache_hit:
+        if (not fast_person_only and self.use_cache and self.cache_path
+                and not cache_hit):
             try:
                 cache_dir = os.path.dirname(self.cache_path)
                 if cache_dir:
                     os.makedirs(cache_dir, exist_ok=True)
                 cache = {
+                    "version": 2,
                     "meta": {
                         "total": total,
                         "fps": fps,
@@ -696,13 +834,29 @@ class MosaicJob:
                                              cat_on.get(tid, {}).items() if v},
                                   "sample": samp}
 
+        # 얼굴/동승자처럼 '사람이면 가린다'가 안전한 항목은 VLM이 매
+        # 프레임 잡지 못해도 모든 사람 트랙에 적용한다. 명찰은 위치가
+        # 사람마다 다르므로 제외하고, 찾은 박스만 직접 가린다.
+        blanket_cats = ({c for c in person_cats if c in mask_cats}
+                        if (self.mask_all_persons and not invert) else set())
+
         # ---- 2패스: 선택된 카테고리만 렌더 ----
+        # ffmpeg 파이프로 바로 H.264 인코딩한다(기존 mp4v→H.264 2중
+        # 인코딩 제거). 실패하면 기존 VideoWriter 경로로 대체한다.
         tmp_noaudio = output_path + ".noaudio.mp4"
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter(tmp_noaudio, fourcc, fps, (W, H))
-        if not out.isOpened():
-            cleanup_tmp(tmp_noaudio)
-            raise RuntimeError("VideoWriter 열기 실패. 코덱/경로 확인.")
+        writer = None
+        out = None
+        try:
+            writer = FFmpegFrameWriter(
+                output_path, W, H, fps, audio_src=input_path,
+                preset=encode_preset)
+        except Exception:
+            writer = None
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            out = cv2.VideoWriter(tmp_noaudio, fourcc, fps, (W, H))
+            if not out.isOpened():
+                cleanup_tmp(tmp_noaudio)
+                raise RuntimeError("VideoWriter 열기 실패. 코덱/경로 확인.")
 
         smooth = {}
         hist_mask = {}
@@ -718,14 +872,37 @@ class MosaicJob:
         rendered_region_cats = set()
 
         done = 0
-        try:
+        progress_base = 0.0 if fast_person_only else 0.5
+        # 사람 항목이 없으면 2패스에서 YOLO 추적을 아예 건너뛴다.
+        # (번호판만 가리는 경우 렌더 속도가 크게 빨라진다.)
+        needs_person = bool(person_cats) or invert
+        cap2 = None
+        if needs_person:
+            _reset_tracker(model)
             results2 = model.track(source=input_path, stream=True,
                                    persist=True, tracker=_TRACKER_CFG,
                                    conf=conf, classes=[0], verbose=False,
                                    imgsz=imgsz, iou=0.5, max_det=30)
-            for r in results2:
+
+            def _iter_frames():
+                for res in results2:
+                    yield res
+        else:
+            cap2 = cv2.VideoCapture(input_path)
+
+            def _iter_frames():
+                while True:
+                    ok2, frm = cap2.read()
+                    if not ok2:
+                        break
+                    yield SimpleNamespace(orig_img=frm, boxes=None,
+                                          masks=None)
+
+        try:
+            for r in _iter_frames():
                 frame = r.orig_img.copy()
                 sidx = done // keyframe_stride
+
 
                 seen = set()
                 items = []
@@ -759,6 +936,19 @@ class MosaicJob:
                         tid = int(ids[i])
                         seen.add(tid)
                         track_frames[tid] += 1
+                        if tid not in first_thumb:
+                            try:
+                                _x1c, _y1c = max(0, int(x1)), max(0, int(y1))
+                                _x2c = min(frame.shape[1], int(x2))
+                                _y2c = min(frame.shape[0], int(y2))
+                                crop = frame[_y1c:_y2c, _x1c:_x2c]
+                                first_thumb[tid] = cv2.resize(
+                                    crop, (96, max(1, int(
+                                        96 * crop.shape[0]
+                                        / max(1, crop.shape[1])))),
+                                    interpolation=cv2.INTER_AREA)
+                            except Exception:
+                                first_thumb[tid] = None
                         if tid in smooth:
                             px1, py1, px2, py2 = smooth[tid]
                             x1 = int(ALPHA * x1 + (1 - ALPHA) * px1)
@@ -772,26 +962,56 @@ class MosaicJob:
                             *raw_box, area_mode)
                         # 명찰만 선택한 사람은 몸 전체를 가리지 않는다.
                         # 얼굴/동승자/자유형 사람 항목만 마스크를 적용한다.
+                        # blanket_cats는 VLM 재탐지 없이 모든 사람에게
+                        # 적용하는 얼굴/동승자 항목이다.
                         now_on = bool(global_on.get(tid, False))
                         should = ((not now_on) if invert
-                                  else bool(mask_on.get(tid, False)))
+                                  else (bool(mask_on.get(tid, False))
+                                        or bool(blanket_cats)))
                         mf = None
                         if masks_full is not None and i < len(masks_full):
                             try:
-                                mfull = cv2.resize(
-                                    masks_full[i],
-                                    (frame.shape[1], frame.shape[0]))
-                                mfull = (mfull > 0.5).astype(np.uint8) * 255
-                                if area_mode != "full":
-                                    tmp = np.zeros_like(mfull)
-                                    tmp[max(0, ay1):ay2,
-                                        max(0, ax1):ax2] = 255
-                                    mfull = cv2.bitwise_and(
-                                        mfull, mfull, mask=tmp)
-                                hist_mask[tid] = mfull
-                                mf = mfull
+                                small = masks_full[i]
+                                if invert:
+                                    mfull = cv2.resize(
+                                        small,
+                                        (frame.shape[1], frame.shape[0]))
+                                    mfull = ((mfull > 0.5).astype(np.uint8)
+                                             * 255)
+                                    if area_mode != "full":
+                                        tmp = np.zeros_like(mfull)
+                                        tmp[max(0, ay1):ay2,
+                                            max(0, ax1):ax2] = 255
+                                        mfull = cv2.bitwise_and(
+                                            mfull, mfull, mask=tmp)
+                                    hist_mask[tid] = mfull
+                                    mf = mfull
+                                else:
+                                    # 모델 해상도 마스크에서 사람 영역만 잘라
+                                    # ROI 크기로 줄인다. 전체 프레임 resize를
+                                    # 매 프레임/사람마다 하지 않아 빠르다.
+                                    mh, mw = small.shape[:2]
+                                    sx = mw / float(max(1, W))
+                                    sy = mh / float(max(1, H))
+                                    mx1 = max(0, min(mw - 1, int(ax1 * sx)))
+                                    my1 = max(0, min(mh - 1, int(ay1 * sy)))
+                                    mx2 = max(mx1 + 1,
+                                              min(mw, int(ax2 * sx)))
+                                    my2 = max(my1 + 1,
+                                              min(mh, int(ay2 * sy)))
+                                    crop = small[my1:my2, mx1:mx2]
+                                    if crop.size:
+                                        mf = ((crop > 0.5).astype(np.uint8)
+                                              * 255)
+                                        mf = cv2.resize(
+                                            mf, (max(1, ax2 - ax1),
+                                                 max(1, ay2 - ay1)),
+                                            interpolation=cv2.INTER_NEAREST)
+                                        hist_mask[tid] = mf
                             except Exception:
                                 mf = None
+                        elif not invert:
+                            mf = hist_mask.get(tid)
                         else:
                             mf = hist_mask.get(tid)
                         items.append((tid, ax1, ay1, ax2, ay2, should, mf,
@@ -841,10 +1061,17 @@ class MosaicJob:
                                 mask=cv2.bitwise_not(keep_union))
                         except Exception:
                             pass
-                    if render_person_strict(
+                    if invert:
+                        ok_render = render_person_strict(
                             frame, x1, y1, x2, y2, render_mask,
                             style=style, blocks=blocks, blur=blur,
-                            area_mode=area_mode):
+                            area_mode=area_mode)
+                    else:
+                        ok_render = render_person_roi(
+                            frame, x1, y1, x2, y2, render_mask,
+                            style=style, blocks=blocks, blur=blur,
+                            area_mode=area_mode)
+                    if ok_render:
                         rendered_tids.add(tid)
 
                 # 트랙이 잠깐 사라진 프레임도 같은 카테고리면 계속 가린다.
@@ -874,7 +1101,8 @@ class MosaicJob:
                     if invert:
                         if global_on.get(tid, False):
                             continue
-                    elif not mask_on.get(tid, False):
+                    elif (not mask_on.get(tid, False)
+                          and not blanket_cats):
                         continue
                     x1, y1, x2, y2 = apply_area_limit(
                         *raw_box, area_mode)
@@ -885,10 +1113,17 @@ class MosaicJob:
                                 _mf, _mf, mask=cv2.bitwise_not(keep_union))
                         except Exception:
                             pass
-                    if render_person_strict(
+                    if invert:
+                        ok_render = render_person_strict(
                             frame, x1, y1, x2, y2, _mf,
                             style=style, blocks=blocks, blur=blur,
-                            area_mode=area_mode):
+                            area_mode=area_mode)
+                    else:
+                        ok_render = render_person_roi(
+                            frame, x1, y1, x2, y2, _mf,
+                            style=style, blocks=blocks, blur=blur,
+                            area_mode=area_mode)
+                    if ok_render:
                         rendered_tids.add(tid)
 
                 # 사람 트랙에 매칭되지 않은 사람 부착 박스(트랙 ID 불일치,
@@ -920,31 +1155,50 @@ class MosaicJob:
                             rendered_region_cats.add(cat)
                             rendered_cats.add(cat)
 
-                out.write(frame)
+                if writer is not None:
+                    writer.write(frame)
+                else:
+                    out.write(frame)
                 done += 1
                 if progress_fn and total > 0:
                     try:
                         progress_fn(
-                            0.5 + 0.5 * min(1.0, done / max(1, total)),
+                            progress_base + (1.0 - progress_base)
+                            * min(1.0, done / max(1, total)),
                             done, total, time.time() - t0)
                     except Exception:
                         pass
             if done == 0:
                 raise RuntimeError("처리된 프레임이 없습니다.")
         except Exception:
-            cleanup_tmp(tmp_noaudio)
+            if writer is not None:
+                writer.abort()
+            else:
+                cleanup_tmp(tmp_noaudio)
             raise
         finally:
-            out.release()
+            if cap2 is not None:
+                cap2.release()
 
-        try:
-            mux_audio_h264(tmp_noaudio, input_path, output_path,
-                           preset=encode_preset)
-        except Exception:
-            cleanup_tmp(output_path)
-            shutil.copy(tmp_noaudio, output_path)
-        finally:
-            cleanup_tmp(tmp_noaudio)
+        if writer is not None:
+            writer.close()
+        else:
+            out.release()
+            try:
+                mux_audio_h264(tmp_noaudio, input_path, output_path,
+                               preset=encode_preset)
+            except Exception:
+                cleanup_tmp(output_path)
+                shutil.copy(tmp_noaudio, output_path)
+            finally:
+                cleanup_tmp(tmp_noaudio)
+
+        if blanket_cats:
+            for tid in rendered_tids:
+                cat_on.setdefault(tid, {})
+                for cat in blanket_cats:
+                    cat_on[tid].setdefault(cat, True)
+            rendered_cats.update(blanket_cats)
 
         stats = {}
         for tid in sorted(set(votes) | set(cat_on) | rendered_tids):
@@ -966,6 +1220,8 @@ class MosaicJob:
         stats["_regions"] = len(rendered_region_cats)
         stats["_cats"] = sorted(rendered_cats)
         stats["_untracked"] = sorted(untracked_cats)
+        stats["_vlm_calls"] = int(vlm_budget.used_this_video)
+        stats["_vlm_errors"] = int(vlm_errors)
         return stats
 
 
@@ -976,7 +1232,8 @@ def mosaic_video(input_path, output_path, targets=None, invert=False,
                  keyframe_stride=3, progress_fn=None,
                  query_raw="", api_key=None, vlm_model=VLM_MODEL,
                  vlm_base_url=None, region_priors=None, person_priors=None,
-                 cache_path=None, use_cache=False):
+                 cache_path=None, use_cache=False,
+                 vlm_call_limit=None, mask_all_persons=False):
     """호환 래퍼."""
     job = MosaicJob(input_path, output_path, targets=targets, invert=invert,
                     conf=conf, model_name=model_name, imgsz=imgsz,
@@ -987,5 +1244,7 @@ def mosaic_video(input_path, output_path, targets=None, invert=False,
                     vlm_base_url=vlm_base_url,
                     region_priors=region_priors,
                     person_priors=person_priors,
-                    cache_path=cache_path, use_cache=use_cache)
+                    cache_path=cache_path, use_cache=use_cache,
+                    vlm_call_limit=vlm_call_limit,
+                    mask_all_persons=mask_all_persons)
     return job.run(progress_fn)

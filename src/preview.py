@@ -2,14 +2,20 @@
 YOLO11-seg는 사람 박스/마스크와 차량 크롭 후보만 만들고, 개인정보 항목은
 VLM이 찾는다. VLM이 찾은 항목을 카테고리별 체크리스트로 묶어 돌려준다.
 """
+import os
 import cv2
+import math
 import numpy as np
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .config import (CANDS, CATEGORY_TYPE, VLM_MODEL, canon_category,
                      category_type, label_ko)
 from .detect import filter_contained, big_enough, iou, match_box
+from .render import render_person_strict, render_region
 from .select import VLMSelector
-from .vlm_budget import VLMBudget
+from .models import MODEL_LOCK
+from .vlm_budget import VLMBudget, classify_vlm_error
 from .vlm_package import (VLMError, detect_with_vlm, prompt_categories)
 
 # COCO 차량 클래스: car, motorcycle, bus, truck
@@ -109,9 +115,14 @@ def _detect_vehicles(model, frame, imgsz):
     """번호판 확대 탐지를 위한 차량 크롭 후보. VLM이 아니라 YOLO11-seg가
     '차량 영역'만 제안하고, 번호판 판정은 VLM이 한다."""
     try:
-        pr = list(model.predict(source=frame, conf=0.18,
-                                classes=VEHICLE_CLASSES, verbose=False,
-                                imgsz=max(640, int(imgsz)), max_det=20))[0]
+        # 여러 샘플 스레드가 같은 YOLO 모델을 동시에 predict하면 내부
+        # predictor 상태가 깨질 수 있다. 추론만 직렬화하고 VLM 대기는
+        # 각 스레드에서 병렬로 유지한다.
+        with MODEL_LOCK:
+            pr = list(model.predict(source=frame, conf=0.18,
+                                    classes=VEHICLE_CLASSES, verbose=False,
+                                    imgsz=max(640, int(imgsz)),
+                                    max_det=20))[0]
         if pr.boxes is None or len(pr.boxes) == 0:
             return []
         xy = pr.boxes.xyxy.cpu().numpy().astype(int)
@@ -133,7 +144,7 @@ def _detect_vehicles(model, frame, imgsz):
 
 def _refine_plates(frame, vlm_boxes, model, imgsz, api_key, vlm_model,
                    vlm_base_url, max_calls=2, max_vehicles=4,
-                   budget: VLMBudget | None = None):
+                   budget: VLMBudget | None = None, cancel_event=None):
     """VLM이 전체 프레임에서 번호판을 놓쳤을 때, 차량 크롭을 확대해
     번호판 전용 VLM 호출을 한다. 찾은 박스는 원본 좌표로 되돌린다.
     번호판 판정은 여전히 VLM이 하며, YOLO는 차량 크롭만 제안한다.
@@ -161,8 +172,7 @@ def _refine_plates(frame, vlm_boxes, model, imgsz, api_key, vlm_model,
     for vx1, vy1, vx2, vy2, _conf in vehicles[:max_vehicles]:
         if calls >= max_calls:
             break
-        # 예산 재확인 (중간 호출에서 소진될 수 있음)
-        if budget is not None and not budget.can_call():
+        if cancel_event is not None and cancel_event.is_set():
             break
         # 이미 번호판을 찾은 차량은 건너뛴다.
         already = False
@@ -189,9 +199,10 @@ def _refine_plates(frame, vlm_boxes, model, imgsz, api_key, vlm_model,
             crop = cv2.resize(crop, (target_w, target_h),
                               interpolation=cv2.INTER_CUBIC)
         ch2, cw2 = crop.shape[:2]
+        # 병렬 샘플 스레드에서도 한도를 넘지 않도록 원자적으로 예약한다.
+        if budget is not None and not budget.reserve():
+            break
         calls += 1
-        if budget is not None:
-            budget.record(1)
         try:
             found = detect_with_vlm(
                 crop, ["license_plate"], api_key, model=vlm_model,
@@ -199,6 +210,11 @@ def _refine_plates(frame, vlm_boxes, model, imgsz, api_key, vlm_model,
                 focus="license_plate",
                 max_retries=2)
         except VLMError as e:
+            # 한도/인증/모델 오류는 더 호출해도 실패하므로 상위로 올려
+            # 남은 샘플 호출을 중단시킨다. 서버/파싱 오류만 무시한다.
+            if classify_vlm_error(e) in ("quota_exceeded", "auth_error",
+                                         "model_not_found"):
+                raise
             print(f"번호판 확대 탐지 실패(무시): {e}")
             continue
 
@@ -231,15 +247,17 @@ def analyze_first_frame_items(frame, model, conf, imgsz,
                               frame_idx=0,
                               refine_plates=True,
                               plate_zoom_calls=2,
-                              plate_budget: VLMBudget | None = None):
+                              plate_budget: VLMBudget | None = None,
+                              cancel_event=None):
     """returns (anno_bgr, persons, items).
     items: VLM이 찾은 카테고리별 체크리스트 항목. persons: 사람 요약 목록.
     """
     targets = ([targets] if isinstance(targets, str)
                else (list(targets) if targets else list(CANDS)))
 
-    pr = list(model.predict(source=frame, conf=conf, classes=[0],
-                            verbose=False, imgsz=imgsz))[0]
+    with MODEL_LOCK:
+        pr = list(model.predict(source=frame, conf=conf, classes=[0],
+                                verbose=False, imgsz=imgsz))[0]
     boxes = np.zeros((0, 4), dtype=int)
     if pr.boxes is not None and len(pr.boxes) > 0:
         boxes = pr.boxes.xyxy.cpu().numpy().astype(int)
@@ -260,10 +278,12 @@ def analyze_first_frame_items(frame, model, conf, imgsz,
                            api_key=api_key, vlm_model=vlm_model,
                            vlm_base_url=vlm_base_url)
     vlm_boxes = selector.detect_boxes(frame)
-    if refine_plates and "license_plate" in targets and plate_zoom_calls > 0:
+    if (refine_plates and "license_plate" in targets and plate_zoom_calls > 0
+            and not (cancel_event is not None and cancel_event.is_set())):
         vlm_boxes = _refine_plates(
             frame, vlm_boxes, model, imgsz, api_key, vlm_model, vlm_base_url,
-            max_calls=min(2, plate_zoom_calls), budget=plate_budget)
+            max_calls=min(2, plate_zoom_calls), budget=plate_budget,
+            cancel_event=cancel_event)
     judged = selector.match_items(cand, vlm_boxes)
 
     persons = []
@@ -352,9 +372,10 @@ def _merge_items(all_items):
 def analyze_video(video_path, model, conf, imgsz,
                   query_raw="", targets=None, api_key=None,
                   vlm_model=VLM_MODEL, samples=12, vlm_base_url=None,
-                  plate_zoom_budget=6):
+                  plate_zoom_budget=6, parallel_workers=3):
     """영상 앞/중간/끝을 고르게 샘플링해 체크리스트 항목을 만든다.
-    기본 12개 샘플로 짧게 등장하는 번호판도 최대한 포함한다.
+    샘플 프레임들을 ThreadPoolExecutor로 병렬 처리한다. 각 워커는
+    해당 프레임만 읽고 VLM을 호출해 독립적으로 결과를 낸다.
     returns (anno_bgr, persons, items). 첫 샘플 화면을 미리보기로 쓴다.
     """
     cap = cv2.VideoCapture(video_path)
@@ -373,30 +394,327 @@ def analyze_video(video_path, model, conf, imgsz,
     n = max(1, int(samples))
     idxs = sorted(set(int(round(v))
                       for v in np.linspace(0, max(0, total - 1), n)))
-    anno0, persons0 = None, []
-    all_items = []
-    plate_budget = VLMBudget(
-        per_video_limit=max(0, int(plate_zoom_budget)))
+
+    # 병렬 처리를 위해 프레임 비트맵을 사전에 읽어 둔다.
+    frames = []
     for idx in idxs:
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ok, frame = cap.read()
         if not ok:
             continue
-        # 일부 코덱은 요청한 프레임과 실제로 읽은 프레임이 다르다.
-        # priors를 프레임에 정확히 맞추기 위해 실제 위치를 쓴다.
         try:
             pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
             actual_idx = max(0, pos - 1)
         except Exception:
             actual_idx = idx
-        anno, persons, items = analyze_first_frame_items(
-            frame, model, conf, imgsz, query_raw=query_raw, targets=targets,
-            api_key=api_key, vlm_model=vlm_model, vlm_base_url=vlm_base_url,
-            frame_idx=actual_idx, plate_budget=plate_budget)
-        if anno0 is None:
-            anno0, persons0 = anno, persons
-        all_items.append(items)
+        frames.append((actual_idx, frame))
     cap.release()
-    if not all_items:
+    if not frames:
         return None, [], []
+
+    plate_budget = VLMBudget(
+        per_video_limit=max(0, int(plate_zoom_budget)))
+    results = [None] * len(frames)
+    errors = []
+    fatal_errors = []
+    fatal = threading.Event()
+
+    def _process(i, actual_idx, frame):
+        # 한도/인증 오류가 먼저 난 경우 대기 중이던 샘플은 호출하지 않는다.
+        if fatal.is_set():
+            results[i] = (None, [], [])
+            return
+        try:
+            anno, persons, items = analyze_first_frame_items(
+                frame, model, conf, imgsz, query_raw=query_raw,
+                targets=targets, api_key=api_key, vlm_model=vlm_model,
+                vlm_base_url=vlm_base_url, frame_idx=actual_idx,
+                plate_budget=plate_budget, cancel_event=fatal)
+            results[i] = (anno, persons, items)
+        except Exception as e:
+            errors.append(e)
+            if classify_vlm_error(e) in ("quota_exceeded", "auth_error",
+                                         "model_not_found"):
+                fatal_errors.append(e)
+                fatal.set()
+            results[i] = (None, [], [])
+
+    with ThreadPoolExecutor(max_workers=parallel_workers) as ex:
+        futs = []
+        for i, (actual_idx, frame) in enumerate(frames):
+            futs.append(ex.submit(_process, i, actual_idx, frame))
+        for f in as_completed(futs):
+            try:
+                f.result()
+            except Exception as e:
+                errors.append(e)
+
+    # 한도/인증 오류는 빈 결과로 숨기지 않고 그대로 알린다.
+    if fatal_errors:
+        raise fatal_errors[0]
+
+    collected = [r for r in results
+                 if r is not None and r[0] is not None]
+    if not collected:
+        if errors:
+            raise errors[0]
+        return None, [], []
+    anno0, persons0 = collected[0][0], collected[0][1]
+    all_items = [r[2] for r in collected]
     return anno0, persons0, _merge_items(all_items)
+
+
+def _pair_boxes(prev_boxes, next_boxes):
+    """앞/뒤 샘플 박스를 중심 거리로 짝짓는다. 미리보기 보간용."""
+    used = set()
+    pairs = []
+    for p in prev_boxes:
+        pxy = [float(v) for v in p]
+        pw = max(1.0, pxy[2] - pxy[0])
+        ph = max(1.0, pxy[3] - pxy[1])
+        pcx, pcy = (pxy[0] + pxy[2]) / 2.0, (pxy[1] + pxy[3]) / 2.0
+        best, best_score = None, None
+        for j, n in enumerate(next_boxes):
+            if j in used:
+                continue
+            nxy = [float(v) for v in n]
+            nw = max(1.0, nxy[2] - nxy[0])
+            nh = max(1.0, nxy[3] - nxy[1])
+            ratio = (nw * nh) / max(1.0, pw * ph)
+            if ratio < 0.25 or ratio > 4.0:
+                continue
+            ncx, ncy = (nxy[0] + nxy[2]) / 2.0, (nxy[1] + nxy[3]) / 2.0
+            dist = math.hypot(ncx - pcx, ncy - pcy) / max(pw, ph, nw, nh)
+            if dist > 1.5:
+                continue
+            if best_score is None or dist < best_score:
+                best, best_score = j, dist
+        if best is None:
+            pairs.append((pxy, pxy))
+        else:
+            used.add(best)
+            pairs.append((pxy, [float(v) for v in next_boxes[best]]))
+    return pairs
+
+
+def _boxes_at_frame(samples, frame_idx):
+    """현재 프레임에 가장 가까운 박스 묶음을 돌려준다(가능하면 보간)."""
+    if not samples:
+        return []
+    keys = sorted(int(k) for k in samples)
+    if not keys:
+        return []
+    prev = [k for k in keys if k <= frame_idx]
+    if not prev:
+        return [list(map(int, b)) for b in samples[keys[0]]]
+    prev_k = prev[-1]
+    nxt = [k for k in keys if k > frame_idx]
+    prev_boxes = [list(map(int, b)) for b in samples[prev_k]]
+    if not nxt:
+        return prev_boxes
+    next_k = nxt[0]
+    gap = next_k - prev_k
+    if gap <= 0 or gap > 120:
+        return prev_boxes
+    t = max(0.0, min(1.0, (frame_idx - prev_k) / float(gap)))
+    next_boxes = [list(map(int, b)) for b in samples[next_k]]
+    out = []
+    for a, b in _pair_boxes(prev_boxes, next_boxes):
+        out.append([int(round(a[i] + (b[i] - a[i]) * t)) for i in range(4)])
+    return out
+
+
+def _fmt_time(seconds):
+    """재생 시간 표시용 mm:ss."""
+    seconds = max(0.0, float(seconds or 0.0))
+    minutes = int(seconds // 60)
+    secs = int(seconds % 60)
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def build_filmstrip(frames, width=1600, thumb_h=72, max_thumbs=48,
+                    progress=0.0):
+    """타임라인 아래 필름스트립을 한 장의 이미지로 만든다.
+
+    samples의 대표 프레임들을 시간 순으로 균등하게 나열한다. blur.me처럼
+    '어디를 봐도 어떤 장면인지' 바로 보이게 하고, 현재 재생 위치에 흰색
+    커서를 표시한다. 썸네일은 한 번만 만들어 streamlit 캐시에 둔다.
+    """
+    if not frames:
+        return None
+    h0, w0 = frames[0].shape[:2]
+    aspect = w0 / float(max(1, h0))
+    thumb_w = max(32, int(round(thumb_h * aspect)))
+    n = min(len(frames), int(max_thumbs))
+    if n <= 0:
+        return None
+    if len(frames) > n:
+        idxs = [int(round(i * (len(frames) - 1) / float(max(1, n - 1))))
+                for i in range(n)]
+    else:
+        idxs = list(range(len(frames)))
+    thumbs = []
+    for i in idxs:
+        fr = frames[i]
+        thumbs.append(cv2.resize(fr, (thumb_w, thumb_h),
+                                 interpolation=cv2.INTER_AREA))
+    total_w = max(1, sum(t.shape[1] for t in thumbs))
+    strip = np.hstack(thumbs)
+    if strip.shape[1] != total_w:
+        strip = cv2.resize(strip, (total_w, thumb_h))
+    else:
+        strip = strip.copy()
+    # 경계선 + 현재 위치 커서
+    for x in range(thumb_w, total_w, thumb_w):
+        cv2.line(strip, (x, 0), (x, thumb_h), (0, 0, 0), 1)
+    cv2.rectangle(strip, (0, 0), (total_w - 1, thumb_h - 1), (30, 30, 30), 1)
+    cx = int(round(max(0.0, min(1.0, float(progress))) * (total_w - 1)))
+    cv2.line(strip, (cx, 0), (cx, thumb_h), (255, 255, 255), 3)
+    return strip
+
+
+def build_preview_video(
+        proc_in, items, selected_cats, style="pixel", blocks=30,
+        blur=61, area_mode="face_only", max_frames=90, tmp_dir=None,
+        on_progress=None, preset="ultrafast", crf=28):
+    """타임라인을 움직이지 않아도 움직임을 볼 수 있는 미리보기 영상.
+
+    선택 항목이 없으면 원본 H.264 사본만 만든다. 항목이 있으면 샘플
+    박스를 전 프레임에 보간해 render_preview_frame으로 그린다. 전체
+    렌더가 아니라 재생 미리보기용이라 프레임 수와 길이를 제한한다.
+    returns: 파일 경로 또는 None.
+    """
+    if not proc_in:
+        return None
+    cap = cv2.VideoCapture(proc_in)
+    if not cap.isOpened():
+        return None
+    error = None
+    try:
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        frame_n = min(max(1, total or max_frames), int(max_frames))
+        if tmp_dir:
+            os.makedirs(tmp_dir, exist_ok=True)
+            out_path = os.path.join(tmp_dir, "preview_video.mp4")
+        else:
+            import tempfile
+            out_path = tempfile.mktemp(suffix=".mp4", prefix="preview_")
+        writer = None
+        writer_is_ffmpeg = False
+        try:
+            from .render import FFmpegFrameWriter
+            writer = FFmpegFrameWriter(out_path, 0, 0, fps,
+                                       audio_src=proc_in,
+                                       preset=preset, crf=crf)
+            writer_is_ffmpeg = True
+        except Exception:
+            writer = None
+        try:
+            if writer is not None:
+                width = writer.width
+                height = writer.height
+            else:
+                width = height = 0
+            idxs = []
+            if total > 1:
+                idxs = [int(round(i * (total - 1) / float(max(1, frame_n - 1))))
+                        for i in range(frame_n)]
+            else:
+                idxs = [0]
+            for i, frame_idx in enumerate(idxs):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    continue
+                if selected_cats and items:
+                    frame = render_preview_frame(
+                        frame, items, selected_cats, style=style,
+                        blocks=blocks, blur=blur, area_mode=area_mode,
+                        frame_idx=int(frame_idx))
+                # writer.write()가 인코더 크기(0이면 첫 프레임에서 결정)를
+                # 처리하므로 여기서 미리 resize하지 않는다.
+                if writer_is_ffmpeg:
+                    writer.write(frame)
+                elif writer is not None:
+                    writer.write(frame)
+                else:
+                    if writer is None and width == 0:
+                        height, width = frame.shape[:2]
+                        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                        writer = cv2.VideoWriter(out_path, fourcc, fps,
+                                                 (width, height))
+                        if not writer.isOpened():
+                            return None
+                    writer.write(frame)
+                if on_progress is not None:
+                    try:
+                        on_progress((i + 1) / float(max(1, len(idxs))))
+                    except Exception:
+                        pass
+            if writer is not None:
+                if writer_is_ffmpeg:
+                    writer.close()
+                else:
+                    writer.release()
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+                return out_path
+            return None
+        except Exception as e:
+            error = e
+            try:
+                if writer is not None and hasattr(writer, "abort"):
+                    writer.abort()
+                elif writer is not None:
+                    writer.release()
+            except Exception:
+                pass
+            if os.path.exists(out_path):
+                try:
+                    os.remove(out_path)
+                except OSError:
+                    pass
+            return None
+    finally:
+        cap.release()
+        # 실패한 경우에만 임시 프리뷰 파일을 정리한다(성공은 return로 빠져나간다).
+        if error is not None and os.path.exists(out_path):
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+
+
+def render_preview_frame(frame, items, selected_cats, style="pixel",
+                         blocks=30, blur=61, area_mode="face_only",
+                         frame_idx=0):
+    """한 프레임에 선택 항목 모자이크를 미리 적용한다.
+
+    전체 영상 렌더 전에 타임라인/효과를 즉시 확인하기 위한 근사 렌더다.
+    사람 항목은 '가리는 범위'를 적용하고, 번호판·명찰은 탐지 박스를
+    그대로 가린다.
+    """
+    out = frame.copy()
+    selected = set(selected_cats or [])
+    for it in items or []:
+        cat = it.get("category")
+        if cat not in selected:
+            continue
+        boxes = _boxes_at_frame(it.get("samples") or {}, int(frame_idx))
+        if not boxes:
+            continue
+        for xyxy in boxes:
+            if len(xyxy) != 4:
+                continue
+            if it.get("type") == "region" or cat == "name_tag":
+                render_region(out, *xyxy, style=style, blocks=blocks,
+                              blur=blur, pad=4)
+            else:
+                try:
+                    render_person_strict(
+                        out, *xyxy, None, style=style, blocks=blocks,
+                        blur=blur, area_mode=area_mode)
+                except Exception:
+                    render_region(out, *xyxy, style=style, blocks=blocks,
+                                  blur=blur, pad=4)
+    return out

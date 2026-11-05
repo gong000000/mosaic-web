@@ -10,15 +10,23 @@ import tempfile
 import cv2
 import streamlit as st
 
-from src.config import (CANDS, PRESETS, OUTPUT_DIR, VLM_PROVIDERS,
-                        label_ko)
-from src.preview import analyze_video
+from src.config import (CATEGORY_TYPE, CANDS, PRESETS, OUTPUT_DIR,
+                        VLM_PROVIDERS, label_ko)
+from src.preview import (analyze_video, render_preview_frame,
+                         build_filmstrip, build_preview_video)
 from src.vlm_package import prompt_categories
 from src.render import normalize_video, trim_video
 from src.models import get_model, MODEL_LOCK
-from src.pipeline import mosaic_video
 from src import history as H
 from src import retention as RT
+
+
+# blur.me 스튜디오처럼 '항상 빠름' 고정. UI에서 속도/샘플을 고르지 않는다.
+FAST_MODEL = "yolo11n-seg.pt"
+FAST_IMGSZ = 480
+FAST_STRIDE = 15
+FAST_SAMPLES = 4
+FAST_PRESET = "veryfast"
 
 
 st.set_page_config(
@@ -360,14 +368,26 @@ if purged or stale_rows:
                + (f" · 만료된 기록 {stale_rows}개 정리" if stale_rows else ""))
 
 
+
 def _apply_preset():
-    """프리셋 선택 시 프롬프트를 위젯 생성 전에 채운다."""
-    st.session_state["prompt_txt"] = PRESETS.get(
-        st.session_state.get("preset_sel", ""), "")
+    """프리셋을 사이드바/본문 프롬프트에 동시에 반영한다."""
+    txt = PRESETS.get(st.session_state.get("preset_sel", ""), "")
+    st.session_state["prompt_txt"] = txt
+    st.session_state["prompt_edit"] = txt
+
+
+def _sync_prompt_from_sidebar():
+    st.session_state["prompt_edit"] = st.session_state.get("prompt_txt", "")
+
+
+def _sync_prompt_from_main():
+    st.session_state["prompt_txt"] = st.session_state.get("prompt_edit", "")
 
 
 if "prompt_txt" not in st.session_state:
     st.session_state["prompt_txt"] = PRESETS["얼굴 + 차량번호판"]
+if "prompt_edit" not in st.session_state:
+    st.session_state["prompt_edit"] = st.session_state["prompt_txt"]
 
 with st.sidebar:
     st.header("설정")
@@ -380,7 +400,8 @@ with st.sidebar:
                  on_change=_apply_preset)
     prompt_raw = st.text_area(
         "프롬프트", key="prompt_txt", height=90,
-        help="이 문장이 VLM 요청에 그대로 포함됩니다. VLM은 영상 프레임을 보고 판단합니다.",
+        on_change=_sync_prompt_from_sidebar,
+        help="이 문장이 VLM 요청에 포함됩니다. 미리보기 화면에서도 수정할 수 있습니다.",
     )
 
     st.subheader("3. VLM")
@@ -395,44 +416,23 @@ with st.sidebar:
         help="제공자의 비전 모델 이름.")
     api_key = st.text_input(
         "API 키", type="password", key=f"vlm_key_{provider_label}",
-        help="VLM 판정에 쓰는 영상 프레임이 선택한 제공자로 전송됩니다. "
-             "영상 파일 자체는 전송되지 않습니다.")
-
-    st.subheader("4. 속도 모드")
-    sample_n = st.select_slider(
-        "체크리스트 샘플", options=[4, 6, 8, 12], value=12,
-        help="많을수록 짧게 등장하는 항목을 잘 찾지만 VLM 호출이 늘어납니다.")
-    speed_label = st.radio("속도", ["빠름", "보통", "정밀"], index=1,
-                           help="빠름: 작은 모델·15프레임 간격 / 보통: 중간 모델·5프레임 간격 / "
-                                "정밀: 큰 모델·모든 프레임. 간격마다 VLM이 판정합니다.")
-    speed_map = {
-        "빠름": ("yolo11n-seg.pt", 480, "veryfast", 15),
-        "보통": ("yolo11m-seg.pt", 640, "veryfast", 5),
-        "정밀": ("yolo11x-seg.pt", 960, "slow", 1),
-    }
-    model_name, imgsz, encode_preset, keyframe_stride = speed_map[speed_label]
-
-    st.subheader("5. 모자이크 설정")
-    area_label = st.selectbox("가리는 범위", ["전체", "상반신", "얼굴만"], index=0)
-    area_mode = {"전체": "full", "상반신": "upper", "얼굴만": "face_only"}[area_label]
-    st.caption("사람 항목에 적용됩니다. 명찰은 이 설정과 무관하게 VLM이 찾은 "
-               "위치를 항상 가립니다. 배경 항목은 항상 탐지 영역만 가립니다.")
-    style_label = st.selectbox("모자이크 모양", ["모자이크", "흐리게", "검게"], index=0)
-    style = {"모자이크": "pixel", "흐리게": "blur", "검게": "solid"}[style_label]
-    if style == "모자이크":
-        blocks = st.slider("강도", 18, 44, 30,
-                           help="값이 클수록 더 강하게 가립니다.")
-        blur = 61
-    elif style == "흐리게":
-        blocks = 30
-        blur = st.slider("흐림 정도", 21, 101, 61, step=2)
-    else:
-        blocks, blur = 30, 61
+        help="VLM 판정에 쓰는 영상 프레임만 전송됩니다. 영상 파일 자체는 전송되지 않습니다.")
 
     st.divider()
     auto_del = st.checkbox("받으면 결과 자동 삭제", value=False)
 
 if not uploaded:
+    st.markdown(
+        """
+        <div class="info-card">
+            <h3>시작하기</h3>
+            <p>1) 왼쪽에서 영상을 올립니다. 2) 프롬프트와 VLM API 키를 입력합니다.
+            3) 분석이 끝나면 체크리스트와 실시간 미리보기가 나타나고,
+            별도 버튼 없이 자동으로 모자이크 영상이 만들어집니다.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     st.stop()
 
 # 세션마다 임시 폴더 1개만 쓴다. 업로드가 바뀔 때만 다시 기록한다.
@@ -443,8 +443,6 @@ if not tmp_dir or not os.path.isdir(tmp_dir):
 
 raw_bytes = uploaded.getvalue()
 digest = hashlib.sha256(raw_bytes).hexdigest()[:16]
-# 파일명/크기만 같고 내용이 다른 영상이 이전 분석 결과를 재사용하지 않도록
-# 내용 해시까지 키에 넣는다.
 upload_id = (uploaded.name, uploaded.size, digest)
 raw_suffix = os.path.splitext(uploaded.name)[1].lower()
 suffix = raw_suffix if raw_suffix in (".mp4", ".mov", ".avi") else ".mp4"
@@ -473,7 +471,9 @@ if st.session_state.get("upload_id") != upload_id or not os.path.exists(in_path)
     st.session_state["input_path"] = in_path
     st.session_state.pop("trim_key", None)
     st.session_state.pop("preview_key", None)
+    st.session_state.pop("preview_pos", None)
     st.session_state.pop("result", None)
+    st.session_state.pop("quota_sig", None)
 
 
 def _probe_video(path):
@@ -492,9 +492,94 @@ def _probe_video(path):
         cap.release()
 
 
+@st.cache_data(show_spinner=False, max_entries=6)
+def _read_frame_cached(path, idx, token):
+    """미리보기용 프레임 1장. 업로드 내용(token)이 바뀌면 캐시도 갈린다."""
+    cap = cv2.VideoCapture(path)
+    try:
+        if not cap.isOpened():
+            return None
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(idx)))
+        ok, frame = cap.read()
+        return frame if ok else None
+    finally:
+        cap.release()
+
+
+@st.cache_data(show_spinner=False)
+def _filmstrip_frames_cached(path, token):
+    """필름스트립용 대표 프레임. 시간 순으로 균등하게 뽑는다."""
+    import numpy as np
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return None
+    try:
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        if total <= 0:
+            return None
+        want = 48
+        idxs = []
+        if total > 1:
+            idxs = [int(round(i * (total - 1) / float(want - 1)))
+                    for i in range(min(want, total))]
+        else:
+            idxs = [0]
+        frames = []
+        for idx in idxs:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                frames.append(frame)
+        return np.array(frames) if frames else None
+    finally:
+        cap.release()
+
+
+@st.cache_data(show_spinner=False, max_entries=6)
+def _filmstrip_cached(path, token, progress):
+    frames = _filmstrip_frames_cached(path, token)
+    if frames is None or len(frames) == 0:
+        return None
+    import numpy as np
+    frames = [np.asarray(f) for f in frames]
+    return build_filmstrip(frames, progress=float(progress))
+
+
+def _get_preview_video_path(proc_in, items, selected_cats, style, blocks,
+                            blur, area_mode, cache_token):
+    """미리보기 영상을 tmp_dir에 만들고 경로를 돌려준다.
+
+    Streamlit 캐시에 파일 전체를 들고 있지 않으므로 새로고침에도
+    파일 핸들을 유지하지 않는다. 설정/선택이 바뀌면 파일이 갈린다.
+    """
+    import hashlib, json
+    sig = hashlib.sha1(json.dumps({
+        "items": [(it.get("category"),
+                   sorted((int(k), [list(map(int, b)) for b in v])
+                            for k, v in (it.get("samples") or {}).items()))
+                  for it in (items or [])],
+        "sel": sorted(selected_cats or []),
+        "style": style, "blocks": int(blocks), "blur": int(blur),
+        "area": area_mode, "tok": cache_token,
+    }, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()[:12]
+    out_path = os.path.join(tmp_dir, f"preview_{sig}.mp4")
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+        return out_path
+    pv = build_preview_video(proc_in, items, selected_cats, style=style,
+                              blocks=blocks, blur=blur, area_mode=area_mode,
+                              max_frames=90, tmp_dir=tmp_dir)
+    if pv and os.path.exists(pv):
+        if pv != out_path:
+            try:
+                shutil.copy(pv, out_path)
+            except OSError:
+                out_path = pv
+        return out_path
+    return None
+
+
 probe = _probe_video(in_path)
-# MOV/AVI는 브라우저 미리보기와 OpenCV 읽기가 불안정하므로 MP4 사본을
-# 만들어 처리한다. MP4라도 읽기 실패하면 변환을 한 번 시도한다.
+# MOV/AVI는 브라우저 미리보기와 OpenCV 읽기가 불안정하므로 MP4 사본을 만든다.
 needs_norm = suffix != ".mp4" or probe is None
 if needs_norm:
     if not os.path.exists(norm_path):
@@ -536,7 +621,8 @@ if use_trim:
         proc_in = src_path
     else:
         trim_sig = (upload_id, float(s_sec), float(e_sec))
-        if st.session_state.get("trim_key") != trim_sig or not os.path.exists(trim_path):
+        if (st.session_state.get("trim_key") != trim_sig
+                or not os.path.exists(trim_path)):
             with st.spinner("구간 자르는 중..."):
                 try:
                     trim_video(src_path, trim_path, s_sec,
@@ -545,83 +631,136 @@ if use_trim:
                     st.error(f"구간 자르기 실패: {e}")
                     st.stop()
             st.session_state["trim_key"] = trim_sig
+            st.session_state.pop("preview_key", None)
+            st.session_state.pop("result", None)
+            st.session_state["preview_pos"] = 0
         proc_in = trim_path
 else:
     s_sec, e_sec = 0.0, 0.0
     proc_in = src_path
 
-st.subheader("1. 개인정보 항목 확인")
-if st.button("다시 분석"):
-    st.session_state.pop("preview_key", None)
-    st.session_state.pop("result", None)
-    st.rerun()
+proc_probe = _probe_video(proc_in)
+proc_total = int(proc_probe[0]) if proc_probe else total0
 
-# 분석 단계에서는 프롬프트 항목 + 모든 개인정보 카테고리를 후보로 찾는다.
-# 체크리스트에서 실제로 가릴 항목을 고른다.
+st.subheader("1. 개인정보 항목 확인")
+
 analysis_targets = list(CANDS)
+analysis_key = None
 ok = False
 preview_err = ""
-anno, persons, items = None, [], []
-preview_key = None
+anno, persons, base_items = None, [], []
 
 if not api_key.strip():
     st.warning("VLM API 키를 입력해야 영상을 분석할 수 있습니다.")
 else:
-    st.caption(f"VLM: {provider_label} · {vlm_model or '(모델명 없음)'} · "
-               "설정을 바꾸면 자동으로 다시 분석합니다.")
-    preview_key = (upload_id, prompt_raw, tuple(analysis_targets),
-                   api_key, vlm_base_url, vlm_model, model_name, imgsz,
-                   sample_n, trim_sig)
-    if st.session_state.get("preview_key") != preview_key:
-        # 영상/프롬프트/설정이 바뀌면 이전 결과 영상은 더 이상 유효하지 않다.
+    key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
+    analysis_key = (upload_id, tuple(analysis_targets), key_hash,
+                    vlm_base_url, vlm_model, provider_label,
+                    FAST_MODEL, FAST_IMGSZ, FAST_SAMPLES, trim_sig)
+
+    if st.button("다시 분석", key="reanalyze"):
+        st.session_state.pop("preview_key", None)
         st.session_state.pop("result", None)
+        st.session_state.pop("quota_sig", None)
+        st.rerun()
+
+    st.caption(f"VLM: {provider_label} · {vlm_model or '(모델명 없음)'} · "
+               "영상이 바뀌면 자동으로 다시 분석합니다. "
+               "프롬프트만 바꾸면 VLM을 다시 호출하지 않고 체크 항목만 갱신합니다.")
+    if st.session_state.get("preview_key") != analysis_key:
+        st.session_state.pop("result", None)
+        st.session_state.pop("quota_sig", None)
         err = None
-        anno, persons, items = None, [], []
+        anno, persons, found = None, [], []
         with st.spinner("영상 샘플 분석 중... (VLM)"):
             try:
-                det = load_model_cached(model_name)
-                with MODEL_LOCK:
-                    anno, persons, items = analyze_video(
-                        proc_in, det, conf=0.20, imgsz=imgsz,
-                        query_raw=prompt_raw, targets=analysis_targets,
-                        api_key=api_key,
-                        vlm_model=vlm_model,
-                        vlm_base_url=vlm_base_url,
-                        samples=sample_n,
-                    )
+                det = load_model_cached(FAST_MODEL)
+                # analyze_video 내부에서 YOLO predict만 MODEL_LOCK으로
+                # 직렬화한다. 바깥에서 락을 잡으면 병렬 워커가 락을
+                # 기다리다 교착되므로 여기서는 잡지 않는다.
+                anno, persons, found = analyze_video(
+                    proc_in, det, conf=0.20, imgsz=FAST_IMGSZ,
+                    query_raw=prompt_raw, targets=analysis_targets,
+                    api_key=api_key,
+                    vlm_model=vlm_model,
+                    vlm_base_url=vlm_base_url,
+                    samples=FAST_SAMPLES,
+                )
             except Exception as e:
                 err = e
-        st.session_state["preview_key"] = preview_key
+        st.session_state["preview_key"] = analysis_key
         st.session_state["preview_err"] = (
             _friendly_vlm_error(err, api_key) if err else "")
         st.session_state["preview_ok"] = anno is not None and err is None
         st.session_state["preview_anno"] = anno
         st.session_state["preview_persons"] = persons
-        st.session_state["preview_items"] = items
+        st.session_state["preview_items"] = found
         st.session_state["analysis_n"] = st.session_state.get("analysis_n", 0) + 1
 
     ok = st.session_state.get("preview_ok", False)
     preview_err = st.session_state.get("preview_err", "")
     anno = st.session_state.get("preview_anno")
     persons = st.session_state.get("preview_persons", [])
-    items = st.session_state.get("preview_items", [])
-# 분석이 바뀌면 체크박스 키도 바뀌어서 기본값(체크)으로 새로 시작한다.
-analysis_id = str(st.session_state.get("analysis_n", 0))
+    base_items = st.session_state.get("preview_items", [])
 
 if preview_err:
     st.error(f"분석 실패: {preview_err}")
+    # 한도/인증 오류는 자동 재시도로 호출을 더 태우지 않는다.
+    st.session_state["quota_sig"] = analysis_key
+    st.session_state["quota_msg"] = f"분석 실패: {preview_err}"
 elif ok and persons:
-    st.write(f"사람 {len(persons)}명 · 개인정보 후보 {len(items)}종 찾음")
-    st.image(cv2.cvtColor(anno, cv2.COLOR_BGR2RGB),
-             caption="첫 샘플 화면 (초록 번호=개인정보 탐지 후보)")
+    st.write(f"사람 {len(persons)}명 · 개인정보 후보 {len(base_items)}종 찾음")
+    if anno is not None:
+        st.image(cv2.cvtColor(anno, cv2.COLOR_BGR2RGB),
+                 caption="첫 샘플 화면 (초록 번호=개인정보 탐지 후보)")
 elif ok:
-    st.write(f"사람 없음 · 개인정보 후보 {len(items)}종 찾음")
-elif api_key.strip():
-    st.warning("영상을 읽을 수 없거나 분석 결과가 없습니다.")
+    st.write(f"사람 없음 · 개인정보 후보 {len(base_items)}종 찾음")
+
+analysis_id = str(st.session_state.get("analysis_n", 0))
+
+# 프롬프트에 적힌 카테고리를 기준으로 체크박스 기본값을 정한다.
+# '얼굴과 번호판' → '얼굴만'으로 바꾸면 번호판 키가 새로 만들어져
+# 자동으로 체크 해제된다(VLM 재호출 없음).
+prompt_cats = prompt_categories(prompt_raw)
+items = []
+seen_cats = set()
+if ok:
+    for it in base_items:
+        copy = dict(it)
+        copy["samples"] = dict(it.get("samples") or {})
+        copy["prompt_match"] = copy.get("category") in prompt_cats
+        items.append(copy)
+        seen_cats.add(copy.get("category"))
+    # 프롬프트가 요구했지만 샘플에서 못 찾은 항목도 체크리스트에 남긴다.
+    # 사람 항목(얼굴 등)은 처리 단계에서 모든 사람에게 적용할 수 있다.
+    for cat in sorted(prompt_cats - seen_cats):
+        items.append({
+            "category": cat,
+            "label_ko": label_ko(cat),
+            "type": CATEGORY_TYPE.get(cat, "region"),
+            "prompt_match": True,
+            "boxes": [],
+            "samples": {},
+            "source": "prompt",
+            "count": 0,
+            "box_count": 0,
+            "thumb": None,
+            "missing": True,
+        })
 
 if items:
-    prompt_items = [it for it in items if it.get("prompt_match")]
-    extra_items = [it for it in items if not it.get("prompt_match")]
+    prompt_items = [it for it in items if it.get("category") in prompt_cats]
+    extra_items = [it for it in items if it.get("category") not in prompt_cats]
+
+    filter_id = hashlib.sha1(
+        ("|".join(sorted(prompt_cats)) or "all").encode("utf-8")
+    ).hexdigest()[:8]
+
+    def _default_checked(cat):
+        return (cat in prompt_cats) if prompt_cats else True
+
+    def _check_key(cat):
+        return f"chk_{analysis_id}_{filter_id}_{cat}"
 
     def _render_item(it):
         cat = it["category"]
@@ -629,7 +768,9 @@ if items:
         cnt = it.get("count", 0)
         box_cnt = it.get("box_count", 0)
         label = f"{it.get('label_ko', cat)} · {cnt}{unit}"
-        if box_cnt and box_cnt != cnt:
+        if it.get("missing"):
+            label += " · 이번 샘플에서 못 찾음"
+        elif box_cnt and box_cnt != cnt:
             label += f" (총 {box_cnt}회 탐지)"
         c1, c2 = st.columns([1, 9])
         with c1:
@@ -640,8 +781,8 @@ if items:
                 except Exception:
                     pass
         with c2:
-            checked = st.checkbox(label, value=True,
-                                  key=f"chk_{analysis_id}_{cat}")
+            checked = st.checkbox(label, value=_default_checked(cat),
+                                  key=_check_key(cat))
         return checked
 
     if prompt_items:
@@ -652,141 +793,167 @@ if items:
         st.markdown("**추가로 찾은 개인정보**")
         for it in extra_items:
             _render_item(it)
-    st.caption("VLM이 영상에서 찾은 항목입니다. 가리지 않을 항목은 체크를 해제하세요.")
-    found_cats = {it["category"] for it in items}
-    missing = sorted(prompt_categories(prompt_raw) - found_cats)
+    st.caption("체크한 항목만 가립니다. 프롬프트를 바꾸면 체크 상태가 "
+               "프롬프트에 맞게 다시 정해집니다.")
+
+    found_now = {it["category"] for it in items if not it.get("missing")}
+    missing = sorted(prompt_cats - found_now)
     if missing:
-        st.caption("프롬프트 항목 중 이번 샘플에서 못 찾은 것: "
-                   + ", ".join(label_ko(c) for c in missing))
+        st.caption("샘플에서 못 찾은 요청 항목: "
+                   + ", ".join(label_ko(c) for c in missing)
+                   + " (처리 단계에서 한 번 더 찾습니다)")
 
     selected_cats = [it["category"] for it in items
-                     if st.session_state.get(f"chk_{analysis_id}_{it['category']}", True)]
+                     if st.session_state.get(_check_key(it["category"]),
+                                            _default_checked(it["category"]))]
 else:
     selected_cats = []
     if ok:
         st.warning("VLM이 이번 샘플에서 가릴 항목을 찾지 못했습니다. "
                    "프롬프트를 구체화하거나 '다시 분석'을 눌러보세요.")
 
-st.subheader("2. 처리")
-run = st.button("모자이크 시작", type="primary",
-                disabled=not selected_cats or not api_key.strip())
-if not selected_cats:
-    st.caption("최소 한 항목을 체크해야 시작할 수 있습니다.")
+# ---------------------------------------------------------------- 설정/미리보기
+st.subheader("2. 모자이크 설정")
 
-# 체크리스트 VLM 박스를 처리 단계의 초기값으로 넘긴다.
-# 처리 중 VLM이 같은 프레임에서 놓쳐도 체크한 항목은 계속 가려진다.
-region_priors = {}
-person_priors = {}
-for it in items:
-    cat = it.get("category")
-    if cat not in selected_cats:
-        continue
-    by_frame = it.get("samples") or {}
-    if not by_frame:
-        continue
-    if it.get("type") == "region":
-        region_priors[cat] = by_frame
+area_label = st.segmented_control(
+    "가리는 범위",
+    ["👤 얼굴만", "🧍 상반신", "🧑 전체"],
+    default="👤 얼굴만",
+    key="area_mode_ui",
+    help="사람 항목에 적용됩니다.")
+area_label = area_label or "👤 얼굴만"
+area_mode = {"👤 얼굴만": "face_only",
+             "🧍 상반신": "upper",
+             "🧑 전체": "full"}[area_label]
+
+style_label = st.segmented_control(
+    "모자이크 모양",
+    ["🟦 모자이크", "🌫️ 흐리게", "⬛ 검게"],
+    default="🟦 모자이크",
+    key="style_ui")
+style_label = style_label or "🟦 모자이크"
+style = {"🟦 모자이크": "pixel",
+         "🌫️ 흐리게": "blur",
+         "⬛ 검게": "solid"}[style_label]
+if style == "pixel":
+    blocks = st.slider("강도", 18, 44, 30,
+                       help="값이 클수록 더 강하게 가립니다.")
+    blur = 61
+elif style == "blur":
+    blocks = 30
+    blur = st.slider("흐림 정도", 21, 101, 61, step=2)
+else:
+    blocks, blur = 30, 61
+
+st.caption("번호판·간판 같은 배경 항목은 '가리는 범위'와 무관하게 "
+           "탐지된 영역만 가립니다. 명찰도 찾은 위치만 가립니다.")
+
+st.text_area(
+    "프롬프트 수정 (미리보기에서 바로 반영)",
+    key="prompt_edit", height=80,
+    on_change=_sync_prompt_from_main,
+    help="예: '얼굴과 차량번호판을 모자이크' → '얼굴만 모자이크'로 바꾸면 "
+         "차량번호판 체크가 자동으로 해제됩니다.")
+
+st.subheader("3. 실시간 미리보기")
+selected_tuple = tuple(sorted(selected_cats))
+
+if proc_total > 0:
+    frame_idx = st.slider(
+        "타임라인", 0, max(0, proc_total - 1), 0,
+        key="preview_pos",
+        help="타임라인을 움직이면 그 위치의 프레임을 모자이크 적용해 보여줍니다.")
+    compare_original = st.toggle("원본과 비교", value=False)
+
+    frame_time = float(frame_idx) / float(fps0) if fps0 > 0 else 0.0
+
+    # 원본 영상 재생 (원본 길이·속도 그대로, 배속 없음)
+    st.video(proc_in, format="video/mp4", start_time=frame_time,
+             width="stretch")
+    st.caption(f"{frame_time:.1f}s / {dur:.1f}s")
+
+    # 선택한 항목에 모자이크를 적용한 단일 프레임 (타임라인 위치)
+    src_frame = _read_frame_cached(proc_in, int(frame_idx),
+                                   f"{upload_id[2]}|{trim_sig}")
+    if src_frame is None:
+        st.warning("이 위치의 프레임을 읽지 못했습니다.")
     else:
-        person_priors[cat] = by_frame
-
-# 처리 단계에는 체크한 항목만 말한다. 원문 프롬프트에 있는 선택 해제
-# 카테고리까지 VLM이 다시 찾느라 호출/응답을 낭비하지 않게 한다.
-selected_items = [it for it in items
-                  if it.get("category") in selected_cats]
-proc_prompt = "선택한 항목만 가리기: " + ", ".join(
-    str(it.get("label_ko") or label_ko(it["category"]))
-    for it in selected_items)
-
-# 결과는 session_state에 남긴다. 다운로드/위젯 클릭으로 스크립트가 다시 돌아도
-# 결과 화면이 사라지지 않는다. analysis_id를 넣어 '다시 분석' 후에도 이전
-# 결과가 유효한 것처럼 보이지 않게 한다.
-run_sig = (preview_key, analysis_id, tuple(selected_cats), style, blocks,
-           blur, area_mode, keyframe_stride, speed_label)
-res = st.session_state.get("result")
-if res is not None and res.get("sig") != run_sig:
-    st.session_state.pop("result", None)
-    res = None
-
-if run:
-    out_path = _unique_out_path(uploaded.name)
-    out_name = os.path.basename(out_path)
-    bar = st.progress(0)
-    info = st.empty()
-
-    def _pg(p, d, t, el):
-        bar.progress(max(0.0, min(1.0, float(p))))
-        if el > 1:
-            info.write(f"{d}/{t} 프레임 · {el:.1f}초")
-
-    t_start = time.time()
-    stats = {}
-    err = None
-    with st.spinner("처리 중..."):
-        try:
-            with MODEL_LOCK:
-                stats = mosaic_video(
-                    proc_in, out_path,
-                    targets=selected_cats, invert=False, conf=0.20,
-                    model_name=model_name, imgsz=imgsz,
-                    blocks=blocks, style=style, blur=blur,
-                    ultra=(speed_label == "정밀"), area_mode=area_mode,
-                    keyframe_stride=keyframe_stride,
-                    encode_preset=encode_preset, progress_fn=_pg,
-                    query_raw=proc_prompt, api_key=api_key,
-                    vlm_model=vlm_model, vlm_base_url=vlm_base_url,
-                    region_priors=region_priors,
-                    person_priors=person_priors,
-                ) or {}
-        except Exception as e:
-            err = e
-    elapsed = time.time() - t_start
-    if err is not None:
-        st.error(f"처리 실패: {_friendly_vlm_error(err, api_key)}")
-        for p in (out_path, out_path + ".noaudio.mp4"):
+        shown = src_frame.copy()
+        if selected_cats and items:
             try:
-                if os.path.exists(p):
-                    os.remove(p)
-            except OSError:
-                pass
-        st.session_state.pop("result", None)
-        st.stop()
+                shown = render_preview_frame(
+                    src_frame, items, selected_cats, style=style,
+                    blocks=blocks, blur=blur, area_mode=area_mode,
+                    frame_idx=int(frame_idx))
+            except Exception as e:
+                st.caption(f"미리보기 렌더 오류: {e}")
 
-    region_n = stats.pop("_regions", 0)
-    stats.pop("_cats", None)
-    untracked_cats = list(stats.pop("_untracked", []))
-    final_n = sum(1 for v in stats.values()
-                  if isinstance(v, dict) and v.get("mosaic"))
-    summary = f"{final_n}명 가려짐 · 배경 {region_n}종"
-    if untracked_cats:
-        summary += f" · 추적 밖 {len(untracked_cats)}종"
+        if compare_original:
+            c1, c2 = st.columns(2)
+            with c1:
+                st.caption("원본")
+                st.image(cv2.cvtColor(src_frame, cv2.COLOR_BGR2RGB),
+                         width="stretch")
+            with c2:
+                st.caption("모자이크 미리보기")
+                st.image(cv2.cvtColor(shown, cv2.COLOR_BGR2RGB),
+                         width="stretch")
+        else:
+            st.caption("모자이크 미리보기 (타임라인 위치)")
+            st.image(cv2.cvtColor(shown, cv2.COLOR_BGR2RGB),
+                     width="stretch")
+
+    # 필름스트립 (원본 썸네일, 어디에 어떤 장면이 있는지 한눈에)
+    filmstrip = None
     try:
-        H.add(uploaded.name, prompt_raw, ",".join(selected_cats), False,
-              out_name, elapsed, query_raw=prompt_raw, selector="vlm",
-              summary=summary)
-    except Exception:
-        pass
-    res = {
-        "sig": run_sig,
-        "out_name": out_name,
-        "out_path": out_path,
-        "stats": stats,
-        "elapsed": elapsed,
-        "final_n": final_n,
-        "region_n": region_n,
-        "untracked_cats": untracked_cats,
-        "selected_cats": list(selected_cats),
-    }
-    st.session_state["result"] = res
+        filmstrip = _filmstrip_cached(
+            proc_in, f"{upload_id[2]}|{trim_sig}",
+            float(frame_idx) / float(max(1, proc_total - 1)))
+    except Exception as e:
+        st.caption(f"타임라인 미리보기 생성 실패: {e}")
+    if filmstrip is not None:
+        st.image(filmstrip, width="stretch")
+else:
+    st.info("미리보기를 만들 프레임이 없습니다.")
+
+# ---------------------------------------------------------------- 모자이크/다운로드
+st.subheader("4. 모자이크 확인 · 다운로드")
+
+if not selected_cats and ok:
+    st.caption("가릴 항목을 하나 이상 체크하면 미리보기 영상에 모자이크가 적용됩니다.")
+
+pv_out = None
+if ok and selected_cats and proc_total > 0:
+    try:
+        pv_out = _get_preview_video_path(
+            proc_in=proc_in, items=items, selected_cats=selected_cats,
+            style=style, blocks=blocks, blur=blur, area_mode=area_mode,
+            cache_token=f"{upload_id[2]}|{trim_sig}")
+    except Exception as e:
+        st.error(f"미리보기 영상 생성 실패: {e}")
+        pv_out = None
+
+if pv_out and os.path.exists(pv_out):
+    with open(pv_out, "rb") as f:
+        clicked = st.download_button(
+            "🔒 미리보기 모자이크 영상 받기", f,
+            file_name=os.path.splitext(uploaded.name)[0] + "_preview.mp4",
+            mime="video/mp4")
+    if clicked and auto_del:
+        RT.remove_on_download(pv_out)
+        st.info("받기 끝나서 미리보기 영상을 지웠다. (보관 정책)")
+elif ok and selected_cats and proc_total > 0:
+    st.info("미리보기 영상을 만들지 못했습니다.")
 
 with st.expander("지난 작업", expanded=False):
-    for r in H.all_rows():
-        fname = r.get("file")
+    for row in H.all_rows():
+        fname = row.get("file")
         if not fname:
             continue
         c1, c2, c3 = st.columns([3, 1, 1])
         with c1:
-            st.write(f"{r.get('at', '')} · {r.get('src', '')} → {fname}")
-            extra = r.get("summary") or ""
+            st.write(f"{row.get('at', '')} · {row.get('src', '')} → {fname}")
+            extra = row.get("summary") or ""
             if extra:
                 st.caption(extra)
         with c2:
@@ -798,64 +965,5 @@ with st.expander("지난 작업", expanded=False):
         with c3:
             if st.button("삭제", key=f"del_{fname}"):
                 H.delete(fname)
-                if (st.session_state.get("result") or {}).get("out_name") == fname:
-                    st.session_state.pop("result", None)
                 st.rerun()
 
-if not res:
-    st.stop()
-
-out_name = res["out_name"]
-out_path = res["out_path"]
-stats = res["stats"]
-elapsed = res["elapsed"]
-final_n = res["final_n"]
-region_n = res.get("region_n", 0)
-untracked_cats = res.get("untracked_cats", [])
-
-st.success(f"완료 · {elapsed:.1f}초 걸림")
-st.write(f"최종 사람 {final_n}명 · 배경 {region_n}종 가려짐"
-         + (f" · 추적 밖 {len(untracked_cats)}종"
-            if untracked_cats else ""))
-st.caption("선택한 항목: " + ", ".join(label_ko(c) for c in res.get("selected_cats", [])))
-for tid, v in sorted(stats.items()):
-    c1, c2 = st.columns([1, 3])
-    with c1:
-        th = v.get("thumb")
-        if th is not None:
-            try:
-                st.image(cv2.cvtColor(th, cv2.COLOR_BGR2RGB), width=96)
-            except Exception:
-                pass
-    with c2:
-        cats = v.get("cat_on", {})
-        cats_str = ", ".join(label_ko(c) for c in cats) if cats else "-"
-        st.write(f"추적 {tid} · {'가려짐' if v.get('mosaic') else '유지'} · {cats_str}")
-
-st.markdown(
-    """
-    <div class="info-card">
-        <h3 style="margin-top:0;">📊 결과 비교</h3>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-if os.path.exists(out_path):
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**📹 원본**")
-        st.video(proc_in, format="video/mp4")
-    with c2:
-        st.markdown("**🔒 모자이크 적용**")
-        st.video(out_path, format="video/mp4")
-    clicked = False
-    with open(out_path, "rb") as f:
-        clicked = st.download_button("결과 저장", f, file_name=out_name,
-                                     mime="video/mp4")
-    if clicked and auto_del:
-        RT.remove_on_download(out_path)
-        # 파일만 지우고 기록을 남기면 '지난 작업'에 깨진 항목이 남는다.
-        H.delete(out_name)
-        st.info("받기 끝나서 결과 파일을 지웠다. (보관 정책)")
-else:
-    st.info(f"결과 파일이 삭제되었다. ({RT.RETENTION_HOURS}시간 보관 정책 또는 다운로드 후 자동 삭제)")
