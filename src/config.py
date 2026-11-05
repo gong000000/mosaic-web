@@ -36,25 +36,59 @@ CATEGORY_TYPE = {
     "phone_screen": "region",
 }
 
-# 프롬프트에 나오는 한국어/영어 표현 → 표준 카테고리
+# 프롬프트에 나오는 한국어/영어 표현 → 표준 카테고리.
+# 복수형/붙여쓰기/제공자마다 다른 표현도 같은 항목으로 묶는다.
 CATEGORY_ALIASES = {
-    "얼굴": "face", "face": "face",
-    "차량번호판": "license_plate", "번호판": "license_plate",
-    "차번": "license_plate", "자동차번호판": "license_plate",
-    "license plate": "license_plate", "car plate": "license_plate",
-    "number plate": "license_plate", "vehicle plate": "license_plate",
-    "주소": "address", "간판": "address", "signboard": "address",
-    "현수막": "address", "안내판": "address", "address": "address",
-    "동승자": "passenger", "탑승자": "passenger", "passenger": "passenger",
-    "명찰": "name_tag", "명패": "name_tag", "name tag": "name_tag",
-    "badge": "name_tag", "사원증": "name_tag",
-    "신분증": "id_card", "문서": "id_card", "id card": "id_card",
-    "identity card": "id_card", "id document": "id_card",
+    "얼굴": "face", "얼굴들": "face", "face": "face", "faces": "face",
+    "human face": "face", "human faces": "face", "face region": "face",
+    "차량번호판": "license_plate", "차량 번호판": "license_plate",
+    "자동차번호판": "license_plate", "자동차 번호판": "license_plate",
+    "번호판": "license_plate", "번호 판": "license_plate",
+    "차번": "license_plate", "차량 번호": "license_plate",
+    "license plate": "license_plate", "license plates": "license_plate",
+    "license_plates": "license_plate", "licenseplate": "license_plate",
+    "number plate": "license_plate", "number plates": "license_plate",
+    "numberplate": "license_plate", "car plate": "license_plate",
+    "car plates": "license_plate", "vehicle plate": "license_plate",
+    "vehicle plates": "license_plate", "plate": "license_plate",
+    "plates": "license_plate", "license tag": "license_plate",
+    "주소": "address", "주소지": "address", "간판": "address",
+    "간판들": "address", "signboard": "address", "signboards": "address",
+    "sign": "address", "signs": "address", "signage": "address",
+    "street sign": "address", "store sign": "address",
+    "building sign": "address", "billboard": "address",
+    "현수막": "address", "안내판": "address", "표지판": "address",
+    "address": "address", "addresses": "address",
+    "동승자": "passenger", "탑승자": "passenger", "승객": "passenger",
+    "passenger": "passenger", "passengers": "passenger",
+    "car passenger": "passenger", "vehicle occupant": "passenger",
+    "명찰": "name_tag", "명패": "name_tag", "이름표": "name_tag",
+    "name tag": "name_tag", "name tags": "name_tag", "nametag": "name_tag",
+    "name badge": "name_tag", "badge": "name_tag", "badges": "name_tag",
+    "employee badge": "name_tag", "id badge": "name_tag",
+    "사원증": "name_tag",
+    "신분증": "id_card", "신분증명서": "id_card", "문서": "id_card",
+    "서류": "id_card", "id card": "id_card", "id cards": "id_card",
+    "identity card": "id_card", "identification": "id_card",
+    "id document": "id_card", "identity document": "id_card",
     "주민등록증": "id_card", "운전면허증": "id_card", "여권": "id_card",
-    "document": "id_card", "출입증": "id_card",
-    "휴대폰": "phone_screen", "핸드폰": "phone_screen", "휴대전화": "phone_screen",
-    "phone screen": "phone_screen", "smartphone": "phone_screen",
-    "cell phone": "phone_screen", "phone": "phone_screen",
+    "passport": "id_card", "driver license": "id_card",
+    "driver's license": "id_card", "document": "id_card",
+    "documents": "id_card", "document text": "id_card", "출입증": "id_card",
+    "휴대폰": "phone_screen", "핸드폰": "phone_screen",
+    "휴대전화": "phone_screen", "휴대폰 화면": "phone_screen",
+    "핸드폰 화면": "phone_screen", "phone screen": "phone_screen",
+    "smartphone screen": "phone_screen", "mobile phone screen": "phone_screen",
+    "cell phone screen": "phone_screen", "smartphone": "phone_screen",
+    "cell phone": "phone_screen", "cellphone": "phone_screen",
+    "phone": "phone_screen",
+}
+
+# 'vehicle', 'other'처럼 개별 정보가 아닌 포괄 표현. label이 더 구체적이면
+# label 쪽 카테고리를 우선한다.
+GENERIC_CATEGORIES = {
+    "other", "object", "item", "thing", "unknown", "vehicle", "car",
+    "person", "people", "human", "text", "privacy", "pii",
 }
 
 

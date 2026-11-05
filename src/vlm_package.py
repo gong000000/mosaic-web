@@ -10,11 +10,13 @@ import base64
 import json
 import math
 import threading
+import time
 
 import cv2
 
-from .config import (VLM_MODEL, canon_category, categories_in_text,
-                     category_type, label_ko)
+from .config import (CANDS, GENERIC_CATEGORIES, VLM_MODEL, canon_category,
+                     categories_in_text, category_type, label_ko)
+from .vlm_budget import VLMRetryPolicy, classify_vlm_error
 
 VLM_MAX_W = 1920
 VLM_TIMEOUT = 90
@@ -90,6 +92,41 @@ def _as_bool(value):
     return bool(value)
 
 
+def _resolve_category(item):
+    """category와 label을 함께 보고 가장 구체적인 표준 카테고리를 고른다.
+
+    제공자마다 ``{"category":"vehicle","label":"license plate"}``처럼
+    포괄 category와 구체 label을 같이 주기도 한다. category만 믿으면
+    번호판을 놓치므로, 표준 카테고리로 해석되는 label을 우선한다.
+    """
+    raw_values = [
+        item.get("category"), item.get("label_ko"),
+        item.get("label"), item.get("phrase"), item.get("name"),
+    ]
+    values = []
+    for value in raw_values:
+        text = str(value or "").strip()
+        if text and text not in values:
+            values.append(text)
+    if not values:
+        return "", "other"
+
+    def _canon(text):
+        return canon_category(text)
+
+    cats = [_canon(text) for text in values]
+    # 표준 키가 하나라도 있으면 그중 첫 번째를 쓴다. 단, category가
+    # 포괄 표현('vehicle' 등)이고 label이 표준 키라면 label을 쓴다.
+    for text, cat in zip(values, cats):
+        if cat in CANDS and cat not in GENERIC_CATEGORIES:
+            return text, cat
+    for text, cat in zip(values, cats):
+        if cat in CANDS:
+            return text, cat
+    # 자유 형식은 category를 우선하되, category가 비어 있으면 label을 쓴다.
+    return values[0], cats[0]
+
+
 def _salvage_objects(text):
     """잘리거나 깨진 JSON 배열에서 완전한 객체만 꺼낸다."""
     out = []
@@ -125,13 +162,34 @@ def _salvage_objects(text):
     return out
 
 
-def _parse_json_array(content):
-    """VLM 응답에서 JSON 배열을 뽑는다. 해석 불가면 None."""
+def _content_text(content):
+    """OpenAI 호환 응답 content를 문자열로 만든다.
+
+    일부 제공자는 content를 [{"type":"text","text":"..."}] 형태로 준다.
+    """
     if content is None:
-        return []
-    text = str(content).strip()
+        return ""
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                if isinstance(part.get("text"), str):
+                    parts.append(part["text"])
+            elif isinstance(part, str):
+                parts.append(part)
+        return "\n".join(parts)
+    return str(content)
+
+
+def _parse_json_array(content):
+    """VLM 응답에서 JSON 배열을 뽑는다. 해석 불가면 None.
+
+    빈 응답/None은 '탐지 없음'이 아니라 잘린/거부된 응답일 수 있으므로
+    None을 돌려 호출부가 VLMError로 알리게 한다.
+    """
+    text = _content_text(content).strip()
     if not text:
-        return []
+        return None
     if text.startswith("```"):
         text = text.strip("`").strip()
         if text.lower().startswith("json"):
@@ -173,9 +231,10 @@ def _normalize_item(item, w0, h0, scale, query_raw, coord_default="pixel"):
     """
     if not isinstance(item, dict):
         return None
-    raw_cat = str(item.get("category") or item.get("label_ko")
-                  or item.get("label") or "")
-    if "tattoo" in raw_cat.lower() or "문신" in raw_cat:
+    _, cat = _resolve_category(item)
+    probe_cat = " ".join(str(item.get(k) or "") for k in
+                         ("category", "label_ko", "label", "phrase"))
+    if "tattoo" in probe_cat.lower() or "문신" in probe_cat:
         return None
 
     box_2d = item.get("box_2d")
@@ -196,8 +255,13 @@ def _normalize_item(item, w0, h0, scale, query_raw, coord_default="pixel"):
         # Gemini box_2d: [ymin, xmin, ymax, xmax]
         vals = [vals[1], vals[0], vals[3], vals[2]]
 
-    coord = str(item.get("coord") or item.get("coordinate") or "").lower()
+    coord = " ".join(str(item.get(k) or "") for k in
+                     ("coord", "coordinate", "coordinates")).lower()
     mx = max(vals)
+    normalized_label = any(k in coord for k in
+                           ("norm", "relative", "ratio", "0-1", "0~1",
+                            "0 to 1", "0..1"))
+    pixel_label = any(k in coord for k in ("pixel", "abs", "image", "px"))
     if is_box2d:
         if mx <= 1.001:
             sx, sy = w0, h0
@@ -205,14 +269,14 @@ def _normalize_item(item, w0, h0, scale, query_raw, coord_default="pixel"):
             sx, sy = w0 / 1000.0, h0 / 1000.0
         else:
             sx = sy = scale
-    elif "norm" in coord:
+    elif normalized_label:
         if mx <= 1.001:
             sx, sy = w0, h0
         elif mx <= 1000:
             sx, sy = w0 / 1000.0, h0 / 1000.0
         else:
             sx = sy = scale
-    elif "pixel" in coord or "abs" in coord:
+    elif pixel_label:
         sx = sy = scale
     elif mx <= 1.001:
         sx, sy = w0, h0
@@ -235,10 +299,18 @@ def _normalize_item(item, w0, h0, scale, query_raw, coord_default="pixel"):
     if x2 - x1 < 4 or y2 - y1 < 4:
         return None
 
-    cat = canon_category(raw_cat)
     if cat in ("tattoo", "문신"):
         return None
-    label = str(item.get("label_ko") or item.get("label") or label_ko(cat))
+    if cat in CANDS:
+        # 표준 항목은 UI 표기를 통일한다. VLM이 영어 label을 줘도 한국어로.
+        label = label_ko(cat)
+        rtype = category_type(cat)
+    else:
+        label = str(item.get("label_ko") or item.get("label")
+                    or item.get("phrase") or label_ko(cat))
+        rtype = item.get("region_type")
+        if rtype not in ("person", "region"):
+            rtype = category_type(cat)
     try:
         conf = float(item.get("confidence", item.get("conf", 0.5)))
     except (TypeError, ValueError):
@@ -248,10 +320,11 @@ def _normalize_item(item, w0, h0, scale, query_raw, coord_default="pixel"):
     prompt_set = prompt_categories(query_raw)
     match = item.get("matches_prompt")
     if match is None:
-        match = cat in prompt_set or (label and label.lower() in str(query_raw).lower())
-    rtype = item.get("region_type")
-    if rtype not in ("person", "region"):
-        rtype = category_type(cat)
+        label_probe = " ".join(str(item.get(k) or "") for k in
+                               ("category", "label_ko", "label", "phrase"))
+        match = (cat in prompt_set
+                 or canon_category(label_probe) in prompt_set
+                 or bool(label and label.lower() in str(query_raw).lower()))
     return {
         "category": cat,
         "label_ko": label,
@@ -264,8 +337,12 @@ def _normalize_item(item, w0, h0, scale, query_raw, coord_default="pixel"):
 
 
 def _build_prompt(phrases, query_raw, include_all, focus):
-    hints = [TARGET_EN.get(p, str(p)) for p in (phrases or []) if p]
-    hints_str = ", ".join(hints[:10]) if hints else "개인정보 관련 항목"
+    hints = []
+    for p in (phrases or []):
+        if not p:
+            continue
+        hints.append(TARGET_EN.get(p, str(p).replace("_", " ")))
+    hints_str = ", ".join(hints[:12]) if hints else "개인정보 관련 항목"
     lines = []
     if query_raw:
         lines.append(f"사용자 요청: {query_raw}")
@@ -279,15 +356,21 @@ def _build_prompt(phrases, query_raw, include_all, focus):
         lines.append("이 영상 프레임에서 개인정보 보호를 위해 가릴 만한 것을 "
                      "모두 찾으세요.")
         lines.append(f"대상 예: {PERSON_HINT}.")
+        lines.append("얼굴이 작거나 일부만 보여도, 번호판이 흐리거나 "
+                     "원거리여도 찾으세요. 신분증·문서·휴대폰 화면처럼 "
+                     "개인정보가 보이는 물체도 포함하세요.")
     else:
-        lines.append("이 영상 프레임에서 아래 후보에 해당하는 개인정보를 "
-                     "모두 찾으세요. 사용자 요청에 없다는 이유로 후보를 "
-                     "빠뜨리지 마세요.")
+        lines.append("이 프레임에서 아래 후보에 해당하는 개인정보만 찾으세요. "
+                     "후보에 없는 항목은 결과에 넣지 마세요.")
+        lines.append("후보가 여러 개면 하나도 빠뜨리지 말고 각각 찾으세요.")
 
     lines.append(f"참고 후보: {hints_str}")
+    lines.append("같은 종류가 여러 개 있으면 하나로 합치지 말고 각각 별도 "
+                 "항목으로 bbox를 주세요.")
     if include_all or focus == "license_plate" or "license_plate" in (phrases or []):
         lines.append("차량이 보이면 앞/뒤 번호판을 빠짐없이 찾으세요. "
-                     "번호판이 작거나 야간이어도 찾고, 차량 전체가 아니라 "
+                     "승용차·승합차·화물차·오토바이 번호판을 모두 포함하고, "
+                     "번호판이 작거나 야간이어도 찾으세요. 차량 전체가 아니라 "
                      "번호판 영역만 bbox로 표시하세요.")
     lines.append("bbox는 이미지 크기와 무관한 0~1 정규화 좌표 "
                  "[x1,y1,x2,y2]로 답하고 coord는 \"norm\"으로 쓰세요. "
@@ -314,7 +397,8 @@ def _build_prompt(phrases, query_raw, include_all, focus):
 
 def detect_with_vlm(frame_bgr, phrases, api_key, model=VLM_MODEL,
                     timeout=VLM_TIMEOUT, query_raw="", include_all=True,
-                    base_url=None, focus=None):
+                    base_url=None, focus=None,
+                    max_retries: int = 3):
     """VLM으로 개인정보 항목을 탐지한다.
 
     phrases: CANDS 키 목록 (분석 힌트)
@@ -322,72 +406,116 @@ def detect_with_vlm(frame_bgr, phrases, api_key, model=VLM_MODEL,
                  처리 단계(선택 항목만 렌더)에서는 False로 호출한다.
     base_url: OpenAI 호환 엔드포인트(예: Gemini). None이면 OpenAI.
     focus: "license_plate"면 번호판만 집중 탐지한다(차량 크롭 보조 호출).
+    max_retries: 서버 오류(5xx) 발생 시 최대 재시도 횟수.
+                 한도 초과(429)나 인증 오류(401/403)는 재시도하지 않음.
     returns: [{category,label_ko,xyxy,conf,matches_prompt,region_type,source}]
-    raises: VLMError (키 없음/호출 실패/JSON 해석 실패)
+    raises: VLMError (키 없음/호출 실패/JSON 해석 실패/한도 초과)
     """
     api_key = str(api_key or "").strip()
     if not api_key:
         raise VLMError("VLM API 키가 없습니다. 사이드바에 키를 입력하세요.")
-    client = _client(api_key, timeout, base_url)
-    if client is None:
-        raise VLMError("openai 패키지를 불러오지 못했습니다. "
-                       "pip install -r requirements.txt 후 다시 실행하세요.")
-    try:
-        h0, w0 = frame_bgr.shape[:2]
-        if h0 <= 0 or w0 <= 0:
-            return []
-        b64 = _jpg_b64(frame_bgr, max_w=VLM_MAX_W)
-        if not b64:
-            raise VLMError("프레임을 JPEG로 변환하지 못했습니다.")
-        sent_w = min(w0, VLM_MAX_W)
-        scale = w0 / float(sent_w) if sent_w else 1.0
-        prompt = _build_prompt(phrases, query_raw, include_all, focus)
 
-        image_url = {"url": f"data:image/jpeg;base64,{b64}"}
-        if base_url is None:
-            # OpenAI는 detail=high여야 작은 번호판/명찰을 더 잘 본다.
-            image_url["detail"] = "high"
-        extra = {}
-        if base_url and "generativelanguage" in str(base_url):
-            # Gemini 3는 내부 추론에 출력 한도를 먼저 쓰므로 추론량을 낮추고
-            # 한도를 넉넉히 준다. 추론량이 크면 JSON이 중간에 잘린다.
-            extra["reasoning_effort"] = "low"
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system",
-                 "content": "당신은 영상 속 개인정보를 탐지하는 전문가입니다. "
-                            "JSON만 출력합니다."},
-                {"role": "user", "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": image_url},
-                ]}
-            ],
-            max_tokens=8192,
-            temperature=0,
-            timeout=timeout,
-            **extra,
-        )
+    retry = VLMRetryPolicy(max_retries=max_retries)
+    last_error = None
 
-        content = response.choices[0].message.content
-        results = _parse_json_array(content)
-        if results is None:
-            snippet = str(content or "")[:200].replace("\n", " ")
-            raise VLMError("VLM 응답을 JSON으로 해석하지 못했습니다: "
-                           f"{snippet}")
-        coord_default = ("gemini" if base_url and "generativelanguage" in
-                         str(base_url) else "pixel")
-        out = []
-        for item in results:
+    for attempt in range(max_retries + 1):
+        try:
+            client = _client(api_key, timeout, base_url)
+            if client is None:
+                raise VLMError("openai 패키지를 불러오지 못했습니다. "
+                               "pip install -r requirements.txt 후 다시 실행하세요.")
+            h0, w0 = frame_bgr.shape[:2]
+            if h0 <= 0 or w0 <= 0:
+                return []
+            b64 = _jpg_b64(frame_bgr, max_w=VLM_MAX_W)
+            if not b64:
+                raise VLMError("프레임을 JPEG로 변환하지 못했습니다.")
+            sent_w = min(w0, VLM_MAX_W)
+            scale = w0 / float(sent_w) if sent_w else 1.0
+            prompt = _build_prompt(phrases, query_raw, include_all, focus)
+
+            image_url = {"url": f"data:image/jpeg;base64,{b64}"}
+            if base_url is None:
+                # OpenAI는 detail=high여야 작은 번호판/명찰을 더 잘 본다.
+                image_url["detail"] = "high"
+            extra = {}
+            if base_url and "generativelanguage" in str(base_url):
+                # Gemini 3는 내부 추론에 출력 한도를 먼저 쓰므로 추론량을 낮추고
+                # 한도를 넉넉히 준다. 추론량이 크면 JSON이 중간에 잘린다.
+                extra["reasoning_effort"] = "low"
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system",
+                     "content": "당신은 영상 속 개인정보를 탐지하는 전문가입니다. "
+                                "JSON만 출력합니다."},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": image_url},
+                    ]}
+                ],
+                max_tokens=8192,
+                temperature=0,
+                timeout=timeout,
+                **extra,
+            )
+
             try:
-                norm = _normalize_item(item, w0, h0, scale, query_raw,
-                                       coord_default=coord_default)
-                if norm is not None:
-                    out.append(norm)
-            except Exception:
+                choice = response.choices[0]
+                content = choice.message.content
+            except Exception as e:
+                raise VLMError(f"VLM 응답 형식이 올바르지 않습니다: {e}") from e
+            results = _parse_json_array(content)
+            if results is None:
+                snippet = _content_text(content)[:200].replace("\n", " ")
+                finish = str(getattr(choice, "finish_reason", "") or "")
+                extra_msg = f" (finish_reason={finish})" if finish else ""
+                if not snippet:
+                    raise VLMError("VLM이 빈 응답을 돌려줬습니다." + extra_msg)
+                raise VLMError("VLM 응답을 JSON으로 해석하지 못했습니다: "
+                               f"{snippet}{extra_msg}")
+            coord_default = ("gemini" if base_url and "generativelanguage" in
+                             str(base_url) else "pixel")
+            out = []
+            for item in results:
+                try:
+                    norm = _normalize_item(item, w0, h0, scale, query_raw,
+                                           coord_default=coord_default)
+                    if norm is not None:
+                        out.append(norm)
+                except Exception:
+                    continue
+            return out
+
+        except VLMError as e:
+            last_error = e
+            category = classify_vlm_error(e)
+            # 한도 초과나 인증 오류는 재시도해도 소용없음.
+            if category in ("quota_exceeded", "auth_error",
+                            "model_not_found"):
+                raise
+            # 5xx 서버 오류 또는 파싱 오류는 재시도 대상.
+            if not retry.should_retry(e, attempt):
+                raise
+            if attempt < max_retries:
+                delay = retry.delay(attempt)
+                time.sleep(delay)
                 continue
-        return out
-    except VLMError:
-        raise
-    except Exception as e:
-        raise VLMError(f"VLM 호출 실패: {e}") from e
+            raise
+
+        except Exception as e:
+            last_error = e
+            category = classify_vlm_error(e)
+            if category in ("quota_exceeded", "auth_error",
+                            "model_not_found"):
+                raise VLMError(f"VLM 호출 실패: {e}") from e
+            if not retry.should_retry(e, attempt):
+                raise VLMError(f"VLM 호출 실패: {e}") from e
+            if attempt < max_retries:
+                delay = retry.delay(attempt)
+                time.sleep(delay)
+                continue
+            raise VLMError(f"VLM 호출 실패(재시도 {max_retries}회 후): {e}") from e
+
+    # 도달할 수 없지만, 타입 체커를 위해 예외 발생.
+    raise last_error or VLMError("VLM 호출에 실패했습니다.")

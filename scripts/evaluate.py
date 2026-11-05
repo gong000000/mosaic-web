@@ -36,11 +36,7 @@ def main(video, api_key="", provider="OpenAI", model="", conf=0.20,
         print("READ_FAIL")
         return 1
 
-<<<<<<< HEAD
     _anno, persons, items = analyze_first_frame_items(
-=======
-    anno, persons, items = analyze_first_frame_items(
->>>>>>> a541d4dd35d9df26870696446f01c6e8cfc21b72
         first, get_model(model_name), conf, imgsz,
         query_raw="", targets=list(CANDS), api_key=api_key,
         vlm_model=vlm_model, vlm_base_url=base_url)

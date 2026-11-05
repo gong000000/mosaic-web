@@ -119,7 +119,9 @@ def t_black_video():
 
 def t_vlm_parse_and_normalize():
     from src.vlm_package import _normalize_item, _parse_json_array
-    assert _parse_json_array("") == []
+    # 빈 응답은 '탐지 없음'이 아니라 잘린/거부된 응답일 수 있으므로 None.
+    assert _parse_json_array("") is None
+    assert _parse_json_array(None) is None
     assert _parse_json_array("```json\n[{\"a\": 1}]\n```") == [{"a": 1}]
     assert _parse_json_array("설명 [1, 2] 뒤") == [1, 2]
     assert _parse_json_array("not json") is None
@@ -157,6 +159,21 @@ def t_vlm_parse_and_normalize():
              "coord": "pixel"}
     assert _normalize_item(item4, 100, 200, 2.0, "")["xyxy"] == \
         [20, 40, 100, 120]
+
+    # 제공자가 포괄 category('vehicle')와 구체 label을 같이 줘도
+    # 번호판을 놓치지 않아야 한다.
+    item5 = {"category": "vehicle", "label": "license plate",
+             "bbox": [0.1, 0.1, 0.5, 0.5], "coord": "norm"}
+    n5 = _normalize_item(item5, 100, 200, 1.0, "번호판")
+    assert n5["category"] == "license_plate", n5
+    assert n5["label_ko"] == "차량번호판"
+    item6 = {"category": "other", "label": "차량 번호판",
+             "bbox": [0.1, 0.1, 0.5, 0.5], "coord": "relative"}
+    assert _normalize_item(item6, 100, 200, 1.0, "")["category"] == \
+        "license_plate"
+    # 복수형/붙여쓰기도 같은 항목으로 묶는다.
+    item7 = {"category": "faces", "bbox": [0.1, 0.1, 0.5, 0.5]}
+    assert _normalize_item(item7, 100, 200, 1.0, "얼굴")["category"] == "face"
 
     # 문신은 어떤 응답이 와도 항목으로 만들지 않는다.
     assert _normalize_item({"category": "tattoo",

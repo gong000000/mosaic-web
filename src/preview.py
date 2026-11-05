@@ -9,6 +9,7 @@ from .config import (CANDS, CATEGORY_TYPE, VLM_MODEL, canon_category,
                      category_type, label_ko)
 from .detect import filter_contained, big_enough, iou, match_box
 from .select import VLMSelector
+from .vlm_budget import VLMBudget
 from .vlm_package import (VLMError, detect_with_vlm, prompt_categories)
 
 # COCO 차량 클래스: car, motorcycle, bus, truck
@@ -84,8 +85,11 @@ def _finalize(items, frame):
             it["count"] = len(boxes)
         it.pop("person_keys", None)
         it["thumb"] = None
+        it["box_count"] = len(boxes)
         if boxes:
-            x1, y1, x2, y2 = boxes[0]
+            # 대표 썸네일: 가장 큰 박스 선택 (가장 선명하게 찍힐 확률이 높음)
+            best = max(boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
+            x1, y1, x2, y2 = best
             try:
                 crop = frame[max(0, y1):max(0, y2), max(0, x1):max(0, x2)]
                 if crop.size:
@@ -105,9 +109,9 @@ def _detect_vehicles(model, frame, imgsz):
     """번호판 확대 탐지를 위한 차량 크롭 후보. VLM이 아니라 YOLO11-seg가
     '차량 영역'만 제안하고, 번호판 판정은 VLM이 한다."""
     try:
-        pr = list(model.predict(source=frame, conf=0.25,
+        pr = list(model.predict(source=frame, conf=0.18,
                                 classes=VEHICLE_CLASSES, verbose=False,
-                                imgsz=max(640, int(imgsz))))[0]
+                                imgsz=max(640, int(imgsz)), max_det=20))[0]
         if pr.boxes is None or len(pr.boxes) == 0:
             return []
         xy = pr.boxes.xyxy.cpu().numpy().astype(int)
@@ -119,7 +123,8 @@ def _detect_vehicles(model, frame, imgsz):
     for (x1, y1, x2, y2), conf in zip(xy, cf):
         x1, y1 = max(0, int(x1)), max(0, int(y1))
         x2, y2 = min(w, int(x2)), min(h, int(y2))
-        if x2 - x1 < 40 or y2 - y1 < 30:
+        # 아주 작은 차량도 번호판 확대 후보로 남긴다. 최종 판정은 VLM이 한다.
+        if x2 - x1 < 24 or y2 - y1 < 18:
             continue
         out.append((int(x1), int(y1), int(x2), int(y2), float(conf)))
     out.sort(key=lambda b: (b[2] - b[0]) * (b[3] - b[1]), reverse=True)
@@ -127,22 +132,37 @@ def _detect_vehicles(model, frame, imgsz):
 
 
 def _refine_plates(frame, vlm_boxes, model, imgsz, api_key, vlm_model,
-                   vlm_base_url):
+                   vlm_base_url, max_calls=2, max_vehicles=4,
+                   budget: VLMBudget | None = None):
     """VLM이 전체 프레임에서 번호판을 놓쳤을 때, 차량 크롭을 확대해
-    번호판 전용 VLM 호출을 한 번 더 한다. 찾은 박스는 원본 좌표로 되돌린다.
-    번호판 판정은 여전히 VLM이 하며, YOLO는 차량 크롭만 제안한다."""
+    번호판 전용 VLM 호출을 한다. 찾은 박스는 원본 좌표로 되돌린다.
+    번호판 판정은 여전히 VLM이 하며, YOLO는 차량 크롭만 제안한다.
+
+    max_calls는 이 프레임에서 추가로 허용할 VLM 호출 수다.
+    budget이 주어지면 영상 전체 예산을 확인하고 소진 시 호출하지 않는다.
+    """
     h0, w0 = frame.shape[:2]
     plates = [b for b in (vlm_boxes or [])
               if canon_category(b.get("category") or b.get("phrase"))
               == "license_plate"]
     vehicles = _detect_vehicles(model, frame, imgsz)
-    if not vehicles:
+
+    # 예산 확인: 영상 전체 예산이 소진되면 보조 호출을 하지 않는다.
+    if budget is not None:
+        if not budget.can_call():
+            return vlm_boxes
+        max_calls = min(max_calls, budget.remaining())
+
+    if not vehicles or max_calls <= 0:
         return vlm_boxes
 
     added = []
     calls = 0
-    for vx1, vy1, vx2, vy2, _conf in vehicles:
-        if calls >= 2:
+    for vx1, vy1, vx2, vy2, _conf in vehicles[:max_vehicles]:
+        if calls >= max_calls:
+            break
+        # 예산 재확인 (중간 호출에서 소진될 수 있음)
+        if budget is not None and not budget.can_call():
             break
         # 이미 번호판을 찾은 차량은 건너뛴다.
         already = False
@@ -170,11 +190,14 @@ def _refine_plates(frame, vlm_boxes, model, imgsz, api_key, vlm_model,
                               interpolation=cv2.INTER_CUBIC)
         ch2, cw2 = crop.shape[:2]
         calls += 1
+        if budget is not None:
+            budget.record(1)
         try:
             found = detect_with_vlm(
                 crop, ["license_plate"], api_key, model=vlm_model,
                 query_raw="", include_all=False, base_url=vlm_base_url,
-                focus="license_plate")
+                focus="license_plate",
+                max_retries=2)
         except VLMError as e:
             print(f"번호판 확대 탐지 실패(무시): {e}")
             continue
@@ -206,7 +229,9 @@ def analyze_first_frame_items(frame, model, conf, imgsz,
                               vlm_model=VLM_MODEL,
                               vlm_base_url=None,
                               frame_idx=0,
-                              refine_plates=True):
+                              refine_plates=True,
+                              plate_zoom_calls=2,
+                              plate_budget: VLMBudget | None = None):
     """returns (anno_bgr, persons, items).
     items: VLM이 찾은 카테고리별 체크리스트 항목. persons: 사람 요약 목록.
     """
@@ -235,9 +260,10 @@ def analyze_first_frame_items(frame, model, conf, imgsz,
                            api_key=api_key, vlm_model=vlm_model,
                            vlm_base_url=vlm_base_url)
     vlm_boxes = selector.detect_boxes(frame)
-    if refine_plates and "license_plate" in targets:
-        vlm_boxes = _refine_plates(frame, vlm_boxes, model, imgsz,
-                                   api_key, vlm_model, vlm_base_url)
+    if refine_plates and "license_plate" in targets and plate_zoom_calls > 0:
+        vlm_boxes = _refine_plates(
+            frame, vlm_boxes, model, imgsz, api_key, vlm_model, vlm_base_url,
+            max_calls=min(2, plate_zoom_calls), budget=plate_budget)
     judged = selector.match_items(cand, vlm_boxes)
 
     persons = []
@@ -301,6 +327,7 @@ def _merge_items(all_items):
                 merged[cat] = m
             m = merged[cat]
             m["count"] = max(m.get("count", 0), it.get("count", 0))
+            m["box_count"] = m.get("box_count", 0) + it.get("box_count", 0)
             m["prompt_match"] = (m.get("prompt_match")
                                  or it.get("prompt_match", False))
             m["boxes"] = _dedupe(list(m.get("boxes", []))
@@ -313,10 +340,8 @@ def _merge_items(all_items):
     for m in merged.values():
         m["samples"] = {int(k): _dedupe(v, 0.45)
                         for k, v in m.get("samples", {}).items()}
-        if m.get("type") != "person" or not m.get("boxes"):
-            m["count"] = (len(m.get("boxes", []))
-                          if m.get("type") == "region"
-                          else m.get("count", 0))
+        # count는 영상 전체 누적 박스 수가 아니라 한 프레임에서 동시에
+        # 보인 최대 개수다. 움직이는 번호판을 여러 '곳'으로 세지 않는다.
         m.pop("person_keys", None)
         out.append(m)
     out.sort(key=lambda x: (not x["prompt_match"], -x.get("count", 0),
@@ -326,7 +351,8 @@ def _merge_items(all_items):
 
 def analyze_video(video_path, model, conf, imgsz,
                   query_raw="", targets=None, api_key=None,
-                  vlm_model=VLM_MODEL, samples=12, vlm_base_url=None):
+                  vlm_model=VLM_MODEL, samples=12, vlm_base_url=None,
+                  plate_zoom_budget=6):
     """영상 앞/중간/끝을 고르게 샘플링해 체크리스트 항목을 만든다.
     기본 12개 샘플로 짧게 등장하는 번호판도 최대한 포함한다.
     returns (anno_bgr, persons, items). 첫 샘플 화면을 미리보기로 쓴다.
@@ -349,15 +375,24 @@ def analyze_video(video_path, model, conf, imgsz,
                       for v in np.linspace(0, max(0, total - 1), n)))
     anno0, persons0 = None, []
     all_items = []
+    plate_budget = VLMBudget(
+        per_video_limit=max(0, int(plate_zoom_budget)))
     for idx in idxs:
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ok, frame = cap.read()
         if not ok:
             continue
+        # 일부 코덱은 요청한 프레임과 실제로 읽은 프레임이 다르다.
+        # priors를 프레임에 정확히 맞추기 위해 실제 위치를 쓴다.
+        try:
+            pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+            actual_idx = max(0, pos - 1)
+        except Exception:
+            actual_idx = idx
         anno, persons, items = analyze_first_frame_items(
             frame, model, conf, imgsz, query_raw=query_raw, targets=targets,
             api_key=api_key, vlm_model=vlm_model, vlm_base_url=vlm_base_url,
-            frame_idx=idx)
+            frame_idx=actual_idx, plate_budget=plate_budget)
         if anno0 is None:
             anno0, persons0 = anno, persons
         all_items.append(items)

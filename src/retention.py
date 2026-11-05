@@ -1,12 +1,16 @@
 """보관 정책. 업로드 24시간 경과/다운로드 시 자동 삭제.
 영상 파일은 로컬에만 저장된다. (VLM 사용 시 판정용 프레임만 외부 전송)"""
 import os
+import threading
 import time
 try:
     from .config import OUTPUT_DIR
 except ImportError:
     # src/retention.py를 직접 실행할 때를 위한 절대 import 처리
     from config import OUTPUT_DIR
+
+_LOCK = threading.Lock()
+_SKIP = {"jobs.json", "jobs.json.tmp"}
 
 
 class RetentionPolicy:
@@ -20,28 +24,32 @@ class RetentionPolicy:
         limit = (self.max_hours if max_hours is None else max_hours) * 3600
         now = time.time()
         removed = 0
-        if not os.path.isdir(self.directory):
-            return 0
-        for f in os.listdir(self.directory):
-            p = os.path.join(self.directory, f)
-            if not os.path.isfile(p) or f == "jobs.json":
-                continue
-            try:
-                if now - os.path.getmtime(p) > limit:
-                    os.unlink(p)
-                    removed += 1
-            except Exception:
-                pass
+        with _LOCK:
+            if not os.path.isdir(self.directory):
+                return 0
+            for f in os.listdir(self.directory):
+                if f in _SKIP:
+                    continue
+                p = os.path.join(self.directory, f)
+                if not os.path.isfile(p):
+                    continue
+                try:
+                    if now - os.path.getmtime(p) > limit:
+                        os.unlink(p)
+                        removed += 1
+                except Exception:
+                    pass
         return removed
 
     def remove_on_download(self, path):
-        try:
-            if path and os.path.exists(path):
-                os.unlink(path)
-                return True
-        except Exception:
-            pass
-        return False
+        with _LOCK:
+            try:
+                if path and os.path.exists(path):
+                    os.unlink(path)
+                    return True
+            except Exception:
+                pass
+            return False
 
 
 _POLICY = RetentionPolicy()

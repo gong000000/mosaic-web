@@ -4,11 +4,8 @@ VLM이 표준 카테고리에 없는 항목(예: green_shirt, region_type=person
 돌려줄 때도 사람 트랙에 투표되어 모자이크되는지,
 체크하지 않은(선택 해제한) 카테고리는 투표/렌더에 절대 남지 않는지,
 VLM이 찾지 않은 얼굴을 임의로 만들지 않는지 확인한다.
-<<<<<<< HEAD
 또한 '가리는 범위=얼굴만'이어도 선택한 명찰은 VLM 박스 위치에서
 직접 가려지는지 확인한다.
-=======
->>>>>>> a541d4dd35d9df26870696446f01c6e8cfc21b72
 실행: .\\.venv\\Scripts\\python.exe scripts\\freeform.py
 """
 import os
@@ -175,15 +172,12 @@ def main():
                       if isinstance(tid, int) and v.get("mosaic"))
         if face_on != 0:
             fails.append(f"VLM이 face를 찾지 않았는데 {face_on}명 가려짐")
-<<<<<<< HEAD
 
         # 3) 얼굴만 범위에서도 선택한 명찰은 직접 가려져야 한다.
         P.VLMSelector = VLMSelector
         err = check_name_tag_direct(tmp_dir)
         if err:
             fails.append(err)
-=======
->>>>>>> a541d4dd35d9df26870696446f01c6e8cfc21b72
     finally:
         P.VLMSelector = real
         _remove_video(tmp_out)

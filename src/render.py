@@ -65,6 +65,29 @@ def mux_audio_h264(video_noaudio, audio_src, output_path, preset="veryfast"):
     return output_path
 
 
+def normalize_video(input_path, output_path, max_width=1920):
+    """브라우저/OpenCV 호환성을 위해 H.264 MP4로 다시 인코딩한다.
+
+    MOV/AVI나 일부 코덱은 OpenCV가 못 읽거나 브라우저 미리보기가 안 될 수
+    있다. 업로드 원본은 보존하고, 처리용 사본만 MP4로 만든다.
+    """
+    ff = imageio_ffmpeg.get_ffmpeg_exe()
+    cleanup_tmp(output_path)
+    vf = (f"scale=trunc(min({int(max_width)},iw)/2)*2:"
+          "trunc(ih/2)*2")
+    cmd = [ff, "-y", "-i", input_path, "-vf", vf,
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+           "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart",
+           output_path]
+    r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, check=False)
+    if (r.returncode != 0 or not os.path.exists(output_path)
+            or os.path.getsize(output_path) == 0):
+        cleanup_tmp(output_path)
+        raise RuntimeError("ffmpeg 영상 변환 실패")
+    return output_path
+
+
 def trim_video(input_path, output_path, start_sec=0.0, end_sec=None):
     """구간 자르기. 스트림 복사(-c copy)는 키프레임 사이를 자르면
     영상 트랙이 통째로 빠질 수 있어서 재인코딩한다.
@@ -138,8 +161,8 @@ def render_region(frame, x1, y1, x2, y2, style="pixel", blocks=30, blur=61, pad=
     return True
 
 
-def render_person_strict(frame, x1, y1, x2, y2, mask_full_or_None, style="pixel", blocks=30, blur=61):
-    """마스크 있을 때만 마스크 영역. 없으면 얼굴 영역(상단 35%)만 타원으로.
+def render_person_strict(frame, x1, y1, x2, y2, mask_full_or_None, style="pixel", blocks=30, blur=61, area_mode="full"):
+    """마스크 있을 때만 마스크 영역. 없으면 area_mode에 따라 얼굴/상반신/전체 영역을 가린다.
     렌더했으면 True."""
     x1c, y1c = max(0, int(x1)), max(0, int(y1))
     x2c, y2c = min(frame.shape[1], int(x2)), min(frame.shape[0], int(y2))
@@ -160,7 +183,13 @@ def render_person_strict(frame, x1, y1, x2, y2, mask_full_or_None, style="pixel"
         except Exception:
             pass
     h = y2c - y1c
-    fy2 = y1c + int(h * 0.35)
+    if area_mode == "face_only":
+        ratio = 0.32
+    elif area_mode == "upper":
+        ratio = 0.65
+    else:
+        ratio = 1.0
+    fy2 = y1c + int(h * ratio)
     if fy2 - y1c < 15:
         return False
     w_ = x2c - x1c

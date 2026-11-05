@@ -1,7 +1,9 @@
 """개인정보 보호 선택적 모자이크 웹 앱 (Streamlit + YOLO11-seg + VLM)
 영상을 업로드하면 VLM이 개인정보 항목(얼굴, 차량번호판, 주소, 차량동승자 등)을
 탐지하고, 사용자가 선택한 항목에만 모자이크를 적용한다."""
+import hashlib
 import os
+import secrets
 import shutil
 import time
 import tempfile
@@ -12,7 +14,7 @@ from src.config import (CANDS, PRESETS, OUTPUT_DIR, VLM_PROVIDERS,
                         label_ko)
 from src.preview import analyze_video
 from src.vlm_package import prompt_categories
-from src.render import trim_video
+from src.render import normalize_video, trim_video
 from src.models import get_model, MODEL_LOCK
 from src.pipeline import mosaic_video
 from src import history as H
@@ -287,13 +289,9 @@ def _friendly_vlm_error(err, api_key=""):
                 "제공자와 키를 확인하세요.")
     if ("429" in msg or "quota" in low or "rate limit" in low
             or "resource_exhausted" in low):
-<<<<<<< HEAD
         compact = low.replace(" ", "").replace("_", "")
         if ("per day" in low or "daily" in low or "perday" in compact
                 or "freetier" in compact):
-=======
-        if "per day" in low or "daily" in low or "requests per day" in low:
->>>>>>> a541d4dd35d9df26870696446f01c6e8cfc21b72
             return ("VLM 무료 등급의 일일 호출 한도를 초과했습니다. "
                     "내일 다시 시도하거나 다른 모델/유료 키를 사용하세요.")
         return ("VLM 호출 한도를 초과했습니다. 잠시 후 다시 시도하거나 "
@@ -309,10 +307,12 @@ def _unique_out_path(src_name):
     """같은 초에 두 작업이 끝나도 결과 파일을 덮어쓰지 않게 한다."""
     stem = os.path.splitext(os.path.basename(src_name))[0]
     ts = time.strftime("%m%d_%H%M%S")
-    cand = os.path.join(OUTPUT_DIR, f"{stem}_{ts}.mp4")
+    token = secrets.token_hex(2)
+    cand = os.path.join(OUTPUT_DIR, f"{stem}_{ts}_{token}.mp4")
     i = 1
     while os.path.exists(cand):
-        cand = os.path.join(OUTPUT_DIR, f"{stem}_{ts}_{i}.mp4")
+        cand = os.path.join(OUTPUT_DIR,
+                            f"{stem}_{ts}_{token}_{i}.mp4")
         i += 1
     return cand
 
@@ -354,8 +354,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 purged = RT.purge_old()
-if purged:
-    st.caption(f"{RT.RETENTION_HOURS}시간 지난 결과 {purged}개 자동 삭제됨")
+stale_rows = H.remove_missing()
+if purged or stale_rows:
+    st.caption(f"{RT.RETENTION_HOURS}시간 지난 결과 {purged}개 자동 삭제됨"
+               + (f" · 만료된 기록 {stale_rows}개 정리" if stale_rows else ""))
 
 
 def _apply_preset():
@@ -413,13 +415,8 @@ with st.sidebar:
     st.subheader("5. 모자이크 설정")
     area_label = st.selectbox("가리는 범위", ["전체", "상반신", "얼굴만"], index=0)
     area_mode = {"전체": "full", "상반신": "upper", "얼굴만": "face_only"}[area_label]
-<<<<<<< HEAD
     st.caption("사람 항목에 적용됩니다. 명찰은 이 설정과 무관하게 VLM이 찾은 "
                "위치를 항상 가립니다. 배경 항목은 항상 탐지 영역만 가립니다.")
-=======
-    st.caption("사람 항목에 적용됩니다. '얼굴만/상반신'을 고르면 명찰 등 다른 부위가 "
-               "가려지지 않을 수 있습니다. 배경 항목은 항상 탐지 영역만 가립니다.")
->>>>>>> a541d4dd35d9df26870696446f01c6e8cfc21b72
     style_label = st.selectbox("모자이크 모양", ["모자이크", "흐리게", "검게"], index=0)
     style = {"모자이크": "pixel", "흐리게": "blur", "검게": "solid"}[style_label]
     if style == "모자이크":
@@ -444,35 +441,82 @@ if not tmp_dir or not os.path.isdir(tmp_dir):
     tmp_dir = tempfile.mkdtemp(prefix="mosaic_")
     st.session_state["tmp_dir"] = tmp_dir
 
-upload_id = (uploaded.name, uploaded.size, getattr(uploaded, "file_id", ""))
-suffix = os.path.splitext(uploaded.name)[1].lower() or ".mp4"
+raw_bytes = uploaded.getvalue()
+digest = hashlib.sha256(raw_bytes).hexdigest()[:16]
+# 파일명/크기만 같고 내용이 다른 영상이 이전 분석 결과를 재사용하지 않도록
+# 내용 해시까지 키에 넣는다.
+upload_id = (uploaded.name, uploaded.size, digest)
+raw_suffix = os.path.splitext(uploaded.name)[1].lower()
+suffix = raw_suffix if raw_suffix in (".mp4", ".mov", ".avi") else ".mp4"
 in_path = os.path.join(tmp_dir, "input" + suffix)
+norm_path = os.path.join(tmp_dir, "input_norm.mp4")
 trim_path = os.path.join(tmp_dir, "trim.mp4")
+
+
+def _unlink_quiet(*paths):
+    for p in paths:
+        if not p:
+            continue
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
 
 if st.session_state.get("upload_id") != upload_id or not os.path.exists(in_path):
     old_in = st.session_state.get("input_path")
-    if old_in and old_in != in_path:
-        try:
-            os.remove(old_in)
-        except OSError:
-            pass
-    try:
-        os.remove(trim_path)
-    except OSError:
-        pass
+    _unlink_quiet(old_in if old_in != in_path else None,
+                  norm_path, trim_path)
     with open(in_path, "wb") as f:
-        f.write(uploaded.getvalue())
+        f.write(raw_bytes)
     st.session_state["upload_id"] = upload_id
     st.session_state["input_path"] = in_path
     st.session_state.pop("trim_key", None)
+    st.session_state.pop("preview_key", None)
+    st.session_state.pop("result", None)
 
-cap0 = cv2.VideoCapture(in_path)
-fps0 = float(cap0.get(cv2.CAP_PROP_FPS) or 0.0)
-if not (fps0 > 1.0):
+
+def _probe_video(path):
+    """열기·첫 프레임·길이를 한 번에 확인한다. 실패하면 None."""
+    cap = cv2.VideoCapture(path)
+    try:
+        if not cap.isOpened():
+            return None
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            return None
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        return total, fps
+    finally:
+        cap.release()
+
+
+probe = _probe_video(in_path)
+# MOV/AVI는 브라우저 미리보기와 OpenCV 읽기가 불안정하므로 MP4 사본을
+# 만들어 처리한다. MP4라도 읽기 실패하면 변환을 한 번 시도한다.
+needs_norm = suffix != ".mp4" or probe is None
+if needs_norm:
+    if not os.path.exists(norm_path):
+        with st.spinner("브라우저 호환 MP4로 변환 중..."):
+            try:
+                normalize_video(in_path, norm_path)
+            except Exception as e:
+                st.error(f"영상 변환 실패: {e}")
+                st.stop()
+    probe = _probe_video(norm_path)
+    src_path = norm_path
+else:
+    src_path = in_path
+
+if probe is None:
+    st.error("영상을 읽을 수 없습니다. 손상되었거나 지원하지 않는 코덱입니다. "
+             "MP4(H.264)로 변환해 다시 올려주세요.")
+    st.stop()
+total0, fps0 = probe
+if not (fps0 > 0):
     fps0 = 30.0
-total0 = int(cap0.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-dur = total0 / max(1.0, fps0)
-cap0.release()
+dur = total0 / fps0
 st.write(f"길이 {dur:.1f}초 · {total0}프레임")
 
 use_trim = st.checkbox("구간만 처리", value=False)
@@ -489,13 +533,13 @@ if use_trim:
         st.error("끝 시간은 시작 시간보다 커야 합니다.")
         st.stop()
     if s_sec <= 0 and e_sec <= 0:
-        proc_in = in_path
+        proc_in = src_path
     else:
         trim_sig = (upload_id, float(s_sec), float(e_sec))
         if st.session_state.get("trim_key") != trim_sig or not os.path.exists(trim_path):
             with st.spinner("구간 자르는 중..."):
                 try:
-                    trim_video(in_path, trim_path, s_sec,
+                    trim_video(src_path, trim_path, s_sec,
                                e_sec if e_sec > 0 else None)
                 except Exception as e:
                     st.error(f"구간 자르기 실패: {e}")
@@ -504,11 +548,12 @@ if use_trim:
         proc_in = trim_path
 else:
     s_sec, e_sec = 0.0, 0.0
-    proc_in = in_path
+    proc_in = src_path
 
 st.subheader("1. 개인정보 항목 확인")
 if st.button("다시 분석"):
     st.session_state.pop("preview_key", None)
+    st.session_state.pop("result", None)
     st.rerun()
 
 # 분석 단계에서는 프롬프트 항목 + 모든 개인정보 카테고리를 후보로 찾는다.
@@ -528,6 +573,8 @@ else:
                    api_key, vlm_base_url, vlm_model, model_name, imgsz,
                    sample_n, trim_sig)
     if st.session_state.get("preview_key") != preview_key:
+        # 영상/프롬프트/설정이 바뀌면 이전 결과 영상은 더 이상 유효하지 않다.
+        st.session_state.pop("result", None)
         err = None
         anno, persons, items = None, [], []
         with st.spinner("영상 샘플 분석 중... (VLM)"):
@@ -579,7 +626,11 @@ if items:
     def _render_item(it):
         cat = it["category"]
         unit = "명" if it.get("type") == "person" else "곳"
-        label = f"{it.get('label_ko', cat)} · {it.get('count', 0)}{unit}"
+        cnt = it.get("count", 0)
+        box_cnt = it.get("box_count", 0)
+        label = f"{it.get('label_ko', cat)} · {cnt}{unit}"
+        if box_cnt and box_cnt != cnt:
+            label += f" (총 {box_cnt}회 탐지)"
         c1, c2 = st.columns([1, 9])
         with c1:
             th = it.get("thumb")
@@ -622,20 +673,35 @@ run = st.button("모자이크 시작", type="primary",
 if not selected_cats:
     st.caption("최소 한 항목을 체크해야 시작할 수 있습니다.")
 
-# 체크리스트 VLM 박스를 처리 단계의 배경 영역 초기값으로 넘긴다.
+# 체크리스트 VLM 박스를 처리 단계의 초기값으로 넘긴다.
 # 처리 중 VLM이 같은 프레임에서 놓쳐도 체크한 항목은 계속 가려진다.
 region_priors = {}
+person_priors = {}
 for it in items:
     cat = it.get("category")
-    if cat in selected_cats and it.get("type") == "region":
-        by_frame = it.get("samples") or {}
-        if by_frame:
-            region_priors[cat] = by_frame
+    if cat not in selected_cats:
+        continue
+    by_frame = it.get("samples") or {}
+    if not by_frame:
+        continue
+    if it.get("type") == "region":
+        region_priors[cat] = by_frame
+    else:
+        person_priors[cat] = by_frame
+
+# 처리 단계에는 체크한 항목만 말한다. 원문 프롬프트에 있는 선택 해제
+# 카테고리까지 VLM이 다시 찾느라 호출/응답을 낭비하지 않게 한다.
+selected_items = [it for it in items
+                  if it.get("category") in selected_cats]
+proc_prompt = "선택한 항목만 가리기: " + ", ".join(
+    str(it.get("label_ko") or label_ko(it["category"]))
+    for it in selected_items)
 
 # 결과는 session_state에 남긴다. 다운로드/위젯 클릭으로 스크립트가 다시 돌아도
-# 결과 화면이 사라지지 않는다.
-run_sig = (preview_key, tuple(selected_cats), style, blocks, blur,
-           area_mode, keyframe_stride, speed_label)
+# 결과 화면이 사라지지 않는다. analysis_id를 넣어 '다시 분석' 후에도 이전
+# 결과가 유효한 것처럼 보이지 않게 한다.
+run_sig = (preview_key, analysis_id, tuple(selected_cats), style, blocks,
+           blur, area_mode, keyframe_stride, speed_label)
 res = st.session_state.get("result")
 if res is not None and res.get("sig") != run_sig:
     st.session_state.pop("result", None)
@@ -666,9 +732,10 @@ if run:
                     ultra=(speed_label == "정밀"), area_mode=area_mode,
                     keyframe_stride=keyframe_stride,
                     encode_preset=encode_preset, progress_fn=_pg,
-                    query_raw=prompt_raw, api_key=api_key,
+                    query_raw=proc_prompt, api_key=api_key,
                     vlm_model=vlm_model, vlm_base_url=vlm_base_url,
                     region_priors=region_priors,
+                    person_priors=person_priors,
                 ) or {}
         except Exception as e:
             err = e
@@ -685,12 +752,17 @@ if run:
         st.stop()
 
     region_n = stats.pop("_regions", 0)
+    stats.pop("_cats", None)
+    untracked_cats = list(stats.pop("_untracked", []))
     final_n = sum(1 for v in stats.values()
                   if isinstance(v, dict) and v.get("mosaic"))
+    summary = f"{final_n}명 가려짐 · 배경 {region_n}종"
+    if untracked_cats:
+        summary += f" · 추적 밖 {len(untracked_cats)}종"
     try:
         H.add(uploaded.name, prompt_raw, ",".join(selected_cats), False,
               out_name, elapsed, query_raw=prompt_raw, selector="vlm",
-              summary=f"{final_n}명 가려짐 · 배경 {region_n}종")
+              summary=summary)
     except Exception:
         pass
     res = {
@@ -701,6 +773,7 @@ if run:
         "elapsed": elapsed,
         "final_n": final_n,
         "region_n": region_n,
+        "untracked_cats": untracked_cats,
         "selected_cats": list(selected_cats),
     }
     st.session_state["result"] = res
@@ -738,9 +811,12 @@ stats = res["stats"]
 elapsed = res["elapsed"]
 final_n = res["final_n"]
 region_n = res.get("region_n", 0)
+untracked_cats = res.get("untracked_cats", [])
 
 st.success(f"완료 · {elapsed:.1f}초 걸림")
-st.write(f"최종 사람 {final_n}명 · 배경 {region_n}종 가려짐")
+st.write(f"최종 사람 {final_n}명 · 배경 {region_n}종 가려짐"
+         + (f" · 추적 밖 {len(untracked_cats)}종"
+            if untracked_cats else ""))
 st.caption("선택한 항목: " + ", ".join(label_ko(c) for c in res.get("selected_cats", [])))
 for tid, v in sorted(stats.items()):
     c1, c2 = st.columns([1, 3])
@@ -778,6 +854,8 @@ if os.path.exists(out_path):
                                      mime="video/mp4")
     if clicked and auto_del:
         RT.remove_on_download(out_path)
+        # 파일만 지우고 기록을 남기면 '지난 작업'에 깨진 항목이 남는다.
+        H.delete(out_name)
         st.info("받기 끝나서 결과 파일을 지웠다. (보관 정책)")
 else:
     st.info(f"결과 파일이 삭제되었다. ({RT.RETENTION_HOURS}시간 보관 정책 또는 다운로드 후 자동 삭제)")
