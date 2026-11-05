@@ -357,6 +357,9 @@ class MosaicJob:
                 person_box_samples = cache["person_box_samples"]
                 region_samples = cache["region_samples"]
                 first_thumb = cache["first_thumb"]
+                person_cats_seen = cache.get("person_cats_seen", set())
+                all_detail = cache.get("all_detail", {})
+                observed_types = cache.get("observed_types", {})
                 total = cache["meta"]["total"]
                 fps = cache["meta"]["fps"]
                 H = cache["meta"]["H"]
@@ -465,135 +468,144 @@ class MosaicJob:
 
         # ---- 1패스: 모든 프레임 추적 + 키프레임 VLM 탐지 ----
         # 1패스와 2패스가 같은 프레임 시퀀스를 추적해야 트랙 ID가 일치한다.
-        votes = defaultdict(lambda: defaultdict(list))
-        first_thumb = {}
-        person_cats_seen = {c for c in targets
-                            if CATEGORY_TYPE.get(c) == "person"}
-        all_detail = defaultdict(dict)
-
+        # 캐시가 있으면 1패스를 건너뛴다.
+        if cache_hit:
+            _reset_tracker(model)
+            # priors는 캐시 로드 후에도 적용돼야 한다. region/person priors는
+            # region_samples/person_box_samples에 직접 쌓이므로 여기서
+            # pending_person_priors를 확정해 fallback으로 남긴다.
+            pass
+        else:
+            votes = defaultdict(lambda: defaultdict(list))
+            first_thumb = {}
+            person_cats_seen = {c for c in targets
+                                if CATEGORY_TYPE.get(c) == "person"}
+            all_detail = defaultdict(dict)
         t0 = time.time()
-        results1 = model.track(source=input_path, stream=True, persist=True,
-                               tracker=_TRACKER_CFG,
-                               conf=conf, classes=[0], verbose=False,
-                               imgsz=imgsz, iou=0.5, max_det=30)
 
-        frame_idx = -1
-        for r in results1:
-            frame_idx += 1
-            if progress_fn and total > 0 and frame_idx % 5 == 0:
-                try:
-                    progress_fn(0.5 * min(1.0, (frame_idx + 1) / total),
-                                frame_idx + 1, total, time.time() - t0)
-                except Exception:
-                    pass
+        if not cache_hit:
+            results1 = model.track(source=input_path, stream=True, persist=True,
+                                   tracker=_TRACKER_CFG,
+                                   conf=conf, classes=[0], verbose=False,
+                                   imgsz=imgsz, iou=0.5, max_det=30)
 
-            if frame_idx % keyframe_stride != 0:
-                continue
-            sample_idx = frame_idx // keyframe_stride
-
-            frame = r.orig_img
-            boxes = np.zeros((0, 4), dtype=int)
-            ids = np.zeros((0,), dtype=int)
-            if r.boxes is not None and len(r.boxes) > 0:
-                boxes = r.boxes.xyxy.cpu().numpy().astype(int)
-                ids = (r.boxes.id.cpu().numpy().astype(int)
-                       if r.boxes.id is not None else [-1] * len(boxes))
-
-            keep = filter_contained(boxes) if len(boxes) else []
-            cand = []
-            for i, (x1, y1, x2, y2) in enumerate(boxes):
-                if not keep[i]:
-                    continue
-                tid = int(ids[i])
-                x1c, y1c = max(0, int(x1)), max(0, int(y1))
-                x2c, y2c = (min(frame.shape[1], int(x2)),
-                            min(frame.shape[0], int(y2)))
-                if not big_enough(x1c, y1c, x2c, y2c):
-                    continue
-                cand.append({"key": (tid, len(cand)), "tid": tid,
-                             "xyxy": [x1c, y1c, x2c, y2c]})
-                if tid not in first_thumb:
+            frame_idx = -1
+            for r in results1:
+                frame_idx += 1
+                if progress_fn and total > 0 and frame_idx % 5 == 0:
                     try:
-                        crop = frame[y1c:y2c, x1c:x2c]
-                        th = cv2.resize(
-                            crop,
-                            (96, max(1, int(96 * crop.shape[0]
-                                           / max(1, crop.shape[1])))),
-                            interpolation=cv2.INTER_AREA)
-                        first_thumb[tid] = th
+                        progress_fn(0.5 * min(1.0, (frame_idx + 1) / total),
+                                    frame_idx + 1, total, time.time() - t0)
                     except Exception:
-                        first_thumb[tid] = None
+                        pass
 
-            # 사람이 없어도 배경 개인정보를 찾아야 하므로 항상 호출한다.
-            vlm_boxes = selector.detect_boxes(frame)
-
-            # 체크리스트에서 넘어온 사람 부착 박스. 같은 위치를 이번
-            # 키프레임 VLM이 이미 찾았다면 중복 저장하지 않는다.
-            if pending_person_priors:
-                live_person = defaultdict(list)
-                for b in vlm_boxes:
-                    bcat = canon_category(b.get("category")
-                                          or b.get("phrase"))
-                    if (bcat in targets
-                            and _cat_type(bcat, b.get("region_type"))
-                            == "person"):
-                        live_person[bcat].append(b)
-                for cat, by_sidx in list(pending_person_priors.items()):
-                    if sample_idx not in by_sidx:
-                        continue
-                    for coords, due in by_sidx.pop(sample_idx):
-                        if any(iou(coords, b.get("xyxy", [0, 0, 0, 0])) >= 0.25
-                               for b in live_person.get(cat, [])):
-                            continue
-                        _store_person_box(
-                            person_box_samples, cat, sample_idx,
-                            {"xyxy": coords}, cand, due=due)
-
-            judged = selector.match_items(cand, vlm_boxes)
-            hits_by_key = {}
-            detail_by_key = {}
-            for it in cand:
-                _hit, _detail = judged.get(
-                    it["key"], (False, {"selector": "vlm", "hits": []}))
-                hits_by_key[it["key"]] = set(_detail.get("hits", []))
-                detail_by_key[it["key"]] = _detail
-
-            # 사람별 카테고리 투표. 선택된 카테고리만 반영한다.
-            # 각 사람은 자기 자신과 매칭된 카테고리만 투표한다.
-            # (이전 사람을 통해 누적된 카테고리가 다른 사람에게 전이되지 않도록 함)
-            for it in cand:
-                tid = it["tid"]
-                hits = {c for c in hits_by_key.get(it["key"], set())
-                        if c in targets}
-                # 같은 키프레임에서 처음 발견된 자유 형식 카테고리도 즉시 투표한다.
-                person_cats_seen.update(hits)
-                for cat in hits:
-                    votes[tid][cat].append(True)
-                    all_detail[tid].setdefault(
-                        cat, detail_by_key.get(it["key"], {}))
-
-            # 배경 영역 후보 저장 (VLM이 찾은 번호판·간판 등)
-            for b in vlm_boxes:
-                cat = canon_category(b.get("category") or b.get("phrase"))
-                if cat not in targets:
+                if frame_idx % keyframe_stride != 0:
                     continue
-                rtype = _cat_type(cat, b.get("region_type"))
-                observed_types.setdefault(cat, rtype)
-                if rtype == "region":
-                    region_samples[cat][sample_idx].append(b)
-                else:
-                    # 명찰·얼굴처럼 사람에 붙은 항목도 별도 박스로 저장한다.
-                    _store_person_box(person_box_samples, cat, sample_idx,
-                                      b, cand)
+                sample_idx = frame_idx // keyframe_stride
 
-        # 사람 트랙과 한 번도 매칭되지 않은 체크리스트 박스도 절대좌표로
-        # 남겨, 트랙 ID가 바뀌거나 사람 검출이 약한 구간에서도 가린다.
-        for cat, by_sidx in pending_person_priors.items():
-            for _sidx, entries in by_sidx.items():
-                for coords, due in entries:
-                    person_box_samples[cat][_sidx].append(
-                        {"tid": -1, "rel": None, "abs": coords,
-                         "due": int(due)})
+                frame = r.orig_img
+                boxes = np.zeros((0, 4), dtype=int)
+                ids = np.zeros((0,), dtype=int)
+                if r.boxes is not None and len(r.boxes) > 0:
+                    boxes = r.boxes.xyxy.cpu().numpy().astype(int)
+                    ids = (r.boxes.id.cpu().numpy().astype(int)
+                           if r.boxes.id is not None else [-1] * len(boxes))
+
+                keep = filter_contained(boxes) if len(boxes) else []
+                cand = []
+                for i, (x1, y1, x2, y2) in enumerate(boxes):
+                    if not keep[i]:
+                        continue
+                    tid = int(ids[i])
+                    x1c, y1c = max(0, int(x1)), max(0, int(y1))
+                    x2c, y2c = (min(frame.shape[1], int(x2)),
+                                min(frame.shape[0], int(y2)))
+                    if not big_enough(x1c, y1c, x2c, y2c):
+                        continue
+                    cand.append({"key": (tid, len(cand)), "tid": tid,
+                                 "xyxy": [x1c, y1c, x2c, y2c]})
+                    if tid not in first_thumb:
+                        try:
+                            crop = frame[y1c:y2c, x1c:x2c]
+                            th = cv2.resize(
+                                crop,
+                                (96, max(1, int(96 * crop.shape[0]
+                                               / max(1, crop.shape[1])))),
+                                interpolation=cv2.INTER_AREA)
+                            first_thumb[tid] = th
+                        except Exception:
+                            first_thumb[tid] = None
+
+                # 사람이 없어도 배경 개인정보를 찾아야 하므로 항상 호출한다.
+                vlm_boxes = selector.detect_boxes(frame)
+
+                # 체크리스트에서 넘어온 사람 부착 박스. 같은 위치를 이번
+                # 키프레임 VLM이 이미 찾았다면 중복 저장하지 않는다.
+                if pending_person_priors:
+                    live_person = defaultdict(list)
+                    for b in vlm_boxes:
+                        bcat = canon_category(b.get("category")
+                                              or b.get("phrase"))
+                        if (bcat in targets
+                                and _cat_type(bcat, b.get("region_type"))
+                                == "person"):
+                            live_person[bcat].append(b)
+                    for cat, by_sidx in list(pending_person_priors.items()):
+                        if sample_idx not in by_sidx:
+                            continue
+                        for coords, due in by_sidx.pop(sample_idx):
+                            if any(iou(coords, b.get("xyxy", [0, 0, 0, 0])) >= 0.25
+                                   for b in live_person.get(cat, [])):
+                                continue
+                            _store_person_box(
+                                person_box_samples, cat, sample_idx,
+                                {"xyxy": coords}, cand, due=due)
+
+                judged = selector.match_items(cand, vlm_boxes)
+                hits_by_key = {}
+                detail_by_key = {}
+                for it in cand:
+                    _hit, _detail = judged.get(
+                        it["key"], (False, {"selector": "vlm", "hits": []}))
+                    hits_by_key[it["key"]] = set(_detail.get("hits", []))
+                    detail_by_key[it["key"]] = _detail
+
+                # 사람별 카테고리 투표. 선택된 카테고리만 반영한다.
+                # 각 사람은 자기 자신과 매칭된 카테고리만 투표한다.
+                # (이전 사람을 통해 누적된 카테고리가 다른 사람에게 전이되지 않도록 함)
+                for it in cand:
+                    tid = it["tid"]
+                    hits = {c for c in hits_by_key.get(it["key"], set())
+                            if c in targets}
+                    # 같은 키프레임에서 처음 발견된 자유 형식 카테고리도 즉시 투표한다.
+                    person_cats_seen.update(hits)
+                    for cat in hits:
+                        votes[tid][cat].append(True)
+                        all_detail[tid].setdefault(
+                            cat, detail_by_key.get(it["key"], {}))
+
+                # 배경 영역 후보 저장 (VLM이 찾은 번호판·간판 등)
+                for b in vlm_boxes:
+                    cat = canon_category(b.get("category") or b.get("phrase"))
+                    if cat not in targets:
+                        continue
+                    rtype = _cat_type(cat, b.get("region_type"))
+                    observed_types.setdefault(cat, rtype)
+                    if rtype == "region":
+                        region_samples[cat][sample_idx].append(b)
+                    else:
+                        # 명찰·얼굴처럼 사람에 붙은 항목도 별도 박스로 저장한다.
+                        _store_person_box(person_box_samples, cat, sample_idx,
+                                          b, cand)
+
+            # 사람 트랙과 한 번도 매칭되지 않은 체크리스트 박스도 절대좌표로
+            # 남겨, 트랙 ID가 바뀌거나 사람 검출이 약한 구간에서도 가린다.
+            for cat, by_sidx in pending_person_priors.items():
+                for _sidx, entries in by_sidx.items():
+                    for coords, due in entries:
+                        person_box_samples[cat][_sidx].append(
+                            {"tid": -1, "rel": None, "abs": coords,
+                             "due": int(due)})
 
         # 1패스 결과 캐시 저장 (캐시 사용 시 재실행 때 1패스 생략 가능)
         if self.use_cache and self.cache_path and not cache_hit:
@@ -613,6 +625,9 @@ class MosaicJob:
                     "person_box_samples": dict(person_box_samples),
                     "region_samples": dict(region_samples),
                     "first_thumb": first_thumb,
+                    "person_cats_seen": set(person_cats_seen),
+                    "all_detail": dict(all_detail),
+                    "observed_types": dict(observed_types),
                 }
                 with open(self.cache_path, "wb") as f:
                     pickle.dump(cache, f)
