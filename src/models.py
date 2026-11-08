@@ -33,14 +33,14 @@ class ModelStore:
                 return p
         return os.path.join(self.search_dirs[0], name)
 
-    def get(self, name="yolo11m-seg.pt"):
+    def get(self, name="yolo11n-seg.pt"):
         with self._lock:
             if name not in self._models:
                 self._models[name] = YOLO(self._resolve(name))
             return self._models[name]
 
 
-def get_model(name="yolo11m-seg.pt"):
+def get_model(name="yolo11n-seg.pt"):
     global _STORE
     with _STORE_LOCK:
         if _STORE is None:

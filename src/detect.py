@@ -1,7 +1,13 @@
 """검출 후처리. 트래커/프리뷰/파이프라인 공통 기하 유틸."""
+import cv2
+import numpy as np
 
 MIN_W = 24
 MIN_H = 48
+
+# 글자가 있어야 하는 배경 개인정보. VLM이 빈 벽/하늘을 큰 사각형으로
+# 돌려주는 오탐을 렌더 단계에서 한 번 더 거른다.
+TEXT_CATEGORIES = {"address", "id_card", "phone_screen"}
 
 
 def big_enough(x1, y1, x2, y2):
@@ -45,8 +51,13 @@ def match_box(person_xyxy, boxes, iou_thresh=0.12, expand=0.03):
     return True, best, round(float(best_iou), 3)
 
 
-def filter_contained(boxes, thresh=0.75):
-    """큰 박스 안에 75% 이상 들어간 작은 박스 제외. 합쳐진 오탐 제거용.
+def filter_contained(boxes, thresh=0.80, min_area_ratio=0.35):
+    """거의 같은 크기로 겹친 중복 검출만 제거한다.
+
+    예전에는 큰 박스 안에 75%만 들어가도 지웠다. 앞사람이 화면을 크게
+    덮는 장면에서는 뒤쪽 사람 박스가 전부 사라져 얼굴 모자이크가 빠졌다.
+    중복 박스는 보통 크기가 비슷하므로, 면적이 큰 박스의 35% 이상일 때만
+    포함 관계를 중복으로 본다. 뒤에 있는 작은 사람은 남긴다.
     boxes: (N,4) array-like. keep 불리언 리스트 반환."""
     n = len(boxes)
     keep = [True] * n
@@ -58,6 +69,8 @@ def filter_contained(boxes, thresh=0.75):
         for j in range(n):
             if i == j or areas[j] <= areas[i]:
                 continue
+            if areas[i] < areas[j] * min_area_ratio:
+                continue
             ix1 = max(int(boxes[i][0]), int(boxes[j][0]))
             iy1 = max(int(boxes[i][1]), int(boxes[j][1]))
             ix2 = min(int(boxes[i][2]), int(boxes[j][2]))
@@ -67,3 +80,34 @@ def filter_contained(boxes, thresh=0.75):
                 keep[i] = False
                 break
     return keep
+
+
+def region_has_detail(frame, box, cat):
+    """간판·문서 박스에 실제 글자/경계가 있는지 확인한다.
+
+    VLM이 빈 벽이나 배경을 '주소·간판'으로 크게 잡는 경우가 있다.
+    에지 밀도와 명암 분산이 모두 낮으면 아무것도 없는 사각형으로 보고
+    목록/렌더에서 제외한다. 번호판처럼 작은 영역은 이 검사를 하지 않는다.
+    """
+    if cat not in TEXT_CATEGORIES or frame is None:
+        return True
+    try:
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = [int(round(float(v))) for v in box]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        if x2 - x1 < 12 or y2 - y1 < 10:
+            return False
+        crop = frame[y1:y2, x1:x2]
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        if gray.size == 0:
+            return False
+        edges = cv2.Canny(gray, 45, 135)
+        edge_ratio = float(np.count_nonzero(edges)) / float(edges.size)
+        spread = float(gray.std())
+        if edge_ratio >= 0.012:
+            return True
+        return spread >= 28.0 and edge_ratio >= 0.006
+    except Exception:
+        return True
+

@@ -1,130 +1,164 @@
-# 영상 속 개인정보 보호 모자이크 시스템
+# 영상 속 개인정보 보호 모자이크
 
-영상에서 개인정보(얼굴, 번호판, 간판, 명찰, 신분증 등)를 찾아 체크리스트로 보여주고,
-선택한 항목만 모자이크하는 웹 앱.
+영상에서 개인정보(얼굴, 차량번호판, 주소·간판, 명찰, 신분증, 휴대폰 화면,
+차량동승자)를 찾아 **목록으로 보여주고**, 사용자가 고른 항목만 실제
+모자이크 영상으로 렌더링하는 Streamlit 앱입니다.
 
-VLM이 영상 프레임을 보고 개인정보 항목과 위치를 찾는다. 업로드 후 별도 버튼 없이
-분석이 시작되고, 결과 화면에서 타임라인/효과를 바꾸면 미리보기가 즉시 다시 그려지고,
-모두 끝나면 미리보기 영상을 바로 다운로드한다. VLM API 키는 필수이며, 키가 없으면
-분석을 시작하지 않는다. 로컬 검출로 VLM 판정을 대신하지 않는다.
+## 동작 흐름
 
-## 동작 방식
+1. **업로드 → VLM 분석**
+   - 고르게 샘플링한 프레임 4장을 Gemini VLM에 보내 개인정보 후보와 위치를 찾습니다.
+   - 화면에는 자동 모자이크가 아니라 **체크리스트**만 표시됩니다.
+   - 업로드/구간이 바뀌면 다시 분석합니다. 프롬프트만 바꾸면 VLM을
+     다시 호출하지 않고 체크 항목만 갱신합니다.
 
-1. **업로드 → 자동 분석**
-   - 고르게 샘플링한 프레임 4장 + 번호판 확대(전체 6 / 프레임당 2) VLM 호출로
-     체크리스트 항목/박스를 만든다. 프롬프트가 못 찾은 항목은 `못 찾음`으로 표시.
-   - 업로드 내용(SHA-256)이 바뀌면 이전 분석 결과를 재사용하지 않는다.
+2. **가릴 항목 선택**
+   - `요청한 항목`과 `추가로 찾은 개인정보`를 나눠 보여줍니다.
+   - 프롬프트가 요구했지만 샘플에서 못 찾은 항목은 `못 찾음`으로 표시됩니다.
+   - 얼굴은 선택하면 프레임마다 로컬 얼굴 검출로 적용해 누락을 줄입니다.
 
-2. **체크리스트 + 미리보기(영상)**
-   - `st.video` 재생 미리보기 영상 + 아래 필름스트립 타임라인(균등 썸네일 + 현재 위치
-     커서) + 타임라인 슬라이더. 슬라이더를 움직이면 미리보기 영상이 그 위치부터 재생.
-   - `원본과 비교`, `가리는 범위`(얼굴만/상반신/전체), `모자이크 모양`(모자이크/흐리게/
-     검게), 강도 변경 시 미리보기 즉시 갱신.
-   - 미리보기 화면의 프롬프트 수정은 VLM 재호출 없이 체크리스트만 갱신.
+3. **모자이크 시작**
+   - 버튼을 눌러야만 전체 영상을 렌더링합니다. 자동 렌더는 하지 않습니다.
+   - 같은 설정의 이전 결과가 있어도 새로 렌더링합니다.
+   - 렌더 단계에서는 VLM을 다시 호출하지 않습니다. 분석 priors,
+     YOLO11-seg 추적, 얼굴 전용 경로의 OpenCV YuNet 검출을 사용합니다.
+   - 얼굴만 선택하면 얼굴 박스만 타원형으로 가려 목·상체로 퍼지지 않습니다.
+   - 번호판은 VLM priors를 시간 방향으로 보간하고, 이동/오차를 덮도록
+     조금 더 넓게 가립니다.
+   - `veryfast` H.264 MP4로 인코딩하며 원본 오디오와 영상 길이를 유지합니다.
 
-3. **모자이크 → 다운로드**
-   - 체크 항목에 대해 전체 영상 자동 렌더(2패스) 후 결과/미리보기 영상으로 다운로드.
-   - 효과/범위/강도 변경 시 자동 재렌더 옵션(`설정을 바꾸면 전체 영상도 자동으로
-     다시 만들기`)이 있으나 끌 수 있다.
+4. **미리보기 · 다운로드**
+   - 사진이 아니라 **모자이크가 실제로 적용된 동영상**을 재생해 확인합니다.
+   - 확인 후 다운로드합니다. `받으면 결과 자동 삭제`를 켜면 다운로드 시
+     서버 결과 파일과 기록을 지웁니다.
 
-## 고정 처리 설정
+## 고정 설정
 
-속도 모드/샘플 수/모델 선택 UI는 없앴다. blur.me 스튜디오처럼 항상 빠른 설정으로
-동작하도록 아래 값을 고정한다.
+속도 모드/샘플 수/모델 선택 UI는 없습니다. 항상 아래 설정으로 동작합니다.
 
 | 설정 | 값 |
 |---|---|
-| 사람 검출 모델 | `yolo11n-seg.pt` |
+| 사람 검출/추적 | `yolo11n-seg.pt` |
 | 추론 해상도 | `imgsz=480` |
-| 체크리스트 샘플 | `sample_n=4` |
-| 키프레임 간격 | `keyframe_stride=15` |
+| 분석 샘플 수 | `4` |
+| 키프레임 간격 | `15` |
 | 인코딩 프리셋 | `veryfast` |
-| `ultra` | `False` |
-| 처리 단계 VLM 호출 상한 | `vlm_call_limit=3` |
-| 번호판 확대 호출 상한 | 영상 전체 6회, 프레임당 2회 |
+| Ultra 모드 | 사용 안 함 |
 
-## 카테고리
+무거운 `yolo11m-seg.pt`/`yolo11x-seg.pt`는 앱 고정 설정에 쓰지 않아
+로딩/메모리를 줄이기 위해 제거했습니다. 코드 기본값도 `yolo11n-seg.pt`로
+맞춰 두어 구 호출 경로가 무거운 모델을 로딩하지 않습니다.
 
-| 키 | 표시 | 처리 |
-|---|---|---|
-| `face` | 얼굴 | 사람 |
-| `passenger` | 차량동승자 | 사람 |
-| `name_tag` | 명찰 | 사람 (찾은 위치만) |
-| `license_plate` | 차량번호판 | 배경 영역 |
-| `address` | 주소·간판 | 배경 영역 |
-| `id_card` | 신분증·문서 | 배경 영역 |
-| `phone_screen` | 휴대폰 화면 | 배경 영역 |
+## 설치
 
-## 구조
+CUDA GPU 환경(권장):
 
-```
-app.py                  메인 앱: 자동 분석/미리보기, 체크리스트, 필름스트립 영상,
-                         효과 튜너, 프롬프트 동기화, 다운로드
-src/                    라이브러리
-  config.py             카테고리/별칭/타입, 프리셋, VLM 제공자, 출력 경로
-  detect.py             검출 후처리 (작은 박스 제거, 겹친 박스 필터링, 박스 매칭)
-  preview.py            영상 샘플 분석 + 미리보기 프레임/영상 빌드(보간/필름스트립)
-  select.py             VLMSelector: VLM 탐지, 사람 박스 매칭
-  vlm_package.py        프레임 base64 전송, 프롬프트, JSON/좌표/카테고리 파싱, 재시도
-  vlm_budget.py         VLMBudget, 오류 분류
-  render.py             사람/배경 모자이크, FFmpegFrameWriter, ffmpeg 믹싱·자르기·변환
-  models.py             YOLO 모델 로딩 캐시 + 동시 로딩/추론 락
-  pipeline.py           2패스 파이프라인: 병렬 VLM chunk, 카테고리별 투표, 선택 렌더,
-                        priors, blanket 사람 마스크, 캐시, 단일 인코딩
-  history.py / retention.py   작업 히스토리, 24시간 보관 정책
-scripts/                smoke/robustness/regression/checklist/freeform/apptest/bench
-configs/, weights/, outputs/    추적기 설정, 가중치, 결과물/기록
-```
-
-## VLM 호출·한도 동작
-
-- 체크리스트 분석: 샘플 4 + 번호판 확대 최대 6 = 영상당 최대 약 10회.
-- 처리 단계: 전체 키프레임에 고르게 배분해 최대 3회(`vlm_call_limit=3`).
-- 영상당 VLM 최대 약 13회. 429(한도)/401(인증)/모델 없음은 **자동 재시도하지 않는다**.
-- 1패스 결과는 `pass1_<hash>.pkl` 캐시(version 2). 효과 변경 시 재사용, 설정 변경 시
-  `run_sig`로 자동 재렌더 판단.
-
-## 실행 방법
-
-### 1. Python 3.12 가상환경
 ```powershell
-py -3.12 -m venv .venv
+python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-```
-
-### 2. 라이브러리
-```powershell
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
-(저사양 PC는 `requirements-cpu.txt`)
 
-### 3. 실행
-```powershell
-.\.venv\Scripts\python.exe -m streamlit run app.py --server.port 8501
-```
-브라우저에서 `http://localhost:8501`.
-
-### 4. VLM 설정 (OpenAI / Google Gemini) — API 키 필수, 없으면 분석 시작 안 함.
-
-## 현재 한계
-
-- 체크리스트는 고정 4개 샘플. 배경 영역은 키프레임 사이 보간, 순간 이동 항목은 어긋날 수
-  있음. 체크리스트 분석 실패 시 로컬 검출 대신 안내. CPU 환경은 느리다(30~60초 영상 권장).
-## 기술 스택
-
-- Streamlit / YOLO11-seg / ByteTrack / VLM(OpenAI·Gemini) / FFmpeg 단일 패스 H.264
-- Python 3.12
-
-## 검사
+CPU만 사용할 때:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\smoke.py
-.\.venv\Scripts\python.exe scripts\robustness.py
-.\.venv\Scripts\python.exe scripts\checklist.py
-.\.venv\Scripts\python.exe scripts\freeform.py
-.\.venv\Scripts\python.exe scripts\regression.py
-.\.venv\Scripts\python.exe scripts\apptest.py
+pip install -r requirements-cpu.txt
 ```
 
-2026-11-05 기준 6개 검사 모두 PASS. `apptest.py`는 스텁 VLM으로 업로드 → 자동 분석 →
-미리보기/다운로드 흐름과 프롬프트 변경 시 체크 해제까지 검증한다.
+## VLM API 키 (Gemini 전용)
+
+VLM은 **Google Gemini 하나만** 사용합니다. 키는 프로젝트 루트의 `.env`
+파일에만 넣습니다. **키를 채팅이나 코드에 붙여넣지 마세요.**
+
+`.env.example`은 키를 넣는 파일이 아니라 **템플릿**입니다. 처음 한 번만
+`.env`로 복사해서 값을 채우면 됩니다. `.env.example`은 커밋용으로
+의도적으로 남겨둡니다. 실제 키는 `.env`에만 두고, `.env`는 `.gitignore`
+에 등록되어 있어 커밋되지 않습니다.
+
+```powershell
+Copy-Item .env.example .env
+notepad .env
+```
+
+`.env` 내용:
+
+```dotenv
+GEMINI_API_KEY=...
+```
+
+저장한 뒤 Streamlit을 재시작하면 앱이 키를 자동으로 읽습니다. 앱에는 키
+입력창이 없으며, 키 값은 화면과 로그에 출력하지 않습니다. 키가 없으면
+앱이 짧은 안내 문구를 보여주고 분석을 시작하지 않습니다.
+
+모델명을 바꾸려면 같은 파일에 `VLM_MODEL=...`을 추가합니다
+(기본값 `gemini-3-flash-preview`).
+
+## 실행
+
+```powershell
+.\.venv\Scripts\python.exe -m streamlit run app.py \
+  --server.port 8501 --server.address 127.0.0.1 --server.headless true
+```
+
+브라우저에서 `http://127.0.0.1:8501`을 엽니다. 코드 변경 후에는 서버를
+껐다 켜야 반영됩니다.
+
+## 실제 VLM 품질 확인
+
+키를 넣은 뒤 샘플 영상으로 분석 결과를 확인할 수 있습니다.
+
+```powershell
+python scripts/live_vlm.py C:\Users\gong0000\Downloads\street.mp4
+```
+
+찾은 카테고리, 박스 수, 호출 시간, 어노테이션 이미지 저장 경로를 출력합니다.
+키가 없으면 실행을 거부하며 키를 출력하지 않습니다.
+
+## 테스트
+
+VLM 스텁으로 키 없이 실행할 수 있습니다.
+
+```powershell
+python scripts/smoke.py
+python scripts/checklist.py
+python scripts/freeform.py
+python scripts/regression.py
+python scripts/robustness.py
+python scripts/apptest.py
+```
+
+`apptest.py`는 업로드 → 분석 목록 → `모자이크 시작` → 결과 파일 생성 →
+다운로드 버튼 노출까지 확인합니다.
+
+## 개인정보 처리
+
+- 원본 영상은 로컬 임시 폴더에서만 처리됩니다.
+- VLM에는 **샘플 프레임 이미지**만 전송하며 영상 파일 전체를 보내지 않습니다.
+- 결과 파일은 `outputs/`에 저장되며, 기본 24시간이 지난 파일은 자동
+  정리됩니다. 테스트 산출물은 필요 없으면 `outputs/`에서 지워도 됩니다.
+- API 키는 환경변수/`.env`에서만 읽고 화면·로그·코드에 남기지 않습니다.
+
+## 프로젝트 구조
+
+```text
+app.py                      Streamlit UI (분석 목록 → 렌더 → 미리보기/다운로드)
+src/config.py               카테고리/프리셋/.env 로더
+src/preview.py              VLM 샘플 분석 + 체크리스트 항목
+src/vlm_package.py          VLM 호출/파싱/재시도
+src/select.py               VLM 판정 인터페이스
+src/faces.py                YuNet 얼굴 검출/추적
+src/pipeline.py             YOLO 추적 + 모자이크 렌더 파이프라인
+src/render.py               모자이크/FFmpeg H.264 유틸
+src/render_service.py       체크리스트 → 렌더 요청 변환/서명/캐시
+src/history.py              결과 기록
+src/retention.py            보관/삭제 정책
+configs/bytetrack_stable.yaml  ByteTrack 설정
+weights/
+  yolo11n-seg.pt            앱 고정 person/vehicle 모델
+  face_detection_yunet_2023mar.onnx  얼굴 전용 검출 모델
+assets/style.css            앱 스타일
+scripts/
+  smoke/checklist/freeform/regression/robustness/apptest  자동 검사
+  live_vlm.py               실제 Gemini 분석 확인용
+```

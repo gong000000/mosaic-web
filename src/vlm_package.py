@@ -15,7 +15,8 @@ import time
 import cv2
 
 from .config import (CANDS, GENERIC_CATEGORIES, VLM_MODEL, canon_category,
-                     categories_in_text, category_type, label_ko)
+                     categories_in_text, category_type, label_ko,
+                     plausible_box)
 from .vlm_budget import VLMRetryPolicy, classify_vlm_error
 
 VLM_MAX_W = 1920
@@ -239,10 +240,13 @@ def _normalize_item(item, w0, h0, scale, query_raw, coord_default="pixel"):
     if "tattoo" in probe_cat.lower() or "문신" in probe_cat:
         return None
 
+    # Gemini는 box_2d([ymin,xmin,ymax,xmax], 0~1000)를 공식 형식으로
+    # 쓰는 경우가 많다. bbox와 함께 와도 box_2d를 우선해야 스케일을
+    # 잘못 해석해 화면 절반을 덮는 박스가 생기지 않는다.
     box_2d = item.get("box_2d")
     bbox = item.get("bbox") or item.get("box") or item.get("xyxy") or []
     is_box2d = False
-    if len(bbox) != 4 and isinstance(box_2d, (list, tuple)) and len(box_2d) == 4:
+    if isinstance(box_2d, (list, tuple)) and len(box_2d) == 4:
         bbox = box_2d
         is_box2d = True
     if len(bbox) != 4:
@@ -263,8 +267,9 @@ def _normalize_item(item, w0, h0, scale, query_raw, coord_default="pixel"):
     normalized_label = any(k in coord for k in
                            ("norm", "relative", "ratio", "0-1", "0~1",
                             "0 to 1", "0..1"))
+    norm1000_label = any(k in coord for k in ("1000", "0-1000", "0~1000"))
     pixel_label = any(k in coord for k in ("pixel", "abs", "image", "px"))
-    if is_box2d:
+    if is_box2d or norm1000_label:
         if mx <= 1.001:
             sx, sy = w0, h0
         elif mx <= 1000:
@@ -285,8 +290,18 @@ def _normalize_item(item, w0, h0, scale, query_raw, coord_default="pixel"):
     elif mx > 1000:
         sx = sy = scale
     elif coord_default == "gemini":
-        # 좌표 표기가 없고 1~1000 사이면 Gemini의 0~1000 정규화로 본다.
-        sx, sy = w0 / 1000.0, h0 / 1000.0
+        # 1~1000 사이인데 coord 표기가 없다. 0~1000 정규화로 보면
+        # 프레임의 12% 이상을 덮고, 픽셀로 보면 작은 박스라면 픽셀로
+        # 해석한다(거대한 오탐 박스 방지). 그 외에는 Gemini 기본값인
+        # 0~1000 정규화를 따른다.
+        norm_area = ((vals[2] - vals[0]) / 1000.0
+                     * (vals[3] - vals[1]) / 1000.0)
+        px_area = ((vals[2] - vals[0]) / max(1.0, w0)
+                   * (vals[3] - vals[1]) / max(1.0, h0))
+        if norm_area > 0.12 and px_area < 0.06:
+            sx = sy = scale
+        else:
+            sx, sy = w0 / 1000.0, h0 / 1000.0
     else:
         sx = sy = scale
 
@@ -299,6 +314,9 @@ def _normalize_item(item, w0, h0, scale, query_raw, coord_default="pixel"):
     x1, y1 = max(0, int(round(x1))), max(0, int(round(y1)))
     x2, y2 = min(w0, int(round(x2))), min(h0, int(round(y2)))
     if x2 - x1 < 4 or y2 - y1 < 4:
+        return None
+    if not plausible_box(cat, x1, y1, x2, y2, w0, h0):
+        # 좌표 스케일 오류로 생긴 거대 박스/찌그러진 박스는 버린다.
         return None
 
     if cat in ("tattoo", "문신"):
@@ -374,14 +392,19 @@ def _build_prompt(phrases, query_raw, include_all, focus):
                      "승용차·승합차·화물차·오토바이 번호판을 모두 포함하고, "
                      "번호판이 작거나 야간이어도 찾으세요. 차량 전체가 아니라 "
                      "번호판 영역만 bbox로 표시하세요.")
-    lines.append("bbox는 이미지 크기와 무관한 0~1 정규화 좌표 "
-                 "[x1,y1,x2,y2]로 답하고 coord는 \"norm\"으로 쓰세요. "
-                 "(x1,y1)=좌상단, (x2,y2)=우하단입니다.")
+    if focus != "license_plate":
+        lines.append("얼굴 bbox는 이마만이 아니라 눈·코·입을 모두 포함한 "
+                     "얼굴 전체를 감싸세요. 사람 몸 전체를 얼굴로 표시하지 "
+                     "마세요. 명찰·신분증·간판은 글자가 읽히는 영역 전체를 "
+                     "bbox로 표시하세요.")
+    lines.append("좌표는 Gemini box_2d 형식 [ymin,xmin,ymax,xmax]의 0~1000 "
+                 "정수로 답하세요. bbox를 쓸 경우에는 이미지 크기와 무관한 "
+                 "0~1 정규화 좌표 [x1,y1,x2,y2]로 답하고 coord는 \"norm\"으로 "
+                 "쓰세요. (box_2d/bbox 모두 좌상단이 시작점입니다.)")
     lines.append("JSON 배열만 출력하세요. 형식: "
                  "[{\"category\":\"face\",\"label_ko\":\"얼굴\","
-                 "\"bbox\":[0.1,0.2,0.4,0.5],\"coord\":\"norm\","
-                 "\"confidence\":0.95,\"matches_prompt\":true,"
-                 "\"region_type\":\"person\"}]")
+                 "\"box_2d\":[200,100,500,400],\"confidence\":0.95,"
+                 "\"matches_prompt\":true,\"region_type\":\"person\"}]")
     lines.append("category는 가능하면 face, license_plate, address, passenger, "
                  "name_tag, id_card, phone_screen 중 하나를 쓰고, 아니면 영문 "
                  "snake_case로 쓰세요.")
@@ -406,7 +429,7 @@ def detect_with_vlm(frame_bgr, phrases, api_key, model=VLM_MODEL,
     phrases: CANDS 키 목록 (분석 힌트)
     include_all: True면 프롬프트 대상 외 추가 개인정보 후보까지 찾는다.
                  처리 단계(선택 항목만 렌더)에서는 False로 호출한다.
-    base_url: OpenAI 호환 엔드포인트(예: Gemini). None이면 OpenAI.
+    base_url: OpenAI 호환 엔드포인트(현재는 Gemini 고정).
     focus: "license_plate"면 번호판만 집중 탐지한다(차량 크롭 보조 호출).
     max_retries: 서버 오류(5xx) 발생 시 최대 재시도 횟수.
                  한도 초과(429)나 인증 오류(401/403)는 재시도하지 않음.
@@ -415,7 +438,8 @@ def detect_with_vlm(frame_bgr, phrases, api_key, model=VLM_MODEL,
     """
     api_key = str(api_key or "").strip()
     if not api_key:
-        raise VLMError("VLM API 키가 없습니다. 사이드바에 키를 입력하세요.")
+        raise VLMError("Gemini API 키가 없습니다. .env의 GEMINI_API_KEY 또는 "
+                       "사이드바 입력을 확인하세요.")
 
     retry = VLMRetryPolicy(max_retries=max_retries)
     last_error = None
@@ -437,9 +461,6 @@ def detect_with_vlm(frame_bgr, phrases, api_key, model=VLM_MODEL,
             prompt = _build_prompt(phrases, query_raw, include_all, focus)
 
             image_url = {"url": f"data:image/jpeg;base64,{b64}"}
-            if base_url is None:
-                # OpenAI는 detail=high여야 작은 번호판/명찰을 더 잘 본다.
-                image_url["detail"] = "high"
             extra = {}
             if base_url and "generativelanguage" in str(base_url):
                 # Gemini 3는 내부 추론에 출력 한도를 먼저 쓰므로 추론량을 낮추고

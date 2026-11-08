@@ -1,0 +1,233 @@
+:root {
+        --primary: #8b5cf6;
+        --primary-hover: #7c3aed;
+        --accent: #06b6d4;
+        --bg: #0b0f19;
+        --card: #131a2b;
+        --text: #f1f5f9;
+        --muted: #94a3b8;
+        --border: #334155;
+        --success: #22c55e;
+        --warning: #f59e0b;
+    }
+
+    .block-container {
+        max-width: 1150px;
+        padding-top: 1.5rem;
+        padding-bottom: 3rem;
+    }
+
+    .stApp {
+        background: #0a0a0f;
+        background-image:
+          linear-gradient(rgba(18, 16, 16, 0.5) 50%, transparent 50%),
+          linear-gradient(90deg, rgba(18, 16, 16, 0.5) 50%, transparent 50%);
+        background-size: 20px 20px;
+        background-attachment: fixed;
+    }
+
+    .main {
+        background: transparent;
+    }
+
+    h1, h2, h3 {
+        color: var(--text) !important;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+    }
+
+    /* 헤더 카드 */
+    .header-card {
+        background: rgba(15, 15, 25, 0.8);
+        border: 1px solid rgba(99, 102, 241, 0.3);
+        border-radius: 16px;
+        padding: 2rem;
+        margin-bottom: 2rem;
+        box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.3), 0 8px 10px -6px rgba(99, 102, 241, 0.2);
+        position: relative;
+    }
+
+    .header-title {
+        font-size: 2rem;
+        font-weight: 800;
+        color: var(--text);
+        margin: 0 0 0.5rem 0;
+        position: relative;
+        z-index: 1;
+        text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+    }
+
+    .header-subtitle {
+        color: var(--muted);
+        font-size: 1rem;
+        margin: 0;
+        position: relative;
+        z-index: 1;
+    }
+
+    /* 사이드바 */
+    .stSidebar {
+        background: var(--card) !important;
+        border-right: 1px solid var(--border);
+    }
+
+    .stSidebar .stMarkdown, .stSidebar .stCaption {
+        color: var(--muted) !important;
+    }
+
+    .stSidebar h2, .stSidebar h3 {
+        color: var(--text) !important;
+        font-size: 0.85rem;
+        margin-top: 1.5rem;
+        margin-bottom: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        font-weight: 600;
+    }
+
+    .stSidebar .stSelectbox, .stSidebar .stMultiselect, .stSidebar .stSlider, .stSidebar .stRadio {
+        margin-bottom: 1rem;
+    }
+
+    .stSidebar .stButton > button {
+        background: var(--primary);
+        color: white;
+        border: none;
+        border-radius: 8px;
+        padding: 0.6rem 1rem;
+        font-weight: 600;
+        width: 100%;
+    }
+
+    .stSidebar .stButton > button:hover {
+        background: var(--primary-hover);
+    }
+
+    .stSidebar .stTextInput > div > div > input {
+        background: #0f172a;
+        border: 1px solid var(--border);
+        color: var(--text);
+        border-radius: 8px;
+    }
+
+    .stSidebar .stTextInput > div > div > input:focus {
+        border-color: var(--primary);
+        box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
+    }
+
+    .stSidebar .stCheckbox > div {
+        color: var(--text);
+    }
+
+    /* 버튼 */
+    .stButton > button[kind="primary"] {
+        background: linear-gradient(135deg, var(--primary) 0%, var(--accent) 100%);
+        color: white;
+        border: none;
+        border-radius: 10px;
+        padding: 0.75rem 1.5rem;
+        font-weight: 600;
+        font-size: 1rem;
+        width: 100%;
+        box-shadow: 0 4px 6px -1px rgba(99, 102, 241, 0.3);
+    }
+
+    .stButton > button[kind="primary"]:hover {
+        background: linear-gradient(135deg, var(--primary-hover) 0%, #0891b2 100%);
+        box-shadow: 0 8px 10px -6px rgba(99, 102, 241, 0.4);
+    }
+
+    .stButton > button[kind="primary"]:disabled {
+        background: var(--border);
+        color: var(--muted);
+        box-shadow: none;
+    }
+
+    /* 카드 */
+    .info-card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 1.25rem;
+        margin-bottom: 1rem;
+        transition: all 0.2s ease;
+    }
+
+    .info-card:hover {
+        border-color: var(--primary);
+        box-shadow: 0 4px 6px -1px rgba(99, 102, 241, 0.2);
+    }
+
+    .info-card h3 {
+        color: var(--text);
+        margin: 0 0 0.5rem 0;
+        font-size: 1rem;
+    }
+
+    .info-card p {
+        color: var(--muted);
+        margin: 0;
+        font-size: 0.9rem;
+    }
+
+    /* 파일 업로더 */
+    .stFileUploader {
+        background: var(--card);
+        border: 2px dashed var(--border);
+        border-radius: 12px;
+        padding: 2rem;
+        text-align: center;
+        margin-bottom: 1rem;
+        transition: all 0.2s ease;
+    }
+
+    .stFileUploader:hover {
+        border-color: var(--primary);
+        background: #131a2b;
+    }
+
+    .stFileUploader > div {
+        color: var(--text);
+    }
+
+    /* 진행률 */
+    .stProgress > div > div {
+        background: linear-gradient(90deg, var(--primary) 0%, var(--accent) 100%);
+    }
+
+    /* 비디오 */
+    .stVideo > div {
+        border-radius: 12px;
+        overflow: hidden;
+        border: 1px solid var(--border);
+        background: #000;
+        box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3);
+    }
+
+    /* 구분선 */
+    .stDivider {
+        margin: 1.5rem 0;
+        border-color: var(--border);
+    }
+
+    /* expander */
+    .streamlit-expanderHeader {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        color: var(--text);
+    }
+
+    .streamlit-expanderContent {
+        background: #0f172a;
+        border: 1px solid var(--border);
+        border-top: none;
+        border-radius: 0 0 8px 8px;
+    }
+
+    /* 숨길 요소: 헤더는 사이드바 토글 때문에 남겨둔다. */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    [data-testid="stHeader"] {
+        background: transparent;
+    }

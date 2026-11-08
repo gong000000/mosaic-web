@@ -4,3 +4,7 @@ __pycache__/
 outputs/*.mp4
 outputs/jobs.json
 /docs/
+.env
+.env.*
+!.env.example
+*.log

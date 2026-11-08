@@ -1,7 +1,7 @@
 """VLM 호출 예산 및 재시도 관리.
 
-무료 등급(Gemini 하루 20회 등)의 호출 한도를 초과하지 않도록 관리하고,
-호출 실패 시 지수 백오프로 재시도한다.
+Gemini 호출 한도를 초과하지 않도록 영상 단위 예산을 관리하고,
+일시적 호출 실패 시 지수 백오프로 재시도한다.
 """
 import threading
 
@@ -44,10 +44,6 @@ class VLMBudget:
             self.used_today += 1
             self.used_this_video += 1
             return True
-
-    def reset_video(self):
-        with self._lock:
-            self.used_this_video = 0
 
     def remaining(self) -> int:
         """남은 호출 가능 횟수를 반환한다."""
@@ -110,22 +106,3 @@ def classify_vlm_error(error: Exception) -> str:
     if "json" in msg and ("해석" in msg or "parse" in msg):
         return "parse_error"
     return "unknown_error"
-
-
-def friendly_vlm_message(category: str, provider: str = "",
-                          model: str = "") -> str:
-    """사용자에게 보여줄 친절한 VLM 오류 메시지."""
-    if category == "quota_exceeded":
-        return (f"VLM({provider}) 무료 등급의 일일 호출 한도를 초과했습니다. "
-                "내일 다시 시도하거나 유료 키를 사용하세요."
-                + (f" (모델: {model})" if model else ""))
-    if category == "auth_error":
-        return ("API 키가 올바르지 않거나 권한이 없습니다. "
-                "제공자와 키를 확인하세요.")
-    if category == "model_not_found":
-        return ("모델명을 찾을 수 없습니다. 사이드바의 모델명을 확인하세요.")
-    if category == "server_error":
-        return ("VLM 서버가 일시적으로 응답하지 않습니다. 잠시 후 다시 시도하세요.")
-    if category == "parse_error":
-        return ("VLM 응답을 해석하지 못했습니다. 다시 시도해 주세요.")
-    return "VLM 호출 중 알 수 없는 오류가 발생했습니다."

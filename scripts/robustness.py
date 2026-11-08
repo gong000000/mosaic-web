@@ -84,7 +84,7 @@ def t_preview_closeup():
     assert ok
     with fake_vlm(_face_box):
         anno, persons, items = analyze_first_frame_items(
-            fr, get_model("yolo11m-seg.pt"), 0.20, 640,
+            fr, get_model("yolo11n-seg.pt"), 0.20, 480,
             query_raw="얼굴", targets=["face"], api_key="fake-key")
     assert isinstance(anno, type(fr)) and isinstance(persons, list)
     assert len(persons) >= 1
@@ -155,10 +155,10 @@ def t_vlm_parse_and_normalize():
         [200, 100, 600, 500]
 
     # 축소 전송본 기준 픽셀 좌표는 scale을 곱한다.
-    item4 = {"category": "face", "bbox": [10, 20, 50, 60],
+    item4 = {"category": "face", "bbox": [10, 20, 30, 40],
              "coord": "pixel"}
     assert _normalize_item(item4, 100, 200, 2.0, "")["xyxy"] == \
-        [20, 40, 100, 120]
+        [20, 40, 60, 80]
 
     # 제공자가 포괄 category('vehicle')와 구체 label을 같이 줘도
     # 번호판을 놓치지 않아야 한다.
@@ -172,7 +172,7 @@ def t_vlm_parse_and_normalize():
     assert _normalize_item(item6, 100, 200, 1.0, "")["category"] == \
         "license_plate"
     # 복수형/붙여쓰기도 같은 항목으로 묶는다.
-    item7 = {"category": "faces", "bbox": [0.1, 0.1, 0.5, 0.5]}
+    item7 = {"category": "faces", "bbox": [0.2, 0.1, 0.58, 0.42]}
     assert _normalize_item(item7, 100, 200, 1.0, "얼굴")["category"] == "face"
 
     # 문신은 어떤 응답이 와도 항목으로 만들지 않는다.
@@ -230,7 +230,7 @@ def _capture_call(frame, phrases, query_raw, include_all=True,
 
 
 def t_vlm_provider():
-    """OpenAI 호환 제공자(Gemini) 경로: base_url/모델/이미지 전송을 모의 검증."""
+    """Gemini 경로: base_url/모델/이미지 전송을 모의 검증."""
     import numpy as np
     import openai
     import src.vlm_package as vp

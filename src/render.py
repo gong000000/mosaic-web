@@ -54,12 +54,22 @@ class FFmpegFrameWriter:
         if has_audio:
             cmd += ["-i", self.audio_src, "-map", "0:v:0", "-map", "1:a?",
                     "-c:a", "aac"]
+        # 해상도에 맞는 H.264 level. 720p에 3.1을 고정하면 1080p 영상이
+        # 일부 브라우저에서 디코딩되지 않을 수 있다.
+        if self.height <= 720:
+            level = "3.1"
+        elif self.height <= 1080:
+            level = "4.1"
+        else:
+            level = "4.2"
+        gop = max(1, int(round(self.fps * 2)))
         cmd += ["-c:v", "libx264", "-preset", str(self.preset),
                 "-crf", str(int(self.crf)), "-pix_fmt", "yuv420p",
-                "-profile:v", "main", "-level", "3.1",
-                "-g", "30", "-keyint_min", "30", "-bf", "0"]
-        if has_audio:
-            cmd += ["-shortest"]
+                "-profile:v", "main", "-level", level,
+                "-g", str(gop), "-keyint_min", str(gop), "-bf", "0"]
+        # -shortest를 쓰면 원본 오디오가 영상보다 1프레임 짧을 때 마지막
+        # 영상 프레임까지 잘려서 프레임 수가 1개 줄는다. 영상 길이를
+        # 기준으로 유지하고, 오디오는 ffmpeg 기본 동작에 맡긴다.
         cmd += ["-movflags", "+faststart", self.output_path]
         self._proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE,
@@ -184,7 +194,8 @@ def mux_audio_h264(video_noaudio, audio_src, output_path, preset="veryfast"):
     cleanup_tmp(output_path)
     cmd = [ff, "-y", "-i", video_noaudio, "-i", audio_src,
            "-c:v", "libx264", "-preset", preset, "-crf", "20",
-           "-pix_fmt", "yuv420p", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+           "-pix_fmt", "yuv420p", "-profile:v", "main", "-bf", "0",
+           "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
            "-c:a", "aac", "-shortest", "-movflags", "+faststart", output_path]
     r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                        check=False)
@@ -207,7 +218,8 @@ def normalize_video(input_path, output_path, max_width=1920):
           "trunc(ih/2)*2")
     cmd = [ff, "-y", "-i", input_path, "-vf", vf,
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-           "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart",
+           "-pix_fmt", "yuv420p", "-profile:v", "main", "-bf", "0",
+           "-c:a", "aac", "-movflags", "+faststart",
            output_path]
     r = subprocess.run(cmd, stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, check=False)
@@ -240,7 +252,8 @@ def trim_video(input_path, output_path, start_sec=0.0, end_sec=None):
     if end is not None and end > 0:
         cmd += ["-t", f"{end - start:.3f}"]
     cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-            "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart",
+            "-pix_fmt", "yuv420p", "-profile:v", "main", "-bf", "0",
+            "-c:a", "aac", "-movflags", "+faststart",
             output_path]
     r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                        check=False)
@@ -251,10 +264,29 @@ def trim_video(input_path, output_path, start_sec=0.0, end_sec=None):
     return output_path
 
 
+def _face_ratio(w, h):
+    """사람 박스 종횡비에 따른 '얼굴만' 세로 비율."""
+    w = max(1, int(w))
+    h = max(0, int(h))
+    aspect = h / float(w)
+    if aspect >= 2.0:
+        return 0.30
+    if aspect >= 1.55:
+        return 0.40
+    return 0.62
+
+
 def apply_area_limit(x1, y1, x2, y2, mode="full"):
-    h = y2 - y1
+    """사람 박스에서 가릴 세로 범위를 정한다.
+
+    '얼굴만'은 사람 박스 상단 32%로 고정하면 클로즈업에서 이마만
+    가려지고, 전신에서는 가슴까지 가려진다. 사람 박스의 종횡비로
+    얼굴/상반신 범위를 보정한다.
+    """
+    h = max(0, int(y2) - int(y1))
+    w = max(1, int(x2) - int(x1))
     if mode == "face_only":
-        return x1, y1, x2, y1 + int(h * 0.32)
+        return x1, y1, x2, y1 + int(h * _face_ratio(w, h))
     if mode == "upper":
         return x1, y1, x2, y1 + int(h * 0.65)
     return x1, y1, x2, y2
@@ -291,6 +323,31 @@ def render_region(frame, x1, y1, x2, y2, style="pixel", blocks=30, blur=61, pad=
     return True
 
 
+def render_face_ellipse(frame, x1, y1, x2, y2, style="pixel",
+                        blocks=30, blur=61):
+    """얼굴 박스 하나만 타원형으로 가린다.
+
+    사람 박스 전체에 마스크를 씌우던 경로와 달리, 얼굴 박스 밖(목·어깨)은
+    건드리지 않는다. 입/턱까지 덮도록 호출부에서 박스를 넓혀 넘긴다.
+    """
+    x1c, y1c = max(0, int(x1)), max(0, int(y1))
+    x2c, y2c = min(frame.shape[1], int(x2)), min(frame.shape[0], int(y2))
+    if x2c - x1c < 16 or y2c - y1c < 16:
+        return False
+    w, h = x2c - x1c, y2c - y1c
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.ellipse(mask, (w // 2, h // 2),
+                (max(6, w // 2 - 1), max(6, h // 2 - 1)),
+                0, 0, 360, 255, -1)
+    if style != "pixel":
+        mask = cv2.GaussianBlur(mask, (9, 9), 0)
+    roi = frame[y1c:y2c, x1c:x2c]
+    mos = render_mosaic(roi, style=style, blocks=blocks, blur=blur)
+    mf = (mask.astype(float) / 255.0)[..., None]
+    frame[y1c:y2c, x1c:x2c] = (mos * mf + roi * (1 - mf)).astype(np.uint8)
+    return True
+
+
 def render_person_ellipse(frame, x1, y1, x2, y2, style="pixel",
                           blocks=30, blur=61, ratio=1.0):
     """사람 마스크가 없을 때 얼굴/상반신 영역을 타원으로 가린다."""
@@ -315,8 +372,10 @@ def render_person_ellipse(frame, x1, y1, x2, y2, style="pixel",
     return True
 
 
-def _area_ratio(area_mode):
+def _area_ratio(area_mode, w=None, h=None):
     if area_mode == "face_only":
+        if w is not None and h is not None:
+            return _face_ratio(w, h)
         return 0.32
     if area_mode == "upper":
         return 0.65
@@ -347,6 +406,14 @@ def render_person_roi(frame, x1, y1, x2, y2, mask_roi, style="pixel",
             if m.mean() >= 8:
                 if style != "pixel":
                     m = feather_mask(m, roi_f)
+                if area_mode != "full":
+                    # 사람 마스크 전체를 쓰면 '얼굴만' 설정이 몸으로
+                    # 번진다. 허용 영역 밖은 마스크만 0으로 막는다.
+                    allowed_h = int(
+                        (y2c - y1c) * _area_ratio(
+                            area_mode, x2c - x1c, y2c - y1c))
+                    if allowed_h < m.shape[0]:
+                        m[allowed_h:, :] = 0
                 mos = render_mosaic(roi_f, style=style, blocks=blocks,
                                     blur=blur)
                 mf = (m.astype(float) / 255.0)[..., None]
@@ -358,7 +425,8 @@ def render_person_roi(frame, x1, y1, x2, y2, mask_roi, style="pixel",
             pass
     return render_person_ellipse(frame, x1c, y1c, x2c, y2c, style=style,
                                  blocks=blocks, blur=blur,
-                                 ratio=_area_ratio(area_mode))
+                                 ratio=_area_ratio(area_mode,
+                                                   x2c - x1c, y2c - y1c))
 
 
 def render_person_strict(frame, x1, y1, x2, y2, mask_full_or_None, style="pixel", blocks=30, blur=61, area_mode="full"):
@@ -372,6 +440,16 @@ def render_person_strict(frame, x1, y1, x2, y2, mask_full_or_None, style="pixel"
         try:
             mc = mask_full_or_None[y1c:y2c, x1c:x2c]
             if mc.size > 0 and mc.mean() >= 8:
+                h_roi, w_roi = mc.shape[:2]
+                if mc.shape != (y2c - y1c, x2c - x1c):
+                    mc = cv2.resize(mc, (x2c - x1c, y2c - y1c),
+                                    interpolation=cv2.INTER_NEAREST)
+                if area_mode != "full":
+                    allowed_h = int(
+                        (y2c - y1c) * _area_ratio(
+                            area_mode, x2c - x1c, y2c - y1c))
+                    if allowed_h < mc.shape[0]:
+                        mc[allowed_h:, :] = 0
                 # pixel은 하드 경계가 자연스러워 페더링을 생략한다.
                 m = mc if style == "pixel" else feather_mask(
                     mc, frame[y1c:y2c, x1c:x2c])
@@ -386,4 +464,5 @@ def render_person_strict(frame, x1, y1, x2, y2, mask_full_or_None, style="pixel"
             pass
     return render_person_ellipse(frame, x1c, y1c, x2c, y2c, style=style,
                                  blocks=blocks, blur=blur,
-                                 ratio=_area_ratio(area_mode))
+                                 ratio=_area_ratio(area_mode,
+                                                   x2c - x1c, y2c - y1c))

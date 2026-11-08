@@ -20,7 +20,7 @@ from src.pipeline import mosaic_video
 from src.vlm_package import prompt_categories
 
 
-def fake_vlm(frame, phrases, api_key, model="gpt-4o-mini", timeout=30,
+def fake_vlm(frame, phrases, api_key, model="gemini-3-flash-preview", timeout=30,
              query_raw="", include_all=True, focus=None, base_url=None,
              **_kwargs):
     h, w = frame.shape[:2]
@@ -36,7 +36,7 @@ def fake_vlm(frame, phrases, api_key, model="gpt-4o-mini", timeout=30,
     }]
 
 
-def empty_vlm(frame, phrases, api_key, model="gpt-4o-mini", timeout=30,
+def empty_vlm(frame, phrases, api_key, model="gemini-3-flash-preview", timeout=30,
               query_raw="", include_all=True, focus=None, base_url=None,
               **_kwargs):
     return []
@@ -59,7 +59,7 @@ def _box_diff(a, b, box):
     return float(np.abs(ca - cb).mean())
 
 
-def name_tag_vlm(frame, phrases, api_key, model="gpt-4o-mini", timeout=30,
+def name_tag_vlm(frame, phrases, api_key, model="gemini-3-flash-preview", timeout=30,
                  query_raw="", include_all=True, focus=None, base_url=None,
                  **_kwargs):
     """사람이 없는 영상에서도 명찰 박스를 돌려주는 스텁.

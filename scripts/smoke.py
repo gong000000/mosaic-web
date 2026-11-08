@@ -21,8 +21,9 @@ for m in mods:
         print(f"FAIL {m}: {e}")
 
 project_mods = ["src.config", "src.detect", "src.render", "src.models",
-                "src.select", "src.vlm_package", "src.preview",
-                "src.pipeline", "src.history", "src.retention"]
+                "src.select", "src.vlm_package", "src.preview", "src.faces",
+                "src.pipeline", "src.render_service", "src.history",
+                "src.retention"]
 for m in project_mods:
     try:
         __import__(m)

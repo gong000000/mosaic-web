@@ -46,7 +46,7 @@ def main():
     try:
         s = P.mosaic_video(
             FACE, TMP, targets=["face"], conf=0.20,
-            model_name="yolo11m-seg.pt", imgsz=640,
+            model_name="yolo11n-seg.pt", imgsz=480,
             ultra=False, keyframe_stride=3, query_raw="회귀",
             api_key="fake-key")
         got = {k: v["mosaic"] for k, v in s.items()

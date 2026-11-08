@@ -4,6 +4,40 @@ import re
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+
+def _load_dotenv(path=None):
+    """프로젝트 루트의 .env를 읽는다. 이미 설정된 환경변수를 덮지 않는다.
+
+    API 키를 코드/채팅에 남기지 않고 로컬 파일로만 쓰기 위한 최소 파서다.
+    """
+    if os.environ.get("MOSAIC_SKIP_DOTENV"):
+        return
+    env_path = path or os.path.join(ROOT_DIR, ".env")
+    try:
+        if not os.path.isfile(env_path):
+            return
+        # 메모장이 ANSI(cp949)로 저장해도 키 줄은 ASCII라 읽을 수 있게
+        # 잘못된 바이트는 무시한다. UTF-8 BOM도 허용한다.
+        with open(env_path, encoding="utf-8-sig", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                if line.startswith("export "):
+                    line = line[7:].strip()
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                # 실제 값이 있는 환경변수는 덮지 않는다. 빈 값은 미설정으로 본다.
+                if key and value and not os.environ.get(key):
+                    os.environ[key] = value
+    except Exception:
+        # .env는 편의 기능이다. 읽기 실패가 앱 시작을 막으면 안 된다.
+        pass
+
+
+_load_dotenv()
+
 # VLM이 찾는 개인정보 카테고리.
 CANDS = [
     "face",           # 얼굴
@@ -142,17 +176,67 @@ PRESETS = {
 
 OUTPUT_DIR = os.path.join(ROOT_DIR, "outputs")
 
-# VLM 설정. VLM은 항상 사용하며 API 키가 필수다. 로컬 검출로 대신하지 않는다.
-VLM_MODEL = "gpt-4o-mini"
+# VLM 설정. Gemini 하나만 사용한다. 모델명은 .env의 VLM_MODEL로 바꿀 수 있다.
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+VLM_MODEL = os.environ.get("VLM_MODEL", "gemini-3-flash-preview")
 
-# VLM 제공자 프리셋. OpenAI 호환 엔드포인트면 base_url만 추가하면 된다.
-VLM_PROVIDERS = {
-    "OpenAI": {
-        "base_url": None,
-        "model": VLM_MODEL,
-    },
-    "Google Gemini": {
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "model": "gemini-3-flash-preview",
-    },
+# 분석 화면의 박스에 그리는 ASCII 코드. OpenCV putText는 한글을 '?????'로
+# 그리므로, 이미지에는 코드만 쓰고 한국어 이름은 체크리스트/캡션에 쓴다.
+REGION_CODE = {
+    "license_plate": "PLATE",
+    "address": "SIGN",
+    "id_card": "ID",
+    "phone_screen": "PHONE",
+    "name_tag": "NAME",
 }
+
+
+def region_code(cat):
+    return REGION_CODE.get(cat, str(cat or "ITEM").upper()[:8])
+
+
+def env_api_key():
+    """Gemini API 키를 환경변수/.env에서 찾는다. 없으면 빈 문자열."""
+    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "VLM_API_KEY"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+# VLM이 돌려준 박스가 실제 개인정보 영역으로 보이는지 확인하는 상한.
+# 좌표 스케일을 잘못 해석하면 프레임 절반을 덮는 거대한 박스가 생기는데,
+# 이런 박스는 모자이크하지 않는 편이 낫다.
+_MAX_BOX_AREA = {
+    "face": 0.16,
+    "license_plate": 0.20,
+    "address": 0.22,
+    "passenger": 0.35,
+    "name_tag": 0.10,
+    "id_card": 0.18,
+    "phone_screen": 0.14,
+}
+_MAX_BOX_ASPECT = {
+    "face": 1.8,
+    "license_plate": 10.0,
+    "address": 14.0,
+    "passenger": 4.0,
+    "name_tag": 10.0,
+    "id_card": 8.0,
+    "phone_screen": 8.0,
+}
+
+
+def plausible_box(cat, x1, y1, x2, y2, frame_w, frame_h):
+    """VLM 박스가 카테고리별로 현실적인 크기/종횡비인지 확인한다."""
+    w = max(0, int(x2) - int(x1))
+    h = max(0, int(y2) - int(y1))
+    fw, fh = max(1, int(frame_w)), max(1, int(frame_h))
+    if w < 4 or h < 4:
+        return False
+    area = (w * h) / float(fw * fh)
+    if area > _MAX_BOX_AREA.get(cat, 0.35):
+        return False
+    aspect = w / float(max(1, h))
+    return (1.0 / _MAX_BOX_ASPECT.get(cat, 14.0)
+            <= aspect <= _MAX_BOX_ASPECT.get(cat, 14.0))
