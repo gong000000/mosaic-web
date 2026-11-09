@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 *.pt
+!weights/yolo11n-seg.pt
 outputs/*.mp4
 outputs/jobs.json
 /docs/
@@ -8,3 +9,4 @@ outputs/jobs.json
 .env.*
 !.env.example
 *.log
+users.db

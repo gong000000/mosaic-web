@@ -29,6 +29,7 @@ from src.render_service import MosaicSettings, RenderPlan
 from src.vlm_package import prompt_categories
 from src import history as H
 from src import retention as RT
+from src.auth import require_login
 
 # blur.me 스튜디오처럼 항상 빠른 고정 설정을 쓴다.
 FAST_MODEL = "yolo11n-seg.pt"
@@ -63,7 +64,7 @@ def _load_css():
 
 st.markdown(f"<style>{_load_css()}</style>", unsafe_allow_html=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-
+current_user = require_login()
 
 def _friendly_vlm_error(err, api_key=""):
     """VLM 오류를 사용자가 바로 조치할 수 있는 문장으로 바꾼다.
@@ -93,16 +94,16 @@ def _friendly_vlm_error(err, api_key=""):
     return msg
 
 
-def _unique_out_path(src_name):
+def _unique_out_path(src_name, user):
     """같은 초에 두 작업이 끝나도 결과 파일을 덮어쓰지 않게 한다."""
     stem = os.path.splitext(os.path.basename(src_name))[0]
     ts = time.strftime("%m%d_%H%M%S")
     token = secrets.token_hex(2)
-    path = os.path.join(OUTPUT_DIR, f"{stem}_{ts}_{token}.mp4")
+    base = f"{user}--{stem}_{ts}_{token}"
+    path = os.path.join(OUTPUT_DIR, f"{base}.mp4")
     i = 1
     while os.path.exists(path):
-        path = os.path.join(
-            OUTPUT_DIR, f"{stem}_{ts}_{token}_{i}.mp4")
+        path = os.path.join(OUTPUT_DIR, f"{base}_{i}.mp4")
         i += 1
     return path
 
@@ -296,6 +297,12 @@ RT.purge_old()
 H.remove_missing()
 
 with st.sidebar:
+    st.caption(f"👤 {current_user}")
+    if st.button("로그아웃"):
+        shutil.rmtree(st.session_state.get("tmp_dir") or "", ignore_errors=True)
+        st.session_state.clear()
+        st.rerun()
+
     st.header("설정")
 
     st.subheader("영상")
@@ -520,7 +527,7 @@ else:
         source_token, FAST_MODEL, FAST_IMGSZ, FAST_STRIDE, FAST_CONF)
 
     if st.button("모자이크 시작", type="primary", key="start_mosaic"):
-        out_path = _unique_out_path(uploaded.name)
+        out_path = _unique_out_path(uploaded.name, current_user)
         progress = st.progress(0.0, text="렌더 준비 중...")
 
         def on_progress(frac, done, total, elapsed):
@@ -622,7 +629,9 @@ else:
     st.write("모자이크 시작을 누르면 영상이 여기에 표시됩니다.")
 
 with st.expander("지난 작업", expanded=False):
-    rows = H.all_rows()
+    _prefix = f"{current_user}--"
+    rows = [r for r in H.all_rows()
+            if str(r.get("file", "")).startswith(_prefix)]
     if not rows:
         st.write("저장된 작업이 없습니다.")
     for row in rows:
