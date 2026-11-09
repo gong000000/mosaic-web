@@ -1,4 +1,4 @@
---extra-index-url https://download.pytorch.org/whl/cu124
+--extra-index-url https://download.pytorch.org/whl/cpu
 ultralytics==8.4.174
 opencv-python==5.0.0.93
 streamlit==1.65.0
