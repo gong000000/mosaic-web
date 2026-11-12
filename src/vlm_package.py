@@ -438,8 +438,8 @@ def detect_with_vlm(frame_bgr, phrases, api_key, model=VLM_MODEL,
     """
     api_key = str(api_key or "").strip()
     if not api_key:
-        raise VLMError("Gemini API 키가 없습니다. .env의 GEMINI_API_KEY 또는 "
-                       "사이드바 입력을 확인하세요.")
+        raise VLMError("Gemini API 키가 없습니다. .env의 GEMINI_API_KEY를 "
+                       "확인하세요.")
 
     retry = VLMRetryPolicy(max_retries=max_retries)
     last_error = None

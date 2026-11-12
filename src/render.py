@@ -81,10 +81,6 @@ class FFmpegFrameWriter:
         self.height = max(2, int(h) - (int(h) % 2))
         self._start()
 
-    @property
-    def ok(self):
-        return self._proc is not None
-
     def write(self, frame):
         if self._proc is None:
             if self.width == 0 or self.height == 0:
@@ -96,8 +92,9 @@ class FFmpegFrameWriter:
         else:
             frame = self.resize_to(frame)
         try:
-            self._proc.stdin.write(
-                np.ascontiguousarray(frame, dtype=np.uint8).tobytes())
+            # tobytes()로 한 번 더 복사하지 않고 버퍼 프로토콜로 바로 넘긴다.
+            buf = np.ascontiguousarray(frame, dtype=np.uint8)
+            self._proc.stdin.write(memoryview(buf))
         except (BrokenPipeError, OSError) as e:
             raise RuntimeError(f"ffmpeg 프레임 쓰기 실패: {e}")
 
@@ -309,17 +306,20 @@ def render_region(frame, x1, y1, x2, y2, style="pixel", blocks=30, blur=61, pad=
         return False
     roi = frame[y1c:y2c, x1c:x2c]
     mos = render_mosaic(roi, style=style, blocks=blocks, blur=blur)
-    # 경계가 튀지 않도록 1px 테두리만 부드럽게 섞는다.
+    # 내부는 모자이크 그대로 두고, 경계가 튀지 않도록 1px 테두리만
+    # 원본과 60% 섞는다. 전체 ROI float 마스크 할당을 피한다.
+    out = frame[y1c:y2c, x1c:x2c]
     try:
-        m = np.ones(roi.shape[:2], dtype=np.float32)
-        m[:1, :] = 0.6
-        m[-1:, :] = 0.6
-        m[:, :1] = 0.6
-        m[:, -1:] = 0.6
-        m = m[..., None]
-        frame[y1c:y2c, x1c:x2c] = (mos * m + roi * (1 - m)).astype(np.uint8)
+        alpha = 0.6
+        out[1:-1, 1:-1] = mos[1:-1, 1:-1]
+        out[:1] = (mos[:1] * alpha + out[:1] * (1 - alpha)).astype(np.uint8)
+        out[-1:] = (mos[-1:] * alpha + out[-1:] * (1 - alpha)).astype(np.uint8)
+        out[1:-1, :1] = (mos[1:-1, :1] * alpha
+                         + out[1:-1, :1] * (1 - alpha)).astype(np.uint8)
+        out[1:-1, -1:] = (mos[1:-1, -1:] * alpha
+                          + out[1:-1, -1:] * (1 - alpha)).astype(np.uint8)
     except Exception:
-        frame[y1c:y2c, x1c:x2c] = mos
+        out[:] = mos
     return True
 
 
@@ -409,6 +409,8 @@ def render_person_roi(frame, x1, y1, x2, y2, mask_roi, style="pixel",
                 if area_mode != "full":
                     # 사람 마스크 전체를 쓰면 '얼굴만' 설정이 몸으로
                     # 번진다. 허용 영역 밖은 마스크만 0으로 막는다.
+                    # 원본 hist_mask를 직접 자르지 않도록 복사한다.
+                    m = m.copy()
                     allowed_h = int(
                         (y2c - y1c) * _area_ratio(
                             area_mode, x2c - x1c, y2c - y1c))
@@ -429,9 +431,12 @@ def render_person_roi(frame, x1, y1, x2, y2, mask_roi, style="pixel",
                                                    x2c - x1c, y2c - y1c))
 
 
-def render_person_strict(frame, x1, y1, x2, y2, mask_full_or_None, style="pixel", blocks=30, blur=61, area_mode="full"):
-    """마스크 있을 때만 마스크 영역. 없으면 area_mode에 따라 얼굴/상반신/전체 영역을 가린다.
-    렌더했으면 True."""
+def render_person_strict(frame, x1, y1, x2, y2, mask_full_or_None,
+                         style="pixel", blocks=30, blur=61, area_mode="full"):
+    """마스크가 있으면 마스크 영역만, 없으면 area_mode에 따라 가린다.
+
+    얼굴/상반신/전체 범위를 선택할 수 있고, 렌더했으면 True를 반환한다.
+    """
     x1c, y1c = max(0, int(x1)), max(0, int(y1))
     x2c, y2c = min(frame.shape[1], int(x2)), min(frame.shape[0], int(y2))
     if x2c - x1c < 20 or y2c - y1c < 20:
@@ -440,11 +445,13 @@ def render_person_strict(frame, x1, y1, x2, y2, mask_full_or_None, style="pixel"
         try:
             mc = mask_full_or_None[y1c:y2c, x1c:x2c]
             if mc.size > 0 and mc.mean() >= 8:
-                h_roi, w_roi = mc.shape[:2]
                 if mc.shape != (y2c - y1c, x2c - x1c):
                     mc = cv2.resize(mc, (x2c - x1c, y2c - y1c),
                                     interpolation=cv2.INTER_NEAREST)
                 if area_mode != "full":
+                    # 원본 마스크를 자르면 다음 프레임의 허용 높이가
+                    # 달라졌을 때 아래쪽이 비어 보일 수 있어 복사한다.
+                    mc = mc.copy()
                     allowed_h = int(
                         (y2c - y1c) * _area_ratio(
                             area_mode, x2c - x1c, y2c - y1c))

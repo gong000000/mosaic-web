@@ -1,6 +1,7 @@
 """로그인/회원가입 (Streamlit + SQLite).
 
-- require_login(): 로그인된 아이디(str)를 반환한다. 아니면 로그인 화면을 띄우고 st.stop().
+- require_login(): 로그인된 아이디(str)를 반환한다. 아니면 로그인 화면을
+  띄우고 st.stop().
 - register(username, password): (ok, msg) 반환.
 - 비밀번호는 PBKDF2-SHA256 + 사용자별 salt로 저장한다(평문 저장 안 함).
 - 아이디는 영문/숫자/_ 3~20자만 허용한다. app.py가 결과 파일명을
@@ -14,6 +15,7 @@ import re
 import secrets
 import sqlite3
 import time
+from contextlib import closing
 
 import streamlit as st
 
@@ -53,7 +55,9 @@ def register(username, password):
         return False, "비밀번호는 8자 이상이어야 합니다."
     salt = secrets.token_hex(16)
     try:
-        with _conn() as conn:
+        # closing으로 연결을 닫아야 Windows에서 users.db 파일 잠금이
+        # 남지 않는다. with conn은 트랜잭션만 커밋한다.
+        with closing(_conn()) as conn, conn:
             conn.execute(
                 "INSERT INTO users VALUES (?, ?, ?, ?)",
                 (username, salt, _hash(password, salt),
@@ -66,7 +70,7 @@ def register(username, password):
 def verify(username, password):
     """아이디/비밀번호 확인."""
     username = (username or "").strip()
-    with _conn() as conn:
+    with closing(_conn()) as conn:
         row = conn.execute(
             "SELECT salt, pw_hash FROM users WHERE username = ?",
             (username,)).fetchone()

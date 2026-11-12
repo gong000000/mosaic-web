@@ -66,6 +66,7 @@ st.markdown(f"<style>{_load_css()}</style>", unsafe_allow_html=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 current_user = require_login()
 
+
 def _friendly_vlm_error(err, api_key=""):
     """VLM 오류를 사용자가 바로 조치할 수 있는 문장으로 바꾼다.
     키 문자열이 메시지에 섞여도 화면에 노출하지 않는다."""
@@ -95,7 +96,8 @@ def _friendly_vlm_error(err, api_key=""):
 
 
 def _unique_out_path(src_name, user):
-    """같은 초에 두 작업이 끝나도 결과 파일을 덮어쓰지 않게 한다."""
+    """같은 초에 두 작업이 끝나도 결과 파일을 덮어쓰지 않게 한다.
+    파일명 앞에 사용자 ID를 붙여 '지난 작업'을 계정별로 구분한다."""
     stem = os.path.splitext(os.path.basename(src_name))[0]
     ts = time.strftime("%m%d_%H%M%S")
     token = secrets.token_hex(2)
@@ -297,9 +299,11 @@ RT.purge_old()
 H.remove_missing()
 
 with st.sidebar:
-    st.caption(f"👤 {current_user}")
+    st.caption(f"로그인: {current_user}")
     if st.button("로그아웃"):
-        shutil.rmtree(st.session_state.get("tmp_dir") or "", ignore_errors=True)
+        tmp_dir = st.session_state.get("tmp_dir")
+        if tmp_dir:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
         st.session_state.clear()
         st.rerun()
 
@@ -629,9 +633,9 @@ else:
     st.write("모자이크 시작을 누르면 영상이 여기에 표시됩니다.")
 
 with st.expander("지난 작업", expanded=False):
-    _prefix = f"{current_user}--"
+    prefix = f"{current_user}--"
     rows = [r for r in H.all_rows()
-            if str(r.get("file", "")).startswith(_prefix)]
+            if str(r.get("file", "")).startswith(prefix)]
     if not rows:
         st.write("저장된 작업이 없습니다.")
     for row in rows:

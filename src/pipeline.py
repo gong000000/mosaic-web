@@ -410,7 +410,6 @@ class MosaicJob:
         input_path, output_path = self.input_path, self.output_path
         targets = list(self.targets)
         style, blocks, blur = self.style, self.blocks, self.blur
-        area_mode = self.area_mode
         stride = max(1, int(self.keyframe_stride))
         preset = self.encode_preset
 
@@ -823,7 +822,6 @@ class MosaicJob:
                                     vlm_disabled = True
 
             for rec in chunk:
-                frame = rec["frame"]
                 cand = rec["cand"]
                 sample_idx = rec["sample_idx"]
                 vlm_boxes = vlm_results.get(id(rec), [])
@@ -1238,8 +1236,6 @@ class MosaicJob:
                                         hist_mask[tid] = mf
                             except Exception:
                                 mf = None
-                        elif not invert:
-                            mf = hist_mask.get(tid)
                         else:
                             mf = hist_mask.get(tid)
                         items.append((tid, ax1, ay1, ax2, ay2, should, mf,

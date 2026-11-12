@@ -9,7 +9,8 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 FACE = r"C:\Users\gong0000\Downloads\face.mp4"
-YTDOWN = r"C:\Users\gong0000\Downloads\YTDown.com_YouTube_Media__VuJA-VQRcY_Central-Cee-Doja-Official-Music-Video_002_720p.mp4"
+YTDOWN = (r"C:\Users\gong0000\Downloads\YTDown.com_YouTube_Media__"
+          r"VuJA-VQRcY_Central-Cee-Doja-Official-Music-Video_002_720p.mp4")
 TMP = os.path.join(os.environ.get("TEMP", "."), "mosaic_robust_black.mp4")
 
 

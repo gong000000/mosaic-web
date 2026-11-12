@@ -6,6 +6,13 @@
 
 ## 동작 흐름
 
+0. **회원가입 · 로그인**
+   - 앱을 열면 먼저 로그인 화면이 나옵니다. 처음이면 `회원가입` 탭에서
+     아이디(영문/숫자/_ 3~20자)와 비밀번호(8자 이상)를 등록합니다.
+   - 계정은 프로젝트 루트의 `users.db`(SQLite)에 저장되며, 비밀번호는
+     PBKDF2-SHA256 + 사용자별 salt 해시로만 저장됩니다.
+   - 로그인한 아이디별로 결과 파일과 `지난 작업` 기록이 분리됩니다.
+
 1. **업로드 → VLM 분석**
    - 고르게 샘플링한 프레임 4장을 Gemini VLM에 보내 개인정보 후보와 위치를 찾습니다.
    - 화면에는 자동 모자이크가 아니라 **체크리스트**만 표시됩니다.
@@ -29,6 +36,8 @@
 
 4. **미리보기 · 다운로드**
    - 사진이 아니라 **모자이크가 실제로 적용된 동영상**을 재생해 확인합니다.
+   - 결과 파일명은 `아이디--원본이름_시각_토큰.mp4` 형식이라 계정별로
+     구분됩니다. `지난 작업`에는 현재 로그인한 아이디의 결과만 보입니다.
    - 확인 후 다운로드합니다. `받으면 결과 자동 삭제`를 켜면 다운로드 시
      서버 결과 파일과 기록을 지웁니다.
 
@@ -51,19 +60,22 @@
 
 ## 설치
 
-CUDA GPU 환경(권장):
+CUDA GPU 환경:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements-gpu.txt
+```
+
+CPU만 사용할 때:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-```
-
-CPU만 사용할 때:
-
-```powershell
-pip install -r requirements-cpu.txt
 ```
 
 ## VLM API 키 (Gemini 전용)
@@ -94,15 +106,43 @@ GEMINI_API_KEY=...
 모델명을 바꾸려면 같은 파일에 `VLM_MODEL=...`을 추가합니다
 (기본값 `gemini-3-flash-preview`).
 
-## 실행
+## 로그인 · 계정
+
+- 앱을 열면 로그인 화면이 먼저 표시됩니다. `회원가입` 탭에서 계정을 만든 뒤
+  `로그인` 탭에서 접속합니다.
+- 아이디는 영문/숫자/_ 3~20자, 비밀번호는 8자 이상입니다.
+- 계정은 프로젝트 루트의 `users.db`(SQLite)에 자동 생성·저장되며,
+  `users.db`는 `.gitignore`에 등록되어 커밋되지 않습니다.
+- 비밀번호는 PBKDF2-SHA256(20만 회) + 사용자별 salt 해시로 저장되고
+  평문으로 저장하지 않습니다.
+- 5회 연속 실패하면 60초 동안 로그인이 잠깁니다.
+- 로그인 후 사이드바에서 현재 아이디를 확인하고 `로그아웃`할 수 있습니다.
+- 결과 파일은 `아이디--원본이름_시각_토큰.mp4`로 저장되며, `지난 작업`은
+  현재 아이디로 시작하는 파일만 보여줍니다.
+- `users.db`를 지우면 모든 계정과 로그인 정보가 초기화됩니다(결과 영상은
+  `outputs/`에 그대로 남습니다).
+
+## 실행 · 접속
+
+프로젝트 폴더에서 Streamlit 서버를 실행합니다.
 
 ```powershell
-.\.venv\Scripts\python.exe -m streamlit run app.py \
+cd C:\Users\gong0000\Desktop\mosaic-web
+.\.venv\Scripts\python.exe -m streamlit run app.py `
   --server.port 8501 --server.address 127.0.0.1 --server.headless true
 ```
 
-브라우저에서 `http://127.0.0.1:8501`을 엽니다. 코드 변경 후에는 서버를
-껐다 켜야 반영됩니다.
+브라우저에서 **http://127.0.0.1:8501** 을 엽니다.
+
+- 같은 PC에서는 `http://localhost:8501`도 됩니다.
+- 서버 콘솔에 표시되는 `Local URL` / `Network URL`을 그대로 사용해도 됩니다.
+- 같은 네트워크의 다른 기기에서 접속하려면 `--server.address 0.0.0.0`으로
+  실행하고, Windows 방화벽에서 8501 포트를 허용한 뒤
+  `http://<서버 PC의 IP>:8501`로 접속합니다.
+- 서버를 끄려면 실행 중인 터미널에서 `Ctrl+C`를 누릅니다.
+- 코드를 수정한 뒤에는 서버를 다시 시작해야 반영됩니다.
+- 로그인 세션은 브라우저 탭에 유지되며, 서버를 재시작해도 계정(`users.db`)은
+  유지됩니다.
 
 ## 실제 VLM 품질 확인
 
@@ -121,6 +161,7 @@ VLM 스텁으로 키 없이 실행할 수 있습니다.
 
 ```powershell
 python scripts/smoke.py
+python scripts/authtest.py
 python scripts/checklist.py
 python scripts/freeform.py
 python scripts/regression.py
@@ -128,21 +169,25 @@ python scripts/robustness.py
 python scripts/apptest.py
 ```
 
-`apptest.py`는 업로드 → 분석 목록 → `모자이크 시작` → 결과 파일 생성 →
-다운로드 버튼 노출까지 확인합니다.
+`authtest.py`는 임시 DB로 회원가입/로그인/비밀번호 해시 저장과 로그인
+화면 노출을 확인합니다(실제 `users.db`는 건드리지 않습니다).
+`apptest.py`는 로그인 세션을 주입한 뒤 업로드 → 분석 목록 →
+`모자이크 시작` → 결과 파일 생성 → 다운로드 버튼 노출까지 확인합니다.
 
 ## 개인정보 처리
 
 - 원본 영상은 로컬 임시 폴더에서만 처리됩니다.
 - VLM에는 **샘플 프레임 이미지**만 전송하며 영상 파일 전체를 보내지 않습니다.
-- 결과 파일은 `outputs/`에 저장되며, 기본 24시간이 지난 파일은 자동
-  정리됩니다. 테스트 산출물은 필요 없으면 `outputs/`에서 지워도 됩니다.
+- 결과 파일은 `outputs/`에 저장되며, 기본 24시간이 지난 파일은 앱 시작 시
+  자동 정리됩니다. 보관이 필요한 결과는 `outputs/` 밖으로 옮기세요.
+  테스트 산출물은 필요 없으면 `outputs/`에서 지워도 됩니다.
 - API 키는 환경변수/`.env`에서만 읽고 화면·로그·코드에 남기지 않습니다.
 
 ## 프로젝트 구조
 
 ```text
-app.py                      Streamlit UI (분석 목록 → 렌더 → 미리보기/다운로드)
+app.py                      Streamlit UI (로그인 → 분석 목록 → 렌더 → 미리보기/다운로드)
+src/auth.py                 회원가입/로그인 (SQLite users.db, PBKDF2 해시)
 src/config.py               카테고리/프리셋/.env 로더
 src/preview.py              VLM 샘플 분석 + 체크리스트 항목
 src/vlm_package.py          VLM 호출/파싱/재시도
@@ -153,12 +198,14 @@ src/render.py               모자이크/FFmpeg H.264 유틸
 src/render_service.py       체크리스트 → 렌더 요청 변환/서명/캐시
 src/history.py              결과 기록
 src/retention.py            보관/삭제 정책
+requirements.txt            CPU/headless 의존성
+requirements-gpu.txt        CUDA GPU 의존성
 configs/bytetrack_stable.yaml  ByteTrack 설정
 weights/
   yolo11n-seg.pt            앱 고정 person/vehicle 모델
   face_detection_yunet_2023mar.onnx  얼굴 전용 검출 모델
 assets/style.css            앱 스타일
 scripts/
-  smoke/checklist/freeform/regression/robustness/apptest  자동 검사
+  smoke/authtest/checklist/freeform/regression/robustness/apptest  자동 검사
   live_vlm.py               실제 Gemini 분석 확인용
 ```

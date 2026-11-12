@@ -20,6 +20,11 @@ os.environ["GEMINI_API_KEY"] = "fake-key"
 
 from streamlit.testing.v1 import AppTest
 
+# 테스트 실행이 실제 outputs/의 오래된 사용자 결과를 지우지 않게 한다.
+# (앱은 시작할 때 24시간 지난 결과를 정리하지만, 테스트는 그 정책을 끈다.)
+from src import retention as RT
+RT.purge_old = lambda *args, **kwargs: 0
+
 FACE = r"C:\Users\gong0000\Downloads\face.mp4"
 STREET = r"C:\Users\gong0000\Downloads\street.mp4"
 
@@ -77,9 +82,13 @@ def _patch(fn):
 
 
 def _open_app():
-    return AppTest.from_file(
+    at = AppTest.from_file(
         os.path.join(os.path.dirname(__file__), "..", "app.py"),
         default_timeout=900)
+    # 로그인 화면을 건너뛰고 앱 본체를 검사한다. 로그인 자체는
+    # scripts/authtest.py에서 별도로 검증한다.
+    at.session_state["user"] = "apptest"
+    return at
 
 
 def _warnings(at):

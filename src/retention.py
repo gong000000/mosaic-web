@@ -1,4 +1,4 @@
-"""보관 정책. 업로드 24시간 경과/다운로드 시 자동 삭제.
+"""보관 정책. 24시간이 지난 결과물을 자동 삭제한다.
 영상 파일은 로컬에만 저장된다. (VLM 사용 시 판정용 프레임만 외부 전송)"""
 import os
 import threading
@@ -41,18 +41,7 @@ class RetentionPolicy:
                     pass
         return removed
 
-    def remove_on_download(self, path):
-        with _LOCK:
-            try:
-                if path and os.path.exists(path):
-                    os.unlink(path)
-                    return True
-            except Exception:
-                pass
-            return False
-
 
 _POLICY = RetentionPolicy()
 RETENTION_HOURS = _POLICY.max_hours
 purge_old = _POLICY.purge_old
-remove_on_download = _POLICY.remove_on_download

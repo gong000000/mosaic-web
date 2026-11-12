@@ -1,4 +1,4 @@
-"""작업 히스토리. outputs/ 폴더 + jobs.json. 로그인 없이 포트폴리오용 최소 기록."""
+"""작업 히스토리. outputs/ 폴더 + jobs.json. 계정별 필터는 app.py가 한다."""
 import json
 import os
 import threading
