@@ -9,7 +9,8 @@
 - 웹 주소는 배포 출력에 찍히는 https://...modal.run 을 그대로 쓰면 된다.
 - users.db / outputs/ 는 Modal Volume(mosaic-data)에 저장되어 재배포·재시작
   후에도 남는다.
-- GEMINI_API_KEY 는 로컬 .env 에서 읽어 Modal Secret 으로 전달한다.
+- GEMINI_API_KEY 는 Modal Named Secret(mosaic-gemini)에서 읽는다.
+  Secret은 워크스페이스에 있으므로 배포 PC마다 .env 를 복사할 필요가 없다.
   .env 자체는 이미지에 포함하지 않는다.
 """
 import subprocess
@@ -76,7 +77,9 @@ image = (
     # 접속자는 이 한 컨테이너를 공유하고, 렌더는 앱이 순서대로 처리한다.
     max_containers=1,
     volumes={DATA_DIR: data_volume},
-    secrets=[modal.Secret.from_dotenv(ROOT)],
+    # GEMINI_API_KEY 는 Modal Named Secret(mosaic-gemini) 에서 읽는다.
+    # .env 를 들고 있는 PC 말고도, 로그인만 되어 있으면 배포할 수 있다.
+    secrets=[modal.Secret.from_name("mosaic-gemini")],
     env={
         "MOSAIC_DATA_DIR": DATA_DIR,
         "MOSAIC_SKIP_DOTENV": "1",

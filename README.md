@@ -91,7 +91,7 @@
 가입 후 매월 $30 크레딧이 제공되고, 접속이 없으면 컨테이너가 자동으로
 내려가 GPU 비용이 계속 나가지 않습니다.
 
-최초 1회:
+최초 1회(배포 PC에서):
 
 ```powershell
 pip install modal python-dotenv
@@ -107,13 +107,54 @@ modal deploy modal_app.py
 - 첫 배포는 CUDA용 torch 이미지를 빌드하므로 10분 정도 걸릴 수 있습니다.
 - `users.db`와 `outputs/`는 Modal Volume `mosaic-data`에 저장됩니다.
   컨테이너가 재시작·재배포돼도 계정과 결과가 유지됩니다.
-- `GEMINI_API_KEY`는 로컬 `.env`에서 읽어 Secret으로 전달합니다.
-  `.env`는 이미지에 포함되지 않고 커밋되지 않습니다.
-  모델명은 `.env`의 `VLM_MODEL`로 바꿉니다(기본 `gemini-3-flash-preview`).
+- `GEMINI_API_KEY`는 Modal Named Secret `mosaic-gemini`에서 읽습니다.
+  `.env`를 들고 있는 PC 말고도 **Modal 로그인만 되어 있으면 배포할 수
+  있습니다.** `.env`는 이미지에 포함되지 않고 커밋되지 않습니다.
+  모델명은 Secret의 `VLM_MODEL`로 바꿉니다(기본 `gemini-3-flash-preview`).
 - GPU 사양은 `modal_app.py`의 `gpu="T4"`에서 바꿉니다.
 - 로그: `modal app logs mosaic-web --tail 100` (실시간은 `-f`)
 - 중지: `modal app stop mosaic-web`
 - 탭을 열어둔 채 방치하면 GPU가 계속 과금됩니다.
+
+### Named Secret 만들고 갱신하기
+
+Secret은 Modal 워크스페이스에 있으므로 한 번 만들면 모든 배포 PC가
+공유합니다. 값은 화면에 출력되지 않습니다.
+
+최초 1회(키가 있는 PC에서):
+
+```powershell
+modal secret create mosaic-gemini --from-dotenv .env
+```
+
+키를 바꾸었을 때 갱신:
+
+```powershell
+modal secret create mosaic-gemini --from-dotenv .env --force
+```
+
+확인(키 값은 안 보입니다):
+
+```powershell
+modal secret list
+```
+
+### 다른 컴퓨터에서 배포하기
+
+`.env` 없이 가능합니다. 같은 Modal 계정(`gong000000`)으로 로그인해야
+기존 URL과 `mosaic-data` 볼륨을 그대로 씁니다.
+
+```powershell
+git clone https://github.com/gong000000/mosaic-web.git
+cd mosaic-web
+pip install modal python-dotenv
+modal setup          # gong000000 워크스페이스 계정으로 로그인
+modal deploy modal_app.py
+```
+
+- 다른 Modal 계정으로 배포하면 URL이 바뀌고 기존 계정·결과를 볼 수 없습니다.
+- `modal deploy`는 앱을 다시 켜는 동작입니다. 링크를 공개하고 싶지 않으면
+  배포하지 말고 `modal app stop mosaic-web -y`로 중지 상태를 유지합니다.
 
 ### 로컬에서 실행 (개발용, 선택)
 
