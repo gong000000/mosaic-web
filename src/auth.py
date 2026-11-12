@@ -19,9 +19,9 @@ from contextlib import closing
 
 import streamlit as st
 
-from src.config import ROOT_DIR
+from src.config import DATA_DIR
 
-DB_PATH = os.path.join(ROOT_DIR, "users.db")
+DB_PATH = os.path.join(DATA_DIR, "users.db")
 USER_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 ITERATIONS = 200_000
 MAX_FAILS = 5          # 연속 실패 허용 횟수

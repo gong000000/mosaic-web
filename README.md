@@ -144,6 +144,31 @@ cd C:\Users\gong0000\Desktop\mosaic-web
 - 로그인 세션은 브라우저 탭에 유지되며, 서버를 재시작해도 계정(`users.db`)은
   유지됩니다.
 
+## 클라우드 배포 (Modal, GPU)
+
+다른 컴퓨터에서 접속할 수 있도록 Modal에 올리는 방법입니다. 가입 후 매월
+$30 크레딧이 제공되고, 접속이 없으면 컨테이너가 자동으로 내려가 GPU 비용이
+계속 나가지 않습니다.
+
+```powershell
+pip install modal python-dotenv
+modal setup                      # 브라우저에서 로그인 (최초 1회)
+modal deploy modal_app.py
+```
+
+배포가 끝나면 출력에 `https://....modal.run` 주소가 표시됩니다. 이 주소를
+다른 컴퓨터에서 그대로 열면 됩니다.
+
+- 첫 배포는 CUDA용 torch 이미지를 빌드하므로 10분 정도 걸릴 수 있습니다.
+- `users.db`와 `outputs/`는 Modal Volume `mosaic-data`에 저장됩니다.
+  컨테이너가 재시작·재배포돼도 계정과 결과가 유지됩니다.
+- `GEMINI_API_KEY`는 로컬 `.env`에서 읽어 Secret으로 전달합니다. `.env`는
+  이미지에 포함되지 않습니다.
+- Streamlit 탭을 닫으면 약 5분 뒤 컨테이너가 내려갑니다. 탭을 열어둔 채
+  방치하면 GPU가 계속 과금되므로 사용 후 탭을 닫으세요.
+- GPU 사양은 `modal_app.py`의 `gpu="T4"`에서 바꿀 수 있습니다.
+- 로그 확인/중지: `modal app logs mosaic-web`, `modal app stop mosaic-web`.
+
 ## 실제 VLM 품질 확인
 
 키를 넣은 뒤 샘플 영상으로 분석 결과를 확인할 수 있습니다.
@@ -187,6 +212,7 @@ python scripts/apptest.py
 
 ```text
 app.py                      Streamlit UI (로그인 → 분석 목록 → 렌더 → 미리보기/다운로드)
+modal_app.py                Modal 배포 설정 (GPU, 영속 볼륨)
 src/auth.py                 회원가입/로그인 (SQLite users.db, PBKDF2 해시)
 src/config.py               카테고리/프리셋/.env 로더
 src/preview.py              VLM 샘플 분석 + 체크리스트 항목

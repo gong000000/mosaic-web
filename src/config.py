@@ -174,7 +174,10 @@ PRESETS = {
     "직접 입력": "",
 }
 
-OUTPUT_DIR = os.path.join(ROOT_DIR, "outputs")
+# 결과물/DB 저장 위치. Modal 같은 배포 환경에서는 영속 볼륨 경로를
+# MOSAIC_DATA_DIR로 넘겨 컨테이너가 재시작돼도 파일이 남게 한다.
+DATA_DIR = os.environ.get("MOSAIC_DATA_DIR") or ROOT_DIR
+OUTPUT_DIR = os.path.join(DATA_DIR, "outputs")
 
 # VLM 설정. Gemini 하나만 사용한다. 모델명은 .env의 VLM_MODEL로 바꿀 수 있다.
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
