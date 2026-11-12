@@ -216,6 +216,37 @@ def _fmt_size(path):
     return f"{size / 1024:.0f} KB"
 
 
+def _render_history(user, expanded=False):
+    """로그인한 계정의 지난 작업만 보여준다. 업로드 전에도 호출한다."""
+    with st.expander("지난 작업", expanded=expanded):
+        prefix = f"{user}--"
+        rows = [r for r in H.all_rows()
+                if str(r.get("file", "")).startswith(prefix)]
+        if not rows:
+            st.write("저장된 작업이 없습니다.")
+            return
+        for row in rows:
+            fname = row.get("file")
+            if not fname:
+                continue
+            c1, c2, c3 = st.columns([3, 1, 1])
+            with c1:
+                st.write(f"{row.get('at', '')} · {row.get('src', '')} → {fname}")
+            with c2:
+                path = os.path.join(OUTPUT_DIR, fname)
+                if os.path.exists(path):
+                    with open(path, "rb") as f:
+                        st.download_button("받기", f, file_name=fname,
+                                           key=f"dl_{fname}")
+            with c3:
+                if st.button("삭제", key=f"del_{fname}"):
+                    H.delete(fname)
+                    if st.session_state.get("render_out") == os.path.join(
+                            OUTPUT_DIR, fname):
+                        _invalidate_work()
+                    st.rerun()
+
+
 def _render_checklist(items, analysis_id, prompt_cats):
     """체크리스트를 그리고 선택된 카테고리 목록을 돌려준다."""
     if not items:
@@ -319,6 +350,10 @@ with st.sidebar:
 
     st.divider()
     auto_del = st.checkbox("받으면 결과 자동 삭제", value=False)
+
+# 로그인만 해도 지난 작업을 볼 수 있게 업로드 여부와 무관하게 보여준다.
+# 영상이 없을 때는 펼쳐서 바로 확인하고, 작업 중에는 접어 둔다.
+_render_history(current_user, expanded=not uploaded)
 
 # Gemini 하나만 쓴다. 모델명은 .env의 VLM_MODEL, 엔드포인트는 고정이다.
 vlm_model = VLM_MODEL
@@ -632,29 +667,3 @@ if render_valid:
 else:
     st.write("모자이크 시작을 누르면 영상이 여기에 표시됩니다.")
 
-with st.expander("지난 작업", expanded=False):
-    prefix = f"{current_user}--"
-    rows = [r for r in H.all_rows()
-            if str(r.get("file", "")).startswith(prefix)]
-    if not rows:
-        st.write("저장된 작업이 없습니다.")
-    for row in rows:
-        fname = row.get("file")
-        if not fname:
-            continue
-        c1, c2, c3 = st.columns([3, 1, 1])
-        with c1:
-            st.write(f"{row.get('at', '')} · {row.get('src', '')} → {fname}")
-        with c2:
-            path = os.path.join(OUTPUT_DIR, fname)
-            if os.path.exists(path):
-                with open(path, "rb") as f:
-                    st.download_button("받기", f, file_name=fname,
-                                       key=f"dl_{fname}")
-        with c3:
-            if st.button("삭제", key=f"del_{fname}"):
-                H.delete(fname)
-                if st.session_state.get("render_out") == os.path.join(
-                        OUTPUT_DIR, fname):
-                    _invalidate_work()
-                st.rerun()
