@@ -176,7 +176,7 @@ def render_mosaic(roi, style="pixel", blocks=30, blur=61):
     return cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
 
 
-def feather_mask(mask_u8, guide_bgr=None):
+def feather_mask(mask_u8):
     """마스크 경계를 부드럽게 만든다. 성능을 위해 커널을 작게 유지한다."""
     m = mask_u8.astype(np.uint8)
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
@@ -405,7 +405,7 @@ def render_person_roi(frame, x1, y1, x2, y2, mask_roi, style="pixel",
                 m = (m > 0.5).astype(np.uint8) * 255
             if m.mean() >= 8:
                 if style != "pixel":
-                    m = feather_mask(m, roi_f)
+                    m = feather_mask(m)
                 if area_mode != "full":
                     # 사람 마스크 전체를 쓰면 '얼굴만' 설정이 몸으로
                     # 번진다. 허용 영역 밖은 마스크만 0으로 막는다.
@@ -458,8 +458,7 @@ def render_person_strict(frame, x1, y1, x2, y2, mask_full_or_None,
                     if allowed_h < mc.shape[0]:
                         mc[allowed_h:, :] = 0
                 # pixel은 하드 경계가 자연스러워 페더링을 생략한다.
-                m = mc if style == "pixel" else feather_mask(
-                    mc, frame[y1c:y2c, x1c:x2c])
+                m = mc if style == "pixel" else feather_mask(mc)
                 roi_f = frame[y1c:y2c, x1c:x2c]
                 mos = render_mosaic(roi_f, style=style, blocks=blocks, blur=blur)
                 mf = (m.astype(float) / 255.0)[..., None]
