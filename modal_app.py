@@ -87,7 +87,9 @@ image = (
     },
 )
 @modal.concurrent(max_inputs=100)
-@modal.web_server(PORT, startup_timeout=600)
+# label 을 지정하면 URL 이 https://<워크스페이스>--<label>.<리전>.modal.run
+# 형태가 된다. (기본값은 <앱이름>-<함수이름>)
+@modal.web_server(PORT, startup_timeout=600, label="mosaic")
 def web():
     cmd = [
         "streamlit",

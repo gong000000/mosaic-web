@@ -7,9 +7,9 @@
 
 ## 웹에서 사용
 
-- 서비스 주소는 `modal deploy modal_app.py` 출력에 표시되는
-  `https://<워크스페이스>--mosaic-web-web.<리전>.modal.run` 입니다.
-  Modal 대시보드에서도 확인할 수 있습니다.
+- 서비스 주소는 `https://gong000000--mosaic.us-east.modal.run` 입니다.
+  (`modal_app.py`의 `label="mosaic"`로 지정한 값이 URL에 쓰입니다.
+  Modal 대시보드에서도 확인할 수 있습니다.)
 - 주소만 열면 되고, 사용자 PC에 설치할 것은 없습니다.
 - 첫 접속은 서버를 깨우느라 10~30초 걸릴 수 있습니다.
 - 회원가입 → 로그인 → 영상 업로드 순서로 사용합니다.
@@ -115,6 +115,23 @@ modal deploy modal_app.py
 - 로그: `modal app logs mosaic-web --tail 100` (실시간은 `-f`)
 - 중지: `modal app stop mosaic-web`
 - 탭을 열어둔 채 방치하면 GPU가 계속 과금됩니다.
+
+### 서비스 주소 바꾸기
+
+Modal URL은 `https://<워크스페이스>--<label>.<리전>.modal.run` 형태입니다.
+`<label>`은 `modal_app.py`의 `modal.web_server(..., label="...")`로 정합니다.
+
+```python
+@modal.web_server(PORT, startup_timeout=600, label="mosaic")
+```
+
+`label`을 바꾸면 **URL도 바뀝니다.** 이전 주소는 404가 되므로, 공유 사이트에
+올린 링크가 있다면 함께 고쳐야 합니다. 바꾸고 나서 `modal deploy modal_app.py`
+로 다시 배포해야 적용됩니다.
+
+Modal 자체의 커스텀 도메인(`https://app.내도메인.com`)은 Team 플랜
+($250/월) 전용 기능입니다. Starter 플랜에서는 `modal.run` 주소만 쓸 수
+있습니다.
 
 ### Named Secret 만들고 갱신하기
 
