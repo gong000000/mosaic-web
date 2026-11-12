@@ -2,14 +2,28 @@
 
 영상에서 개인정보(얼굴, 차량번호판, 주소·간판, 명찰, 신분증, 휴대폰 화면,
 차량동승자)를 찾아 **목록으로 보여주고**, 사용자가 고른 항목만 실제
-모자이크 영상으로 렌더링하는 Streamlit 앱입니다.
+모자이크 영상으로 렌더링하는 Streamlit 앱입니다. GPU 서버(Modal)에 배포되어
+설치 없이 웹 브라우저로 사용합니다.
+
+## 웹에서 사용
+
+- 서비스 주소는 `modal deploy modal_app.py` 출력에 표시되는
+  `https://<워크스페이스>--mosaic-web-web.<리전>.modal.run` 입니다.
+  Modal 대시보드에서도 확인할 수 있습니다.
+- 주소만 열면 되고, 사용자 PC에 설치할 것은 없습니다.
+- 첫 접속은 서버를 깨우느라 10~30초 걸릴 수 있습니다.
+- 회원가입 → 로그인 → 영상 업로드 순서로 사용합니다.
+- 사용 후 브라우저 탭을 닫으면 약 5분 뒤 GPU가 자동으로 꺼집니다.
+- 계정과 결과는 서버 볼륨에 저장되어 재배포해도 유지됩니다.
+- 서비스 주소는 팀 내부에만 공유하세요. 회원가입이 열려 있어 링크를 아는
+  사람이 크레딧을 사용할 수 있습니다.
 
 ## 동작 흐름
 
 0. **회원가입 · 로그인**
    - 앱을 열면 먼저 로그인 화면이 나옵니다. 처음이면 `회원가입` 탭에서
      아이디(영문/숫자/_ 3~20자)와 비밀번호(8자 이상)를 등록합니다.
-   - 계정은 프로젝트 루트의 `users.db`(SQLite)에 저장되며, 비밀번호는
+   - 계정은 서버의 `users.db`(SQLite)에 저장되며, 비밀번호는
      PBKDF2-SHA256 + 사용자별 salt 해시로만 저장됩니다.
    - 로그인한 아이디별로 결과 파일과 `지난 작업` 기록이 분리됩니다.
 
@@ -58,131 +72,62 @@
 로딩/메모리를 줄이기 위해 제거했습니다. 코드 기본값도 `yolo11n-seg.pt`로
 맞춰 두어 구 호출 경로가 무거운 모델을 로딩하지 않습니다.
 
-## 설치
-
-CUDA GPU 환경:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r requirements-gpu.txt
-```
-
-CPU만 사용할 때:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-## VLM API 키 (Gemini 전용)
-
-VLM은 **Google Gemini 하나만** 사용합니다. 키는 프로젝트 루트의 `.env`
-파일에만 넣습니다. **키를 채팅이나 코드에 붙여넣지 마세요.**
-
-`.env.example`은 키를 넣는 파일이 아니라 **템플릿**입니다. 처음 한 번만
-`.env`로 복사해서 값을 채우면 됩니다. `.env.example`은 커밋용으로
-의도적으로 남겨둡니다. 실제 키는 `.env`에만 두고, `.env`는 `.gitignore`
-에 등록되어 있어 커밋되지 않습니다.
-
-```powershell
-Copy-Item .env.example .env
-notepad .env
-```
-
-`.env` 내용:
-
-```dotenv
-GEMINI_API_KEY=...
-```
-
-저장한 뒤 Streamlit을 재시작하면 앱이 키를 자동으로 읽습니다. 앱에는 키
-입력창이 없으며, 키 값은 화면과 로그에 출력하지 않습니다. 키가 없으면
-앱이 짧은 안내 문구를 보여주고 분석을 시작하지 않습니다.
-
-모델명을 바꾸려면 같은 파일에 `VLM_MODEL=...`을 추가합니다
-(기본값 `gemini-3-flash-preview`).
-
 ## 로그인 · 계정
 
 - 앱을 열면 로그인 화면이 먼저 표시됩니다. `회원가입` 탭에서 계정을 만든 뒤
   `로그인` 탭에서 접속합니다.
 - 아이디는 영문/숫자/_ 3~20자, 비밀번호는 8자 이상입니다.
-- 계정은 프로젝트 루트의 `users.db`(SQLite)에 자동 생성·저장되며,
-  `users.db`는 `.gitignore`에 등록되어 커밋되지 않습니다.
+- 계정은 서버 볼륨의 `users.db`(SQLite)에 자동 생성·저장됩니다.
 - 비밀번호는 PBKDF2-SHA256(20만 회) + 사용자별 salt 해시로 저장되고
   평문으로 저장하지 않습니다.
 - 5회 연속 실패하면 60초 동안 로그인이 잠깁니다.
 - 로그인 후 사이드바에서 현재 아이디를 확인하고 `로그아웃`할 수 있습니다.
 - 결과 파일은 `아이디--원본이름_시각_토큰.mp4`로 저장되며, `지난 작업`은
   현재 아이디로 시작하는 파일만 보여줍니다.
-- `users.db`를 지우면 모든 계정과 로그인 정보가 초기화됩니다(결과 영상은
-  `outputs/`에 그대로 남습니다).
 
-## 실행 · 접속
+## 운영 · 재배포 (Modal, GPU)
 
-프로젝트 폴더에서 Streamlit 서버를 실행합니다.
+가입 후 매월 $30 크레딧이 제공되고, 접속이 없으면 컨테이너가 자동으로
+내려가 GPU 비용이 계속 나가지 않습니다.
 
-```powershell
-cd C:\Users\gong0000\Desktop\mosaic-web
-.\.venv\Scripts\python.exe -m streamlit run app.py `
-  --server.port 8501 --server.address 127.0.0.1 --server.headless true
-```
-
-브라우저에서 **http://127.0.0.1:8501** 을 엽니다.
-
-- 같은 PC에서는 `http://localhost:8501`도 됩니다.
-- 서버 콘솔에 표시되는 `Local URL` / `Network URL`을 그대로 사용해도 됩니다.
-- 같은 네트워크의 다른 기기에서 접속하려면 `--server.address 0.0.0.0`으로
-  실행하고, Windows 방화벽에서 8501 포트를 허용한 뒤
-  `http://<서버 PC의 IP>:8501`로 접속합니다.
-- 서버를 끄려면 실행 중인 터미널에서 `Ctrl+C`를 누릅니다.
-- 코드를 수정한 뒤에는 서버를 다시 시작해야 반영됩니다.
-- 로그인 세션은 브라우저 탭에 유지되며, 서버를 재시작해도 계정(`users.db`)은
-  유지됩니다.
-
-## 클라우드 배포 (Modal, GPU)
-
-다른 컴퓨터에서 접속할 수 있도록 Modal에 올리는 방법입니다. 가입 후 매월
-$30 크레딧이 제공되고, 접속이 없으면 컨테이너가 자동으로 내려가 GPU 비용이
-계속 나가지 않습니다.
+최초 1회:
 
 ```powershell
 pip install modal python-dotenv
-modal setup                      # 브라우저에서 로그인 (최초 1회)
-modal deploy modal_app.py
+modal setup
 ```
 
-배포가 끝나면 출력에 `https://....modal.run` 주소가 표시됩니다. 이 주소를
-다른 컴퓨터에서 그대로 열면 됩니다.
+배포·재배포:
+
+```powershell
+modal deploy modal_app.py
+```
 
 - 첫 배포는 CUDA용 torch 이미지를 빌드하므로 10분 정도 걸릴 수 있습니다.
 - `users.db`와 `outputs/`는 Modal Volume `mosaic-data`에 저장됩니다.
   컨테이너가 재시작·재배포돼도 계정과 결과가 유지됩니다.
-- `GEMINI_API_KEY`는 로컬 `.env`에서 읽어 Secret으로 전달합니다. `.env`는
-  이미지에 포함되지 않습니다.
-- Streamlit 탭을 닫으면 약 5분 뒤 컨테이너가 내려갑니다. 탭을 열어둔 채
-  방치하면 GPU가 계속 과금되므로 사용 후 탭을 닫으세요.
-- GPU 사양은 `modal_app.py`의 `gpu="T4"`에서 바꿀 수 있습니다.
-- 로그 확인/중지: `modal app logs mosaic-web`, `modal app stop mosaic-web`.
+- `GEMINI_API_KEY`는 로컬 `.env`에서 읽어 Secret으로 전달합니다.
+  `.env`는 이미지에 포함되지 않고 커밋되지 않습니다.
+  모델명은 `.env`의 `VLM_MODEL`로 바꿉니다(기본 `gemini-3-flash-preview`).
+- GPU 사양은 `modal_app.py`의 `gpu="T4"`에서 바꿉니다.
+- 로그: `modal app logs mosaic-web --tail 100` (실시간은 `-f`)
+- 중지: `modal app stop mosaic-web`
+- 탭을 열어둔 채 방치하면 GPU가 계속 과금됩니다.
 
-## 실제 VLM 품질 확인
-
-키를 넣은 뒤 샘플 영상으로 분석 결과를 확인할 수 있습니다.
+### 로컬에서 실행 (개발용, 선택)
 
 ```powershell
-python scripts/live_vlm.py C:\Users\gong0000\Downloads\street.mp4
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements-gpu.txt   # CPU만 쓸 때는 requirements.txt
+python -m streamlit run app.py
 ```
 
-찾은 카테고리, 박스 수, 호출 시간, 어노테이션 이미지 저장 경로를 출력합니다.
-키가 없으면 실행을 거부하며 키를 출력하지 않습니다.
+`http://127.0.0.1:8501`에서 확인합니다. `.env`의 키를 그대로 사용합니다.
 
 ## 테스트
 
-VLM 스텁으로 키 없이 실행할 수 있습니다.
+로컬 환경에서 VLM 스텁으로 키 없이 실행할 수 있습니다.
 
 ```powershell
 python scripts/smoke.py
@@ -194,19 +139,20 @@ python scripts/robustness.py
 python scripts/apptest.py
 ```
 
-`authtest.py`는 임시 DB로 회원가입/로그인/비밀번호 해시 저장과 로그인
-화면 노출을 확인합니다(실제 `users.db`는 건드리지 않습니다).
-`apptest.py`는 로그인 세션을 주입한 뒤 업로드 → 분석 목록 →
-`모자이크 시작` → 결과 파일 생성 → 다운로드 버튼 노출까지 확인합니다.
+- `authtest.py`는 임시 DB로 회원가입/로그인/비밀번호 해시 저장과 로그인
+  화면 노출을 확인합니다(실제 `users.db`는 건드리지 않습니다).
+- `apptest.py`는 로그인 세션을 주입한 뒤 업로드 → 분석 목록 →
+  `모자이크 시작` → 결과 파일 생성 → 다운로드 버튼 노출까지 확인합니다.
+- `python scripts/live_vlm.py <영상 경로>`는 실제 Gemini 분석 결과를
+  확인합니다(키 필요).
 
 ## 개인정보 처리
 
-- 원본 영상은 로컬 임시 폴더에서만 처리됩니다.
+- 원본 영상은 실행 환경의 임시 폴더에서만 처리됩니다.
 - VLM에는 **샘플 프레임 이미지**만 전송하며 영상 파일 전체를 보내지 않습니다.
 - 결과 파일은 `outputs/`에 저장되며, 기본 24시간이 지난 파일은 앱 시작 시
-  자동 정리됩니다. 보관이 필요한 결과는 `outputs/` 밖으로 옮기세요.
-  테스트 산출물은 필요 없으면 `outputs/`에서 지워도 됩니다.
-- API 키는 환경변수/`.env`에서만 읽고 화면·로그·코드에 남기지 않습니다.
+  자동 정리됩니다. 보관이 필요한 결과는 다운로드해 두세요.
+- API 키는 환경변수/Secret에서만 읽고 화면·로그·코드에 남기지 않습니다.
 
 ## 프로젝트 구조
 
@@ -226,6 +172,7 @@ src/history.py              결과 기록
 src/retention.py            보관/삭제 정책
 requirements.txt            CPU/headless 의존성
 requirements-gpu.txt        CUDA GPU 의존성
+.env.example                Gemini 키 템플릿 (.env로 복사해 사용)
 configs/bytetrack_stable.yaml  ByteTrack 설정
 weights/
   yolo11n-seg.pt            앱 고정 person/vehicle 모델
