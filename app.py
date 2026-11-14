@@ -33,11 +33,18 @@ from src.auth import require_login
 
 # blur.me 스튜디오처럼 항상 빠른 고정 설정을 쓴다.
 FAST_MODEL = "yolo11n-seg.pt"
-FAST_IMGSZ = 480
+# imgsz 를 키우면 사람 마스크(세그먼트)가 정밀해져 모자이크가 사람
+# 형태에 더 정확히 붙는다. T4 에서도 충분히 빠르다.
+FAST_IMGSZ = 640
 FAST_STRIDE = 15
+# FAST_SAMPLES 는 균등 기본 샘플 수이고, 실제로는 여기에 '장면 전환'과
+# '움직임 피크' 샘플이 더해져 FAST_MAX_SAMPLES 까지 선택된다.
 FAST_SAMPLES = 4
+FAST_MAX_SAMPLES = 10
 FAST_PRESET = "veryfast"
 FAST_CONF = 0.20
+# 번호판 확대 탐지(차량 크롭) 허용 호출 수. 영상 1개 기준.
+FAST_PLATE_BUDGET = 10
 
 # 렌더 단계에서 VLM을 다시 호출하지 않는다. 체크리스트 분석 결과
 # (priors)와 YOLO 추적만으로 전체 영상을 만든다. 같은 영상에 VLM 비용을
@@ -85,6 +92,10 @@ def _friendly_vlm_error(err, api_key=""):
                 or "freetier" in compact):
             return ("Gemini 일일 호출 한도를 초과했습니다. "
                     "내일 다시 시도하거나 결제가 설정된 키를 사용하세요.")
+        if ("per minute" in low or "requestsperminute" in compact
+                or "rpm" in low):
+            return ("Gemini 분당 호출 한도에 걸렸습니다. 잠시 후 다시 "
+                    "시도하세요. 분석을 연속으로 많이 돌리면 걸릴 수 있습니다.")
         return ("Gemini 호출 한도를 초과했습니다. 잠시 후 다시 시도하거나 "
                 "더 짧은 영상을 사용하세요.")
     if "404" in msg or "model not found" in low:
@@ -464,7 +475,8 @@ if not api_key:
 
 key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
 analysis_key = (upload_id, tuple(CANDS), key_hash, vlm_base_url, vlm_model,
-                FAST_MODEL, FAST_IMGSZ, FAST_SAMPLES, trim_sig)
+                FAST_MODEL, FAST_IMGSZ, FAST_SAMPLES, FAST_MAX_SAMPLES,
+                FAST_PLATE_BUDGET, trim_sig)
 
 if st.button("다시 분석", key="reanalyze"):
     _invalidate_work()
@@ -481,7 +493,9 @@ if st.session_state.get("analysis_key") != analysis_key:
                 proc_in, detector, conf=FAST_CONF, imgsz=FAST_IMGSZ,
                 query_raw=prompt_raw, targets=list(CANDS),
                 api_key=api_key, vlm_model=vlm_model,
-                vlm_base_url=vlm_base_url, samples=FAST_SAMPLES)
+                vlm_base_url=vlm_base_url, samples=FAST_SAMPLES,
+                max_samples=FAST_MAX_SAMPLES,
+                plate_zoom_budget=FAST_PLATE_BUDGET)
         except Exception as e:
             err = e
     st.session_state["analysis_key"] = analysis_key

@@ -22,13 +22,13 @@ from types import SimpleNamespace
 
 from .config import (CATEGORY_TYPE, ROOT_DIR, VLM_MODEL, canon_category,
                      category_type, plausible_box)
-from .models import get_model
+from .models import MODEL_LOCK, get_model
 from .detect import filter_contained, big_enough, iou, region_has_detail
 from .faces import (FaceTracker, detect_faces, expand_face_box,
                     scene_signature, is_scene_cut)
 from .render import (render_person_strict, render_person_roi, render_region,
                      render_face_ellipse, mux_audio_h264, apply_area_limit,
-                     cleanup_tmp, FFmpegFrameWriter)
+                     cleanup_tmp, region_pad_for, FFmpegFrameWriter)
 from .select import VLMSelector
 from .vlm_budget import VLMBudget, classify_vlm_error
 
@@ -350,6 +350,60 @@ def _render_rel_boxes(frame, raw_box, rels, style, blocks, blur,
     return rendered
 
 
+def _head_area(px1, py1, px2, py2, ratio=0.32, inset=0.08):
+    """사람 박스에서 머리(상단) 영역을 대략 잡는다.
+
+    YuNet이 놓친 프로필/고개를 숙인 얼굴을 보완할 때 쓴다. 얼굴은
+    머리 안에 있으므로 머리 영역을 가리면 그 얼굴도 가려진다.
+    """
+    hh = max(1, int(py2) - int(py1))
+    hw = max(1, int(px2) - int(px1))
+    hx1 = int(px1) + int(hw * inset)
+    hx2 = int(px2) - int(hw * inset)
+    hy1 = int(py1)
+    hy2 = int(py1) + int(hh * ratio)
+    if hx2 - hx1 < 12 or hy2 - hy1 < 12:
+        return None
+    return [hx1, hy1, hx2, hy2]
+
+
+def _overlap_ratio(a, b):
+    """두 박스의 겹침 비율(작은 쪽 넓이 기준)."""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if inter <= 0:
+        return 0.0
+    aa = max(1, a[2] - a[0]) * max(1, a[3] - a[1])
+    ba = max(1, b[2] - b[0]) * max(1, b[3] - b[1])
+    return inter / float(max(1, min(aa, ba)))
+
+
+def _detect_person_boxes(model, frame, conf=0.30, imgsz=416):
+    """사람 박스만 찾는다. 머리 영역 fallback 에만 쓴다."""
+    if model is None or frame is None:
+        return []
+    try:
+        with MODEL_LOCK:
+            pr = list(model.predict(source=frame, conf=conf, classes=[0],
+                                    verbose=False, imgsz=int(imgsz),
+                                    max_det=30))[0]
+        if pr.boxes is None or len(pr.boxes) == 0:
+            return []
+        xy = pr.boxes.xyxy.cpu().numpy().astype(int)
+    except Exception:
+        return []
+    h, w = frame.shape[:2]
+    out = []
+    for x1, y1, x2, y2 in xy:
+        x1, y1 = max(0, int(x1)), max(0, int(y1))
+        x2, y2 = min(w, int(x2)), min(h, int(y2))
+        if x2 - x1 < 16 or y2 - y1 < 24:
+            continue
+        out.append((x1, y1, x2, y2))
+    return out
+
+
 class MosaicJob:
     """개인정보 보호 모자이크 작업 1건."""
 
@@ -462,11 +516,21 @@ class MosaicJob:
         tracker = FaceTracker(
             max_miss=max(30, int(round(fps * 1.0))),
             seed_miss=max(24, int(round(fps * 0.8))))
+        # YuNet은 프로필이나 고개를 숙인 얼굴을 자주 놓친다. 그 얼굴을
+        # 그대로 두면 프라이버시 목적을 놓치므로, 사람 박스 상단(머리)
+        # 영역을 fallback 으로 가린다. YuNet 이 이미 덮은 얼굴은 건너뛴다.
+        head_model = None
+        try:
+            head_model = get_model(self.model_name)
+            _reset_tracker(head_model)
+        except Exception:
+            head_model = None
         rendered_tids = set()
         track_frames = defaultdict(int)
         rendered_cats = set()
         rendered_region_cats = set()
         max_active = 0
+        fallback_heads = 0
         prev_sig = None
         done = 0
         t0 = time.time()
@@ -512,6 +576,23 @@ class MosaicJob:
                             track_frames[track.tid] += 1
                             rendered_cats.add("face")
 
+                    # YuNet 이 놓친 얼굴 보완: 사람이 있는데 그 머리
+                    # 영역에 YuNet 얼굴이 없으면 머리를 가린다.
+                    if head_model is not None:
+                        for px1, py1, px2, py2 in _detect_person_boxes(
+                                head_model, frame):
+                            head = _head_area(px1, py1, px2, py2)
+                            if not head:
+                                continue
+                            if any(_overlap_ratio(head, t.box) > 0.30
+                                   for t in active):
+                                continue
+                            if render_face_ellipse(
+                                    frame, *head, style=style, blocks=blocks,
+                                    blur=blur):
+                                fallback_heads += 1
+                                rendered_cats.add("face")
+
                     sidx = done // stride
                     for cat in targets:
                         if cat == "face" or _cat_type(cat) != "region":
@@ -529,7 +610,8 @@ class MosaicJob:
                             if render_region(frame, x1, y1, x2, y2,
                                              style=style, blocks=blocks,
                                              blur=blur,
-                                             pad=24 if cat == "license_plate" else 8):
+                                             pad=region_pad_for(
+                                                 cat, x2 - x1, y2 - y1)):
                                 rendered_region_cats.add(cat)
                                 rendered_cats.add(cat)
 
@@ -586,6 +668,7 @@ class MosaicJob:
         stats["_cats"] = sorted(rendered_cats)
         stats["_untracked"] = []
         stats["_faces"] = int(max_active)
+        stats["_head_fallbacks"] = int(fallback_heads)
         stats["_vlm_calls"] = 0
         stats["_vlm_errors"] = 0
         return stats
@@ -1387,7 +1470,8 @@ class MosaicJob:
                         if render_region(frame, x1, y1, x2, y2,
                                          style=style, blocks=blocks,
                                          blur=blur,
-                                         pad=24 if cat == "license_plate" else 8):
+                                         pad=region_pad_for(
+                                             cat, x2 - x1, y2 - y1)):
                             rendered_region_cats.add(cat)
                             rendered_cats.add(cat)
 

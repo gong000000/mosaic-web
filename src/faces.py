@@ -38,12 +38,13 @@ def _clip_box(box, width, height):
     return [x1, y1, x2, y2]
 
 
-def expand_face_box(box, width, height, side=0.12, top=0.08,
-                    bottom=0.24):
+def expand_face_box(box, width, height, side=0.06, top=0.05,
+                    bottom=0.15):
     """YuNet/VLM의 타이트한 얼굴 박스를 입·턱까지 덮도록 넓힌다.
 
     얼굴 검출기는 입꼬리 아래를 조금 남기는 경우가 많다. 좌우보다 아래를
-    더 넓혀 P4처럼 입이 살짝 보이는 문제를 막는다.
+    더 넓혀 P4처럼 입이 살짝 보이는 문제를 막는다. 단, 너무 넓히면
+    목·어깨까지 타원으로 번지므로 확장량은 작게 유지한다.
     """
     x1, y1, x2, y2 = [float(v) for v in box]
     w, h = max(1.0, x2 - x1), max(1.0, y2 - y1)

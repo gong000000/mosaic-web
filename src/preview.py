@@ -12,6 +12,8 @@ from .config import (CANDS, CATEGORY_TYPE, VLM_MODEL, canon_category,
 from .detect import (filter_contained, big_enough, iou, match_box,
                      region_has_detail)
 from .faces import detect_faces
+from .refine import tighten_region_box
+from .sampling import plan_samples
 from .select import VLMSelector
 from .models import MODEL_LOCK
 from .vlm_budget import VLMBudget, classify_vlm_error
@@ -199,7 +201,7 @@ def _detect_vehicles(model, frame, imgsz):
 
 
 def _refine_plates(frame, vlm_boxes, model, imgsz, api_key, vlm_model,
-                   vlm_base_url, max_calls=2, max_vehicles=4,
+                   vlm_base_url, max_calls=2, max_vehicles=6,
                    budget: VLMBudget | None = None, cancel_event=None):
     """VLM이 전체 프레임에서 번호판을 놓쳤을 때, 차량 크롭을 확대해
     번호판 전용 VLM 호출을 한다. 찾은 박스는 원본 좌표로 되돌린다.
@@ -373,6 +375,13 @@ def analyze_first_frame_items(frame, model, conf, imgsz,
         if rtype == "region" and not region_has_detail(frame, box["xyxy"],
                                                        cat):
             continue
+        # VLM이 너무 넓게 잡은 영역(번호판 등)은 실제로 정보가 있는 부분에
+        # 맞춰 줄인다. 모자이크가 글자 바깥까지 퍼지지 않게 한다.
+        if rtype == "region":
+            tightened = tighten_region_box(frame, box["xyxy"], cat)
+            if tightened != list(box["xyxy"]):
+                box = dict(box)
+                box["xyxy"] = tightened
         if cat in prompt_set:
             box = dict(box)
             box["matches_prompt"] = True
@@ -436,10 +445,17 @@ def _merge_items(all_items, person_total=0):
 def analyze_video(video_path, model, conf, imgsz,
                   query_raw="", targets=None, api_key=None,
                   vlm_model=VLM_MODEL, samples=12, vlm_base_url=None,
-                  plate_zoom_budget=6, parallel_workers=3):
-    """영상 앞/중간/끝을 고르게 샘플링해 체크리스트 항목을 만든다.
-    샘플 프레임들을 ThreadPoolExecutor로 병렬 처리한다. 각 워커는
-    해당 프레임만 읽고 VLM을 호출해 독립적으로 결과를 낸다.
+                  plate_zoom_budget=10, parallel_workers=3,
+                  max_samples=10, sample_plan=None):
+    """영상의 개인정보 후보를 찾아 체크리스트 항목을 만든다.
+
+    샘플 프레임은 균등 배치만 쓰지 않는다. 균등 기본 샘플에 더해
+    '장면 전환 직후'와 '움직임 피크' 프레임을 섞어, 짧게 스치는
+    개인정보도 잡는다(src/sampling.py).
+
+    samples       : 균등 기본 샘플 수
+    max_samples   : 전체 샘플 상한 (기본 샘플 + 컷 + 움직임 피크)
+    sample_plan   : 미리 계산한 샘플 계획(dict). 테스트용.
     returns (anno_bgr, persons, items). 첫 샘플 화면을 미리보기로 쓴다.
     """
     cap = cv2.VideoCapture(video_path)
@@ -455,12 +471,21 @@ def analyze_video(video_path, model, conf, imgsz,
             frame, model, conf, imgsz, query_raw=query_raw, targets=targets,
             api_key=api_key, vlm_model=vlm_model, vlm_base_url=vlm_base_url,
             frame_idx=0)
+    cap.release()
+
     n = max(1, int(samples))
-    idxs = sorted(set(int(round(v))
-                      for v in np.linspace(0, max(0, total - 1), n)))
+    if sample_plan is None:
+        sample_plan = plan_samples(video_path, base_count=n,
+                                   max_count=max(n, int(max_samples)))
+    idxs = sorted({int(i) for i in (sample_plan.get("indices") or [])
+                   if 0 <= int(i) < total})
+    if not idxs:
+        idxs = sorted({int(round(v))
+                       for v in np.linspace(0, max(0, total - 1), n)})
 
     # 병렬 처리를 위해 프레임 비트맵을 사전에 읽어 둔다.
     frames = []
+    cap = cv2.VideoCapture(video_path)
     for idx in idxs:
         cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
         ok, frame = cap.read()

@@ -105,9 +105,12 @@ def region_has_detail(frame, box, cat):
         edges = cv2.Canny(gray, 45, 135)
         edge_ratio = float(np.count_nonzero(edges)) / float(edges.size)
         spread = float(gray.std())
-        if edge_ratio >= 0.012:
+        # 임계값을 너무 높이면 흐릿한 화면(야간 CCTV)에서 진짜 간판을
+        # '빈 벽'으로 버린다. 오탐은 렌더 단계의 작은 여백과 겹침 제거로
+        # 막을 수 있으므로 여기서는 실제 항목을 최대한 살린다.
+        if edge_ratio >= 0.008:
             return True
-        return spread >= 28.0 and edge_ratio >= 0.006
+        return spread >= 22.0 and edge_ratio >= 0.004
     except Exception:
         return True
 

@@ -209,24 +209,26 @@ def env_api_key():
 
 # VLM이 돌려준 박스가 실제 개인정보 영역으로 보이는지 확인하는 상한.
 # 좌표 스케일을 잘못 해석하면 프레임 절반을 덮는 거대한 박스가 생기는데,
-# 이런 박스는 모자이크하지 않는 편이 낫다.
+# 이런 박스는 모자이크하지 않는 편이 낫다. 다만 상한을 너무 낮게 잡으면
+# 실제로 맞는 항목(근접 얼굴, 큰 명찰 등)이 통째로 버려지므로, 오탐만
+# 막을 만큼만 제한한다.
 _MAX_BOX_AREA = {
-    "face": 0.16,
-    "license_plate": 0.20,
-    "address": 0.22,
-    "passenger": 0.35,
-    "name_tag": 0.10,
-    "id_card": 0.18,
-    "phone_screen": 0.14,
+    "face": 0.22,
+    "license_plate": 0.28,
+    "address": 0.30,
+    "passenger": 0.40,
+    "name_tag": 0.16,
+    "id_card": 0.26,
+    "phone_screen": 0.22,
 }
 _MAX_BOX_ASPECT = {
-    "face": 1.8,
-    "license_plate": 10.0,
-    "address": 14.0,
-    "passenger": 4.0,
-    "name_tag": 10.0,
-    "id_card": 8.0,
-    "phone_screen": 8.0,
+    "face": 2.2,
+    "license_plate": 14.0,
+    "address": 16.0,
+    "passenger": 5.0,
+    "name_tag": 12.0,
+    "id_card": 10.0,
+    "phone_screen": 10.0,
 }
 
 

@@ -17,7 +17,7 @@ import cv2
 from .config import (CANDS, GENERIC_CATEGORIES, VLM_MODEL, canon_category,
                      categories_in_text, category_type, label_ko,
                      plausible_box)
-from .vlm_budget import VLMRetryPolicy, classify_vlm_error
+from .vlm_budget import (VLMRetryPolicy, classify_vlm_error, throttle)
 
 VLM_MAX_W = 1920
 VLM_TIMEOUT = 90
@@ -466,6 +466,8 @@ def detect_with_vlm(frame_bgr, phrases, api_key, model=VLM_MODEL,
                 # Gemini 3는 내부 추론에 출력 한도를 먼저 쓰므로 추론량을 낮추고
                 # 한도를 넉넉히 준다. 추론량이 크면 JSON이 중간에 잘린다.
                 extra["reasoning_effort"] = "low"
+            # 무료 티어의 분당 요청 한도를 넘지 않도록 호출을 분산한다.
+            throttle().acquire()
             response = client.chat.completions.create(
                 model=model,
                 messages=[
@@ -513,15 +515,17 @@ def detect_with_vlm(frame_bgr, phrases, api_key, model=VLM_MODEL,
         except VLMError as e:
             last_error = e
             category = classify_vlm_error(e)
-            # 한도 초과나 인증 오류는 재시도해도 소용없음.
+            # 일일 한도나 인증 오류는 재시도해도 소용없다.
             if category in ("quota_exceeded", "auth_error",
                             "model_not_found"):
                 raise
-            # 5xx 서버 오류 또는 파싱 오류는 재시도 대상.
+            # 분당 한도(429)는 기다리면 풀리므로 재시도한다.
             if not retry.should_retry(e, attempt):
                 raise
             if attempt < max_retries:
-                delay = retry.delay(attempt)
+                delay = (retry.rate_limit_delay
+                         if category == "rate_limited"
+                         else retry.delay(attempt))
                 time.sleep(delay)
                 continue
             raise
@@ -535,7 +539,9 @@ def detect_with_vlm(frame_bgr, phrases, api_key, model=VLM_MODEL,
             if not retry.should_retry(e, attempt):
                 raise VLMError(f"VLM 호출 실패: {e}") from e
             if attempt < max_retries:
-                delay = retry.delay(attempt)
+                delay = (retry.rate_limit_delay
+                         if category == "rate_limited"
+                         else retry.delay(attempt))
                 time.sleep(delay)
                 continue
             raise VLMError(f"VLM 호출 실패(재시도 {max_retries}회 후): {e}") from e

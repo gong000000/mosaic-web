@@ -151,10 +151,17 @@ class FFmpegFrameWriter:
 
 
 def mosaic_block_size(w, h, blocks=30):
-    """강도(blocks)에 따른 정사각 블록 크기(px). 클수록 더 강하게 가린다."""
+    """강도(blocks)에 따른 정사각 블록 크기(px).
+
+    블록 크기는 ROI 크기에 비례해 정하지 않는다. 작은 축을 몇 개로
+    나눌지(블록 개수)를 정하고, 거기서 블록 크기를 계산한다. 그래야
+    얼굴 같은 작은 영역도 형태가 남고, 큰 간판은 너무 거칠어지지
+    않는다. 단, 블록을 너무 잘게 나누면 눈·입 위치가 남아 사람이
+    구분되므로 개수는 12개 이내로 제한한다.
+    """
     strength = max(1, int(blocks))
-    div = max(2.0, 180.0 / strength)
-    return max(2, int(round(min(w, h) / div)))
+    count = max(4.0, min(12.0, strength / 3.0))
+    return max(3, int(round(min(w, h) / count)))
 
 
 def render_mosaic(roi, style="pixel", blocks=30, blur=61):
@@ -179,9 +186,8 @@ def render_mosaic(roi, style="pixel", blocks=30, blur=61):
 def feather_mask(mask_u8):
     """마스크 경계를 부드럽게 만든다. 성능을 위해 커널을 작게 유지한다."""
     m = mask_u8.astype(np.uint8)
-    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-    m = cv2.dilate(m, np.ones((3, 3), np.uint8), iterations=1)
-    return cv2.GaussianBlur(m, (9, 9), 0)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    return cv2.GaussianBlur(m, (5, 5), 0)
 
 
 def mux_audio_h264(video_noaudio, audio_src, output_path, preset="veryfast"):
@@ -298,6 +304,21 @@ def cleanup_tmp(*paths):
             pass
 
 
+def region_pad_for(cat, w, h):
+    """영역(번호판 등) 모자이크에 붙일 여백 px.
+
+    번호판은 크기가 작아서 여백을 많이 주면 범퍼/등 전체가 번져 보인다.
+    물체 크기에 비례해 아주 작게 붙인다.
+    """
+    w = max(1, int(w))
+    h = max(1, int(h))
+    if cat == "license_plate":
+        return int(max(2, min(8, 0.10 * min(w, h))))
+    if cat == "phone_screen":
+        return int(max(2, min(8, 0.05 * min(w, h))))
+    return 4
+
+
 def render_region(frame, x1, y1, x2, y2, style="pixel", blocks=30, blur=61, pad=6):
     """사람과 무관한 배경 영역(번호판·간판·문서 등)을 사각형으로 가린다."""
     x1c, y1c = max(0, int(x1) - pad), max(0, int(y1) - pad)
@@ -382,6 +403,29 @@ def _area_ratio(area_mode, w=None, h=None):
     return 1.0
 
 
+def _mosaic_on_masked_rows(roi_f, m, style, blocks, blur):
+    """마스크가 실제로 잡힌 행만 모아 모자이크를 만든다.
+
+    사람 전체 크기로 모자이크를 만들면 블록이 너무 커져 얼굴이 몇 개
+    덩어리로 뭉개진다. 가리는 영역(마스크가 켜진 행) 높이를 기준으로
+    모자이크를 만들어 블록 크기가 실제 얼굴 크기에 맞게 한다.
+    roi_f는 frame 의 뷰이므로 직접 덮어써도 된다.
+    """
+    rows = np.nonzero(m.any(axis=1))[0]
+    if rows.size == 0:
+        return False
+    top = int(rows[0])
+    bottom = int(rows[-1]) + 1
+    src = roi_f[top:bottom]
+    mos = render_mosaic(src, style=style, blocks=blocks, blur=blur)
+    m_sub = m[top:bottom]
+    mf = (m_sub.astype(float) / 255.0)[..., None]
+    if mf.mean() < 0.05:
+        return False
+    roi_f[top:bottom] = (mos * mf + src * (1 - mf)).astype(np.uint8)
+    return True
+
+
 def render_person_roi(frame, x1, y1, x2, y2, mask_roi, style="pixel",
                       blocks=30, blur=61, area_mode="full"):
     """ROI 크기에 맞춰 둔 마스크로 사람을 가린다.
@@ -416,12 +460,7 @@ def render_person_roi(frame, x1, y1, x2, y2, mask_roi, style="pixel",
                             area_mode, x2c - x1c, y2c - y1c))
                     if allowed_h < m.shape[0]:
                         m[allowed_h:, :] = 0
-                mos = render_mosaic(roi_f, style=style, blocks=blocks,
-                                    blur=blur)
-                mf = (m.astype(float) / 255.0)[..., None]
-                if mf.mean() >= 0.05:
-                    frame[y1c:y2c, x1c:x2c] = (mos * mf
-                                               + roi_f * (1 - mf)).astype(np.uint8)
+                if _mosaic_on_masked_rows(roi_f, m, style, blocks, blur):
                     return True
         except Exception:
             pass
@@ -460,12 +499,8 @@ def render_person_strict(frame, x1, y1, x2, y2, mask_full_or_None,
                 # pixel은 하드 경계가 자연스러워 페더링을 생략한다.
                 m = mc if style == "pixel" else feather_mask(mc)
                 roi_f = frame[y1c:y2c, x1c:x2c]
-                mos = render_mosaic(roi_f, style=style, blocks=blocks, blur=blur)
-                mf = (m.astype(float) / 255.0)[..., None]
-                if mf.mean() < 0.05:
-                    raise ValueError("mask too small")
-                frame[y1c:y2c, x1c:x2c] = (mos * mf + roi_f * (1 - mf)).astype(np.uint8)
-                return True
+                if _mosaic_on_masked_rows(roi_f, m, style, blocks, blur):
+                    return True
         except Exception:
             pass
     return render_person_ellipse(frame, x1c, y1c, x2c, y2c, style=style,
