@@ -17,3 +17,4 @@ outputs/jobs.db-*
 !.env.example
 *.log
 users.db
+docs/*.mp4
