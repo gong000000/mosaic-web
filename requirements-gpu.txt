@@ -4,7 +4,7 @@ opencv-python-headless==5.0.0.93
 streamlit==1.65.0
 numpy==2.2.6
 imageio-ffmpeg==0.6.0
-torch==2.6.0
+torch==2.12.1+cpu
 torchvision==0.21.0
 # 얼굴 개인별 실루엣용 랜드마크. 없으면 고정 얼굴형으로 대체된다.
 mediapipe==1.2.3
