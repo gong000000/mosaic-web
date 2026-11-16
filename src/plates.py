@@ -164,7 +164,8 @@ def filter_by_vehicles(plates, vehicles, margin=0.10):
 
 
 class _PlateTrack:
-    __slots__ = ("pid", "box", "score", "misses", "hits", "vel", "age")
+    __slots__ = ("pid", "box", "score", "misses", "hits", "vel", "age",
+                 "committed_box", "pending_box", "pending_vel", "pending_age")
 
     def __init__(self, pid, box, score):
         self.pid = int(pid)
@@ -174,6 +175,22 @@ class _PlateTrack:
         self.hits = 1
         self.vel = [0.0, 0.0, 0.0, 0.0]
         self.age = 0
+        self.committed_box = [float(v) for v in box]
+        self.pending_box = None
+        self.pending_vel = [0.0, 0.0, 0.0, 0.0]
+        self.pending_age = 0
+
+    def clear_pending(self):
+        self.pending_box = None
+        self.pending_vel = [0.0, 0.0, 0.0, 0.0]
+        self.pending_age = 0
+
+    @staticmethod
+    def union_box(a, b):
+        return [min(float(a[0]), float(b[0])),
+                min(float(a[1]), float(b[1])),
+                max(float(a[2]), float(b[2])),
+                max(float(a[3]), float(b[3]))]
 
 
 class PlateTracker:
@@ -182,12 +199,20 @@ class PlateTracker:
     예전에는 검출 리스트를 통째로 덮어써서, 화면에 2대가 있을 때 1대가
     한 프레임만 놓치면 그 번호판이 즉시 사라져 깜빡였다. 트랙마다
     광학 흐름으로 이동시키고 max_miss까지 유지한다.
+    큰 박스 변화는 얼굴과 같은 sticky 규칙으로 2프레임 확인 후 확정한다.
     """
 
-    def __init__(self, max_miss=24, iou_thresh=0.15, max_dist=0.9):
+    def __init__(self, max_miss=24, iou_thresh=0.15, max_dist=0.9,
+                 sticky=True, sticky_center=0.15, sticky_scale=0.20,
+                 pending_center=0.45, pending_scale=0.35):
         self.max_miss = max(1, int(max_miss))
         self.iou_thresh = float(iou_thresh)
         self.max_dist = float(max_dist)
+        self.sticky = bool(sticky)
+        self.sticky_center = max(0.01, float(sticky_center))
+        self.sticky_scale = max(0.01, float(sticky_scale))
+        self.pending_center = max(self.sticky_center, float(pending_center))
+        self.pending_scale = max(self.sticky_scale, float(pending_scale))
         self.tracks = {}
         self.next_id = 1
 
@@ -195,15 +220,73 @@ class PlateTracker:
     def _center(box):
         return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
 
-    def _match(self, det, track):
-        iou = _iou(det, track.box)
+    @staticmethod
+    def _pred_box(box, vel):
+        return [float(box[i]) + float(vel[i]) for i in range(4)]
+
+    def _change_ok(self, det, ref, center=None, scale=None):
+        if ref is None:
+            return False
+        bw = max(1.0, float(ref[2]) - float(ref[0]))
+        bh = max(1.0, float(ref[3]) - float(ref[1]))
+        bw2 = max(1.0, float(det[2]) - float(det[0]))
+        bh2 = max(1.0, float(det[3]) - float(det[1]))
+        cx, cy = self._center(det)
+        rx, ry = self._center(ref)
+        dist = ((cx - rx) ** 2 + (cy - ry) ** 2) ** 0.5 / max(bw, bh)
+        c = self.sticky_center if center is None else float(center)
+        s = self.sticky_scale if scale is None else float(scale)
+        return (dist <= c
+                and abs(bw2 / bw - 1.0) <= s
+                and abs(bh2 / bh - 1.0) <= s)
+
+    def _pending_pred(self, t):
+        return self._pred_box(t.pending_box, t.pending_vel)
+
+    def _pending_matches(self, det, t):
+        if t.pending_box is None:
+            return False
+        return (self._change_ok(det, t.pending_box,
+                                self.pending_center, self.pending_scale)
+                or self._change_ok(det, self._pending_pred(t),
+                                   self.pending_center, self.pending_scale)
+                or _iou(det, t.pending_box) >= 0.35)
+
+    def _commit(self, t, det, smooth=True):
+        new = [float(v) for v in det]
+        # 검출 지터를 조금만 섞어 타일이 떨리지 않게 한다.
+        if smooth and t.hits >= 2:
+            new = [0.8 * new[i] + 0.2 * t.committed_box[i]
+                   for i in range(4)]
+        t.vel = [0.6 * (new[i] - t.committed_box[i])
+                 + 0.4 * t.vel[i] for i in range(4)]
+        t.committed_box = list(new)
+        t.box = list(new)
+        t.misses = 0
+        t.hits += 1
+        t.age = 0
+        t.clear_pending()
+
+    def _set_pending(self, t, det):
+        t.pending_box = [float(v) for v in det]
+        t.pending_vel = [t.pending_box[i] - t.committed_box[i]
+                         for i in range(4)]
+        t.pending_age = 0
+        t.box = t.union_box(t.committed_box, t.pending_box)
+        t.misses = 0
+        t.hits += 1
+        t.age = 0
+
+    def _match(self, det, track, ref=None):
+        if ref is None:
+            ref = track.committed_box
+        iou = _iou(det, ref)
         if iou >= self.iou_thresh:
             return iou
         cx, cy = self._center(det)
-        tx, ty = self._center(track.box)
+        tx, ty = self._center(ref)
         size = max(1.0, det[2] - det[0], det[3] - det[1],
-                   track.box[2] - track.box[0],
-                   track.box[3] - track.box[1])
+                   ref[2] - ref[0], ref[3] - ref[1])
         dist = ((cx - tx) ** 2 + (cy - ty) ** 2) ** 0.5 / size
         if dist <= self.max_dist:
             return 1.0 - dist
@@ -218,22 +301,26 @@ class PlateTracker:
             for t in self.tracks.values():
                 if t.pid in used:
                     continue
-                s = self._match(det, t)
-                if s > best_score:
-                    best, best_score = t, s
+                refs = [t.committed_box]
+                if t.pending_box is not None:
+                    refs.append(t.pending_box)
+                for ref in refs:
+                    s = self._match(det, t, ref=ref)
+                    if s > best_score:
+                        best, best_score = t, s
             if best is not None:
                 used.add(best.pid)
-                new = [float(v) for v in det]
-                # 검출 지터를 조금만 섞어 타일이 떨리지 않게 한다.
-                if best.hits >= 2:
-                    new = [0.8 * new[i] + 0.2 * best.box[i]
-                           for i in range(4)]
-                best.vel = [0.6 * (new[i] - best.box[i])
-                            + 0.4 * best.vel[i] for i in range(4)]
-                best.box = new
-                best.misses = 0
-                best.hits += 1
-                best.age = 0
+                raw = [float(v) for v in det]
+                expected = self._pred_box(best.committed_box, best.vel)
+                if (not self.sticky
+                        or self._change_ok(raw, best.committed_box)
+                        or self._change_ok(raw, expected)
+                        or self._pending_matches(raw, best)):
+                    self._commit(
+                        best, raw,
+                        smooth=not self._pending_matches(raw, best))
+                else:
+                    self._set_pending(best, raw)
             else:
                 t = _PlateTrack(self.next_id, det, 1.0)
                 self.tracks[t.pid] = t
@@ -245,16 +332,28 @@ class PlateTracker:
                 continue
             t.misses += 1
             t.age += 1
+            old = list(t.committed_box)
             moved = None
             if gray is not None and prev_gray is not None:
                 try:
-                    moved = shift_box(prev_gray, gray, t.box)
+                    moved = shift_box(prev_gray, gray, old)
                 except Exception:
                     moved = None
             if moved is None:
                 decay = 0.85 ** t.misses
-                moved = [t.box[i] + t.vel[i] * decay for i in range(4)]
-            t.box = [float(v) for v in moved]
+                moved = [old[i] + t.vel[i] * decay for i in range(4)]
+            new_committed = [float(v) for v in moved]
+            delta = [new_committed[i] - old[i] for i in range(4)]
+            t.committed_box = new_committed
+            if t.pending_box is not None:
+                t.pending_box = [t.pending_box[i] + delta[i]
+                                 for i in range(4)]
+                t.pending_age += 1
+                if t.pending_age > 2:
+                    t.clear_pending()
+            t.box = (t.union_box(t.committed_box, t.pending_box)
+                     if t.pending_box is not None
+                     else list(t.committed_box))
             if t.misses > self.max_miss:
                 self.tracks.pop(pid, None)
 

@@ -494,6 +494,32 @@ class FaceTrack:
     seeded: bool = False
     angle: float = 0.0
     vel: list = field(default_factory=lambda: [0.0, 0.0, 0.0, 0.0])
+    # sticky box: 큰 변화는 2프레임 확인 후 확정한다. 확인 전에는
+    # committed와 pending의 합집합을 그려서 움직인 쪽도 노출하지 않는다.
+    committed_box: list = None
+    pending_box: list = None
+    pending_angle: float = 0.0
+    pending_vel: list = field(default_factory=lambda: [0.0, 0.0, 0.0, 0.0])
+    pending_hits: int = 0
+    pending_age: int = 0
+
+    def __post_init__(self):
+        if not self.committed_box:
+            self.committed_box = [float(v) for v in self.box]
+
+    def clear_pending(self):
+        self.pending_box = None
+        self.pending_angle = 0.0
+        self.pending_vel = [0.0, 0.0, 0.0, 0.0]
+        self.pending_hits = 0
+        self.pending_age = 0
+
+    @staticmethod
+    def union_box(a, b):
+        return [min(float(a[0]), float(b[0])),
+                min(float(a[1]), float(b[1])),
+                max(float(a[2]), float(b[2])),
+                max(float(a[3]), float(b[3]))]
 
     def speed(self):
         """박스 중심의 프레임당 이동 속도(px)."""
@@ -515,10 +541,17 @@ class FaceTrack:
 class FaceTracker:
     """짧은 누락을 버티는 얼굴 트랙."""
 
-    def __init__(self, max_miss=45, seed_miss=24, iou_thresh=0.20):
+    def __init__(self, max_miss=45, seed_miss=24, iou_thresh=0.20,
+                 sticky=True, sticky_center=0.13, sticky_scale=0.15,
+                 pending_center=0.40, pending_scale=0.30):
         self.max_miss = max(1, int(max_miss))
         self.seed_miss = max(1, int(seed_miss))
         self.iou_thresh = float(iou_thresh)
+        self.sticky = bool(sticky)
+        self.sticky_center = max(0.01, float(sticky_center))
+        self.sticky_scale = max(0.01, float(sticky_scale))
+        self.pending_center = max(self.sticky_center, float(pending_center))
+        self.pending_scale = max(self.sticky_scale, float(pending_scale))
         self.tracks = {}
         self.next_id = 1
 
@@ -526,20 +559,86 @@ class FaceTracker:
     def _center(box):
         return ((box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0)
 
-    def _match_score(self, box, track):
-        iou = _box_iou(box, track.box)
+    @staticmethod
+    def _pred_box(box, vel):
+        return [float(box[i]) + float(vel[i]) for i in range(4)]
+
+    def _change(self, box, ref):
+        bw = max(1.0, float(ref[2]) - float(ref[0]))
+        bh = max(1.0, float(ref[3]) - float(ref[1]))
+        bw2 = max(1.0, float(box[2]) - float(box[0]))
+        bh2 = max(1.0, float(box[3]) - float(box[1]))
+        cx, cy = self._center(box)
+        rx, ry = self._center(ref)
+        dist = ((cx - rx) ** 2 + (cy - ry) ** 2) ** 0.5 / max(bw, bh)
+        return dist, bw2 / bw, bh2 / bh
+
+    def _change_ok(self, box, ref, center=None, scale=None):
+        if ref is None:
+            return False
+        dist, wr, hr = self._change(box, ref)
+        c = self.sticky_center if center is None else float(center)
+        s = self.sticky_scale if scale is None else float(scale)
+        return (dist <= c
+                and abs(wr - 1.0) <= s
+                and abs(hr - 1.0) <= s)
+
+    def _is_small_change(self, box, ref):
+        return self._change_ok(box, ref)
+
+    def _pending_pred(self, track):
+        return self._pred_box(track.pending_box, track.pending_vel)
+
+    def _pending_matches(self, box, track):
+        if track.pending_box is None:
+            return False
+        return (self._change_ok(box, track.pending_box,
+                                self.pending_center, self.pending_scale)
+                or self._change_ok(box, self._pending_pred(track),
+                                   self.pending_center, self.pending_scale)
+                or _box_iou(box, track.pending_box) >= 0.35)
+
+    def _set_pending(self, track, box, angle, score):
+        track.pending_box = [float(v) for v in box]
+        track.pending_angle = float(angle)
+        track.pending_vel = [track.pending_box[i] - track.committed_box[i]
+                             for i in range(4)]
+        track.pending_hits = 1
+        track.pending_age = 0
+        track.box = track.union_box(track.committed_box, track.pending_box)
+        track.misses = 0
+        track.hits += 1
+        track.score = float(score)
+
+    def _commit(self, track, box, angle, score):
+        raw_vel = [float(box[i]) - float(track.committed_box[i])
+                   for i in range(4)]
+        track.vel = [0.6 * raw_vel[i] + 0.4 * track.vel[i]
+                     for i in range(4)]
+        track.committed_box = [float(v) for v in box]
+        track.box = list(track.committed_box)
+        track.angle = float(angle)
+        track.score = float(score)
+        track.misses = 0
+        track.hits += 1
+        track.seeded = False
+        track.clear_pending()
+
+    def _match_score(self, box, track, ref=None):
+        if ref is None:
+            ref = track.committed_box
+        iou = _box_iou(box, ref)
         if iou >= self.iou_thresh:
             return iou
         cx, cy = self._center(box)
-        tx, ty = self._center(track.box)
+        tx, ty = self._center(ref)
         bw = max(1.0, box[2] - box[0], box[3] - box[1])
-        tw = max(1.0, track.box[2] - track.box[0],
-                 track.box[3] - track.box[1])
+        tw = max(1.0, ref[2] - ref[0], ref[3] - ref[1])
         scale = max(bw, tw)
         dist = ((cx - tx) ** 2 + (cy - ty) ** 2) ** 0.5 / scale
         area_ratio = ((box[2] - box[0]) * (box[3] - box[1])
-                      / max(1.0, (track.box[2] - track.box[0])
-                            * (track.box[3] - track.box[1])))
+                      / max(1.0, (ref[2] - ref[0])
+                            * (ref[3] - ref[1])))
         if dist <= 0.95 and 0.10 <= area_ratio <= 10.0:
             return 1.0 - dist
         return 0.0
@@ -563,11 +662,14 @@ class FaceTracker:
             if score_match > best_score:
                 best, best_score = track, score_match
         if best is not None:
-            best.box = FaceBox(box, angle=ang or best.angle)
+            ang = float(ang or best.angle)
+            best.committed_box = [float(v) for v in box]
+            best.box = FaceBox(best.committed_box, angle=ang)
             best.score = max(best.score, float(score))
             best.misses = 0
-            best.angle = float(ang or best.angle)
+            best.angle = ang
             best.seeded = False
+            best.clear_pending()
             return best
         return self._new_track(box, score, seeded=True, angle=ang)
 
@@ -593,28 +695,35 @@ class FaceTracker:
             for track in self.tracks.values():
                 if track.tid in used:
                     continue
-                match = self._match_score(box, track)
-                if match > best_score:
-                    best, best_score = track, match
+                refs = [track.committed_box]
+                if track.pending_box is not None:
+                    refs.append(track.pending_box)
+                for ref in refs:
+                    match = self._match_score(box, track, ref=ref)
+                    if match > best_score:
+                        best, best_score = track, match
             if best is not None:
                 used.add(best.tid)
-                pred = [best.box[i] + best.vel[i] * 0.5 for i in range(4)] \
-                    if best.misses == 0 else list(best.box)
+                base = best.committed_box
+                pred = ([base[i] + best.vel[i] * 0.5 for i in range(4)]
+                        if best.misses == 0 else list(base))
                 blend = [alpha * float(box[i]) + (1.0 - alpha) * pred[i]
                          for i in range(4)]
                 new_ang = _blend_angle(best.angle, angle)
                 new_box = (_clip_box(blend, 10 ** 9, 10 ** 9, angle=new_ang)
                            or FaceBox(box, angle=new_ang))
-                raw_vel = [float(new_box[i]) - float(best.box[i])
-                           for i in range(4)]
-                best.vel = [0.6 * raw_vel[i] + 0.4 * best.vel[i]
-                            for i in range(4)]
-                best.box = new_box
-                best.score = float(score)
-                best.misses = 0
-                best.hits += 1
-                best.angle = new_ang
-                best.seeded = False
+                raw = [float(v) for v in box]
+                expected = self._pred_box(base, best.vel)
+                if (not self.sticky
+                        or self._is_small_change(raw, base)
+                        or self._is_small_change(raw, expected)
+                        or self._pending_matches(raw, best)):
+                    self._commit(best, new_box, new_ang, score)
+                else:
+                    # 큰 변화는 후보로만 저장한다. 다음 프레임에 같은
+                    # 변화가 확인되면 확정하고, 아니면 버린다. 확인 전
+                    # 프레임은 committed와 pending의 합집합으로 가린다.
+                    self._set_pending(best, raw, new_ang, score)
             else:
                 self._new_track(box, score, angle=angle)
 
@@ -624,24 +733,39 @@ class FaceTracker:
             track = self.tracks[tid]
             track.misses += 1
             decay = 0.8 ** track.misses
+            old = list(track.committed_box)
             moved = None
             if flow_fn is not None:
                 try:
-                    moved = [float(v) for v in flow_fn(track.box)]
-                    if all(abs(moved[i] - track.box[i]) < 1e-6
+                    moved = [float(v) for v in flow_fn(track.committed_box)]
+                    if all(abs(moved[i] - old[i]) < 1e-6
                            for i in range(4)):
                         moved = None
                     else:
-                        track.vel = [0.7 * (moved[i] - track.box[i])
+                        track.vel = [0.7 * (moved[i] - old[i])
                                      + 0.3 * track.vel[i]
                                      for i in range(4)]
                 except Exception:
                     moved = None
             if moved is None:
-                moved = [track.box[i] + track.vel[i] * decay
+                moved = [old[i] + track.vel[i] * decay
                          for i in range(4)]
-            track.box = (_clip_box(moved, 10 ** 9, 10 ** 9, angle=track.angle)
-                         or track.box)
+            new_committed = (_clip_box(moved, 10 ** 9, 10 ** 9,
+                                       angle=track.angle) or old)
+            delta = [float(new_committed[i]) - float(old[i])
+                     for i in range(4)]
+            track.committed_box = [float(v) for v in new_committed]
+            if track.pending_box is not None:
+                track.pending_box = [float(track.pending_box[i]) + delta[i]
+                                     for i in range(4)]
+                track.pending_age += 1
+                if track.pending_age > 2:
+                    track.clear_pending()
+            if track.pending_box is not None:
+                track.box = track.union_box(track.committed_box,
+                                            track.pending_box)
+            else:
+                track.box = list(track.committed_box)
             if track.misses > track.max_miss(self.max_miss,
                                              self.seed_miss):
                 self.tracks.pop(tid, None)

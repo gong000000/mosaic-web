@@ -34,6 +34,49 @@ def test_tracker_follows_fast_motion_with_small_lag():
     assert max(err[5:]) < 6, err
 
 
+def test_tracker_holds_big_jump_until_confirmed():
+    t = FaceTracker()
+    t.update([([100, 100, 160, 170], 0.9)])
+    # 한 프레임만 30px 아래로 튄 검출: 바로 확정하지 않고 합집합으로 가린다.
+    t.update([([100, 130, 160, 200], 0.9)])
+    tr = t.active()[0]
+    assert list(tr.committed_box) == [100, 100, 160, 170]
+    assert list(tr.box) == [100, 100, 160, 200]
+    assert tr.pending_box is not None
+    # 다음 프레임에 같은 위치가 다시 오면 그때 확정한다.
+    t.update([([100, 131, 160, 201], 0.9)])
+    tr = t.active()[0]
+    assert list(tr.committed_box) == [100, 131, 160, 201]
+    assert tr.pending_box is None
+    assert list(tr.box) == [100, 131, 160, 201]
+
+
+def test_tracker_discards_single_frame_false_jump():
+    t = FaceTracker()
+    t.update([([100, 100, 160, 170], 0.9)])
+    t.update([([100, 160, 160, 230], 0.9)])
+    assert t.active()[0].pending_box is not None
+    # 원래 위치로 돌아오면 후보를 버리고 기존 박스를 유지한다.
+    t.update([([100, 101, 160, 171], 0.9)])
+    tr = t.active()[0]
+    assert tr.pending_box is None
+    assert list(tr.committed_box) == [100, 101, 160, 171]
+
+
+def test_plate_tracker_holds_big_jump_until_confirmed():
+    from src.plates import PlateTracker
+    t = PlateTracker(max_miss=5)
+    t.update([[100, 100, 160, 130]])
+    t.update([[100, 120, 160, 150]])
+    tr = t.tracks[1]
+    assert list(tr.committed_box) == [100, 100, 160, 130]
+    assert list(tr.box) == [100, 100, 160, 150]
+    t.update([[100, 121, 160, 151]])
+    tr = t.tracks[1]
+    assert tr.pending_box is None
+    assert list(tr.committed_box) == [100, 121, 160, 151]
+
+
 def test_tracker_extrapolates_on_miss():
     t = FaceTracker()
     for det in _moving_dets(10, 10):
