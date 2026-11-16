@@ -240,6 +240,15 @@ def _render_history(user, expanded=False):
     """로그인한 계정의 지난 작업만 페이지 단위로 보여준다."""
     with st.expander("지난 작업", expanded=expanded):
         rows = H.all_rows(user=user)
+        try:
+            u = RT.usage()
+            st.caption(
+                f"저장 결과 {u['files']}개 · "
+                f"{u['bytes'] / (1024 ** 3):.2f} GB "
+                f"(상한 {u['max_files']}개 / "
+                f"{u['max_bytes'] / (1024 ** 3):.0f} GB)")
+        except Exception:
+            pass
         if not rows:
             st.write("저장된 작업이 없습니다.")
             return
@@ -347,7 +356,7 @@ st.markdown(
 # 위젯을 누를 때마다 앱이 다시 실행되므로, 디스크 스캔성 정리는 세션당
 # 5분에 한 번만 한다.
 if time.time() - st.session_state.get("_last_purge", 0) > 300:
-    RT.purge_old()
+    RT.enforce()
     H.remove_missing()
     st.session_state["_last_purge"] = time.time()
 

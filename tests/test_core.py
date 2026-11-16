@@ -4,6 +4,7 @@ import sys
 import tempfile
 import types
 import json
+import time
 
 import numpy as np  # noqa: E402
 import cv2  # noqa: E402
@@ -358,6 +359,31 @@ def test_render_gate_reports_waiters():
     assert g.waiting() == 0
     with g:
         pass
+
+
+def test_retention_purges_old_and_quota_keeps_db():
+    from src.retention import RetentionPolicy
+    d = tempfile.mkdtemp()
+    for name, content in (("jobs.db", b"db"), ("jobs.db-wal", b"wal")):
+        with open(os.path.join(d, name), "wb") as f:
+            f.write(content)
+    now = time.time()
+    old = os.path.join(d, "old.mp4")
+    mid = os.path.join(d, "mid.mp4")
+    new = os.path.join(d, "new.mp4")
+    for p, size in ((old, 10), (mid, 20), (new, 30)):
+        with open(p, "wb") as f:
+            f.write(b"x" * size)
+    os.utime(old, (now - 25 * 3600, now - 25 * 3600))
+    os.utime(mid, (now - 60, now - 60))
+    os.utime(new, (now, now))
+    p = RetentionPolicy(d, max_hours=24, max_files=1, max_bytes=0)
+    removed = p.enforce()
+    assert removed == 2, removed
+    assert os.path.exists(old) is False and os.path.exists(mid) is False
+    assert os.path.exists(new) is True
+    assert os.path.exists(os.path.join(d, "jobs.db")) is True
+    assert os.path.exists(os.path.join(d, "jobs.db-wal")) is True
 
 
 def test_face_mesh_falls_back_without_model():
