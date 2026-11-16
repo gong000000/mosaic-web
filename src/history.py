@@ -1,13 +1,37 @@
-"""작업 히스토리. outputs/ 폴더 + jobs.json. 계정별 필터/보관은 사용자 단위로 관리한다."""
+"""작업 히스토리. outputs/ 폴더 + SQLite(jobs.db).
+
+예전에는 jobs.json을 읽고 전체를 다시 쓰는 방식이라 동시 작업에서
+덮어쓰기 위험이 있었다. 이제 작업 1건은 INSERT 1번, 사용자별 상한은
+DELETE 1번으로 처리한다. 기존 jobs.json은 최초 실행 때 자동으로
+jobs.db로 옮기고 `.migrated`로 보존한다.
+"""
 import json
 import os
+import sqlite3
 import threading
 import time
-from collections import defaultdict
+from contextlib import contextmanager
 from .config import OUTPUT_DIR
 
-# 여러 세션이 동시에 저장/삭제해도 jobs.json이 깨지지 않게 한다.
 _LOCK = threading.RLock()
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL DEFAULT '',
+    user TEXT NOT NULL DEFAULT '',
+    src TEXT NOT NULL DEFAULT '',
+    prompt TEXT NOT NULL DEFAULT '',
+    query_raw TEXT NOT NULL DEFAULT '',
+    target TEXT NOT NULL DEFAULT '',
+    invert INTEGER NOT NULL DEFAULT 0,
+    file TEXT NOT NULL DEFAULT '',
+    sec REAL NOT NULL DEFAULT 0,
+    selector TEXT NOT NULL DEFAULT 'vlm',
+    summary TEXT NOT NULL DEFAULT '',
+    created REAL NOT NULL DEFAULT 0
+)
+"""
 
 
 def _owner_of(file_name):
@@ -24,71 +48,109 @@ class JobHistory:
 
     def __init__(self, directory=OUTPUT_DIR, max_rows=100):
         self.directory = directory
-        self.max_rows = max_rows
-        self.db = os.path.join(directory, "jobs.json")
+        self.max_rows = max(1, int(max_rows))
+        self.db = os.path.join(directory, "jobs.db")
+        self.legacy = os.path.join(directory, "jobs.json")
+        self._init_db()
 
-    def _load(self):
-        with _LOCK:
-            try:
-                with open(self.db, encoding="utf-8") as f:
-                    rows = json.load(f)
-                return rows if isinstance(rows, list) else []
-            except Exception:
-                return []
+    def _connect(self):
+        conn = sqlite3.connect(self.db, timeout=15)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        return conn
 
-    def _trim_per_user(self, rows):
-        buckets = defaultdict(list)
-        for idx, r in enumerate(rows):
-            owner = r.get("user") or _owner_of(r.get("file"))
-            buckets[owner].append((idx, r))
-        keep_indices = set()
-        for items in buckets.values():
-            for idx, _r in items[-self.max_rows:]:
-                keep_indices.add(idx)
-        return [r for idx, r in enumerate(rows) if idx in keep_indices]
+    @contextmanager
+    def _db(self):
+        conn = self._connect()
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
 
-    def _save(self, rows):
+    def _init_db(self):
         with _LOCK:
             os.makedirs(self.directory, exist_ok=True)
-            trimmed = self._trim_per_user(rows)
-            # 임시 파일에 쓴 뒤 교체해, 저장 도중 앱이 멈춰도 기존 기록이
-            # 반쯤 잘린 JSON으로 남지 않게 한다.
-            tmp = self.db + ".tmp"
-            try:
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(trimmed, f, ensure_ascii=False, indent=2)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp, self.db)
-            finally:
-                try:
-                    if os.path.exists(tmp):
-                        os.unlink(tmp)
-                except Exception:
-                    pass
+            with self._db() as c:
+                c.execute(_SCHEMA)
+                c.execute("CREATE INDEX IF NOT EXISTS idx_jobs_user "
+                          "ON jobs(user, id)")
+                n = c.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+            if n == 0 and os.path.exists(self.legacy):
+                self._migrate_legacy()
+
+    def _insert(self, c, r):
+        file_name = str(r.get("file") or "")
+        owner = str(r.get("user") or _owner_of(file_name))
+        c.execute(
+            "INSERT INTO jobs (at, user, src, prompt, query_raw, target, "
+            "invert, file, sec, selector, summary, created) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (str(r.get("at") or time.strftime("%m-%d %H:%M")),
+             owner, str(r.get("src") or ""), str(r.get("prompt") or ""),
+             str(r.get("query_raw") or r.get("prompt") or ""),
+             str(r.get("target") or ""), 1 if r.get("invert") else 0,
+             file_name, float(r.get("sec") or 0),
+             str(r.get("selector") or "vlm"),
+             str(r.get("summary") or ""),
+             float(r.get("created") or time.time())))
+
+    def _migrate_legacy(self):
+        try:
+            with open(self.legacy, encoding="utf-8") as f:
+                rows = json.load(f)
+        except Exception:
+            return
+        if not isinstance(rows, list):
+            return
+        with _LOCK, self._db() as c:
+            for r in rows:
+                if isinstance(r, dict) and r.get("file"):
+                    self._insert(c, r)
+        try:
+            os.replace(self.legacy, self.legacy + ".migrated")
+        except OSError:
+            pass
 
     def add(self, src_name, prompt, target, invert, out_name, seconds,
             query_raw=None, selector=None, summary=None, user=None):
-        with _LOCK:
-            rows = self._load()
-            owner = user or _owner_of(out_name)
-            rows.append({
-                "at": time.strftime("%m-%d %H:%M"),
-                "user": owner,
-                "src": src_name,
-                "prompt": prompt,
-                "query_raw": query_raw if query_raw is not None else prompt,
-                "target": target,
-                "invert": bool(invert),
-                "file": out_name,
-                "sec": round(float(seconds), 1),
-                "selector": selector or "vlm",
-                "summary": summary or "",
-            })
-            self._save(rows)
+        owner = user or _owner_of(out_name)
+        row = {
+            "at": time.strftime("%m-%d %H:%M"),
+            "user": owner,
+            "src": src_name,
+            "prompt": prompt,
+            "query_raw": query_raw if query_raw is not None else prompt,
+            "target": target,
+            "invert": bool(invert),
+            "file": out_name,
+            "sec": round(float(seconds), 1),
+            "selector": selector or "vlm",
+            "summary": summary or "",
+            "created": time.time(),
+        }
+        with _LOCK, self._db() as c:
+            self._insert(c, row)
+            # 사용자별 최근 max_rows개만 남긴다.
+            c.execute(
+                "DELETE FROM jobs WHERE user=? AND id NOT IN "
+                "(SELECT id FROM jobs WHERE user=? ORDER BY id DESC LIMIT ?)",
+                (owner, owner, self.max_rows))
+
+    def _rows(self):
+        with _LOCK, self._db() as c:
+            rows = [dict(r) for r in c.execute(
+                "SELECT at, user, src, prompt, query_raw, target, invert, "
+                "file, sec, selector, summary FROM jobs "
+                "ORDER BY id DESC").fetchall()]
+        for r in rows:
+            r["invert"] = bool(r.get("invert"))
+        return rows
 
     def all_rows(self, user=None):
-        rows = list(reversed(self._load()))
+        rows = self._rows()
         if not user:
             return rows
         prefix = f"{user}--"
@@ -96,7 +158,8 @@ class JobHistory:
                if r.get("user") == user
                or str(r.get("file", "")).startswith(prefix)]
         known = {r.get("file") for r in out if r.get("file")}
-        # jobs.json에서 누락됐지만 실제 outputs/ 폴더에 남아 있는 내 결과 파일도 복구한다.
+        # DB에서 누락됐지만 실제 outputs/ 폴더에 남아 있는 내 결과 파일도
+        # 복구한다(이전 버전/수동 복사/마이그레이션 누락 대비).
         try:
             for fname in sorted(os.listdir(self.directory), reverse=True):
                 if (fname.startswith(prefix) and fname.endswith(".mp4")
@@ -126,26 +189,23 @@ class JobHistory:
 
     def remove_missing(self):
         """파일이 이미 지워진(만료/수동 삭제) 기록을 정리한다."""
-        with _LOCK:
-            rows = self._load()
-            keep = [r for r in rows
-                    if r.get("file")
-                    and os.path.exists(os.path.join(self.directory,
-                                                    r["file"]))]
-            if len(keep) != len(rows):
-                self._save(keep)
-            return len(rows) - len(keep)
+        with _LOCK, self._db() as c:
+            rows = c.execute("SELECT id, file FROM jobs").fetchall()
+            gone = [(int(r["id"]),) for r in rows
+                    if not os.path.exists(os.path.join(self.directory,
+                                                       r["file"]))]
+            c.executemany("DELETE FROM jobs WHERE id=?", gone)
+            return len(gone)
 
     def delete(self, out_name):
-        with _LOCK:
-            self._save([r for r in self._load()
-                        if r.get("file") != out_name])
-            try:
-                p = os.path.join(self.directory, out_name)
-                if os.path.exists(p):
-                    os.unlink(p)
-            except Exception:
-                pass
+        with _LOCK, self._db() as c:
+            c.execute("DELETE FROM jobs WHERE file=?", (out_name,))
+        try:
+            p = os.path.join(self.directory, out_name)
+            if os.path.exists(p):
+                os.unlink(p)
+        except Exception:
+            pass
 
 
 _HISTORY = JobHistory()

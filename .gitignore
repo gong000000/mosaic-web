@@ -9,6 +9,9 @@ __pycache__/
 *.pb
 outputs/*.mp4
 outputs/jobs.json
+outputs/jobs.json.migrated
+outputs/jobs.db
+outputs/jobs.db-*
 .env
 .env.*
 !.env.example

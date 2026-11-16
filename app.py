@@ -16,7 +16,6 @@ import os
 import secrets
 import shutil
 import tempfile
-import threading
 import time
 
 import cv2
@@ -29,6 +28,7 @@ from src.models import get_model
 from src.preview import analyze_video
 from src.render import normalize_video, strip_audio, trim_video
 from src.render_service import MosaicSettings, RenderPlan
+from src.render_queue import RenderGate
 from src import history as H
 from src import retention as RT
 from src.auth import require_login
@@ -58,8 +58,8 @@ FAST_PLATE_BUDGET = 28
 # 두 번 쓰지 않고, 렌더 결과도 분석 결과와 일치한다.
 RENDER_VLM_CALLS = 0
 
-# 한 컨테이너에서 여러 세션이 동시에 렌더할 때 순번 대기를 알리기 위한 락.
-_RENDER_JOB_LOCK = threading.Lock()
+# 한 컨테이너에서 여러 세션이 동시에 렌더할 때 순번 대기를 알리기 위한 게이트.
+_RENDER_GATE = RenderGate()
 _HISTORY_PAGE_SIZE = 10
 
 
@@ -621,8 +621,10 @@ else:
 
     if st.button("모자이크 시작", type="primary", key="start_mosaic"):
         out_path = _unique_out_path(uploaded.name, current_user)
-        if _RENDER_JOB_LOCK.locked():
+        _RENDER_GATE.enter()
+        if _RENDER_GATE.waiting() > 0:
             st.info("다른 사용자의 모자이크 작업이 진행 중입니다. "
+                    f"대기 순번: {_RENDER_GATE.waiting() + 1}번째. "
                     "순서대로 자동 시작됩니다...")
         progress = st.progress(0.0, text="렌더 준비 중...")
 
@@ -636,7 +638,7 @@ else:
                 pass
 
         try:
-            with _RENDER_JOB_LOCK:
+            with _RENDER_GATE:
                 pass1_sig = plan.pass1_signature(
                     source_token, FAST_MODEL, FAST_IMGSZ, FAST_STRIDE,
                     FAST_CONF)

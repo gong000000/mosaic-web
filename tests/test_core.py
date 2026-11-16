@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import types
+import json
 
 import numpy as np  # noqa: E402
 import cv2  # noqa: E402
@@ -325,6 +326,38 @@ def test_history_is_per_user_and_recovers_orphan_files():
     assert len([r for r in h.all_rows("alice")
                 if r["file"].startswith("alice--a_")]) == 2
     assert {r["file"] for r in h.all_rows("bob")} == {"bob--b_0.mp4"}
+
+
+def test_history_migrates_legacy_json_once():
+    from src.history import JobHistory
+    d = tempfile.mkdtemp()
+    legacy = [
+        {"at": "01-01 00:00", "user": "alice", "file": "alice--old.mp4",
+         "src": "old.mp4", "target": "face", "sec": 1.0},
+        {"at": "01-01 00:01", "user": "bob", "file": "bob--old.mp4",
+         "src": "old.mp4", "target": "face", "sec": 2.0},
+    ]
+    with open(os.path.join(d, "jobs.json"), "w", encoding="utf-8") as f:
+        json.dump(legacy, f, ensure_ascii=False)
+    h = JobHistory(directory=d, max_rows=5)
+    assert {r["file"] for r in h.all_rows()} == {
+        "alice--old.mp4", "bob--old.mp4"}
+    assert os.path.exists(os.path.join(d, "jobs.json.migrated"))
+    h2 = JobHistory(directory=d, max_rows=5)
+    assert len(h2.all_rows()) == 2, "마이그레이션 후 중복 삽입됨"
+
+
+def test_render_gate_reports_waiters():
+    from src.render_queue import RenderGate
+    g = RenderGate()
+    g.enter()
+    assert g.waiting() == 0
+    g.enter()
+    assert g.waiting() == 1
+    g.leave_waiting()
+    assert g.waiting() == 0
+    with g:
+        pass
 
 
 def test_face_mesh_falls_back_without_model():
