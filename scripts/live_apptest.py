@@ -57,6 +57,10 @@ def main():
                         help="Gemini를 호출하지 않고 로컬 얼굴만 사용")
     parser.add_argument("--keep", action="store_true",
                         help="결과/기록을 지우지 않는다")
+    parser.add_argument("--preset", default="얼굴만",
+                        help="렌더에 사용할 프리셋 이름")
+    parser.add_argument("--expect", default="",
+                        help="분석에서 반드시 나와야 할 카테고리(쉼표 구분)")
     args = parser.parse_args()
     if not os.path.exists(args.video):
         print(f"SKIP 영상 없음: {args.video}")
@@ -96,13 +100,20 @@ def main():
     items = analysis.get("items") or []
     cats = {it.get("category") for it in items}
     print(f"OK 분석 {analyze_sec:.1f}초 · 항목 {sorted(cats)}")
+    if args.expect:
+        want = {c.strip() for c in args.expect.split(",") if c.strip()}
+        missing = sorted(want - cats)
+        if missing:
+            print("FAIL 기대 항목 누락:", missing)
+            return 1
 
-    # 얼굴만 프리셋으로 고정 (번호판 등 추가 항목은 체크 해제)
+    # 요청한 프리셋으로 고정한다.
     try:
-        at.sidebar.selectbox(key="preset_sel").select("얼굴만")
+        at.sidebar.selectbox(key="preset_sel").select(args.preset)
         at.run(timeout=600)
     except Exception as e:
-        print("WARN 프리셋 선택 실패:", e)
+        print("FAIL 프리셋 선택 실패:", args.preset, e)
+        return 1
 
     buttons = [b for b in at.button if b.key == "start_mosaic"]
     if not buttons:
