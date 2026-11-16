@@ -283,19 +283,22 @@ python scripts/leak_metrics.py 결과.mp4   # YuNet 재검출 대리 지표
 - `qualitytest.py`는 마스크가 사람 밖으로 번지지 않는지, 강도가 높을수록
   블록이 커지는지, 기울어진 얼굴·긴 샘플 간격 보간이 유지되는지 봅니다.
 - 테스트 영상은 `MOSAIC_TEST_FACE`, `MOSAIC_TEST_STREET` 환경변수나
-  `samples/face.mp4`, `samples/street.mp4`로 지정합니다. 없으면
-  `~/Downloads`를 한 번 더 확인하고, 그래도 없으면 해당 테스트는 건너뜁니다.
+  `docs/face.mp4`, `docs/street.mp4`로 지정합니다. 실제 얼굴이 있어 git에는
+  커밋하지 않으며, 파일명과 사용법은 `docs/TEST_VIDEOS.md`에 있습니다.
 - `python scripts/live_vlm.py <영상 경로>`는 실제 Gemini 분석 결과를
   확인합니다(키 필요).
 - CI(`.github/workflows/ci.yml`)는 `tests/`와 정적 검사를 실행합니다.
+  `pip check`와 Dependabot도 설정되어 있습니다.
 
 ## 개인정보 처리
 
 - 원본 영상은 실행 환경의 임시 폴더에서만 처리됩니다.
 - VLM에는 **샘플 프레임 이미지**와 선택적 차량 크롭만 전송하며 영상 파일
   전체를 보내지 않습니다. 업로드 화면에 이 사실을 고지합니다.
-- 결과 파일은 `outputs/`에 저장되며, 기본 24시간이 지난 파일은 앱 시작 시
-  자동 정리됩니다. 보관이 필요한 결과는 다운로드해 두세요.
+- 결과 파일은 `outputs/`에 저장되며, 기본 24시간이 지난 파일은 자동 정리됩니다.
+  전체 결과가 500개 또는 20GB를 넘으면 오래된 것부터 지워집니다
+  (`MOSAIC_MAX_OUTPUT_FILES`, `MOSAIC_MAX_OUTPUT_GB`로 조정). 보관이 필요한
+  결과는 다운로드해 두세요.
 - `오디오 제거`를 켜지 않으면 목소리·대화는 결과에 남습니다. 시각 정보만
   자동으로 가리므로 공개 전에 전체 구간을 직접 검수해야 합니다.
 - API 키는 환경변수/Secret에서만 읽고 화면·로그·코드에 남기지 않습니다.
@@ -319,11 +322,12 @@ src/offline.py              2패스 역방향 채움·평활·ID 전환 보간
 src/pipeline.py             YOLO 추적 + 모자이크 렌더 파이프라인
 src/render.py               모자이크/FFmpeg H.264 유틸
 src/render_service.py       체크리스트 → 렌더 요청 변환/서명/캐시
-src/history.py              사용자별 결과 기록/jobs.json
-src/retention.py            보관/삭제 정책
+src/render_queue.py         동시 렌더 직렬화/대기 순번
+src/history.py              사용자별 결과 기록 (SQLite jobs.db)
+src/retention.py            보관/삭제 정책 (24시간·개수·용량)
 requirements.txt            CPU/headless 의존성
 requirements-gpu.txt        CUDA GPU 의존성
-requirements-dev.txt        pytest
+requirements-dev.txt        pytest/ruff
 .env.example                Gemini 키 템플릿 (.env로 복사해 사용)
 configs/bytetrack_stable.yaml  ByteTrack 설정
 weights/
