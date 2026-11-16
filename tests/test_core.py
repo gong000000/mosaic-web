@@ -114,6 +114,19 @@ def test_person_gate_drops_ambiguous_face_outside_person():
     assert out == [], "사람 밖의 애매한 얼굴 검출을 거르지 못함"
 
 
+def test_east_refines_synthetic_address():
+    from src.texts import _model_path, refine_box_with_text
+    if not os.path.exists(_model_path()):
+        return  # EAST 가중치는 CI에 포함되지 않는다.
+    frame = np.full((400, 800, 3), 255, np.uint8)
+    cv2.putText(frame, "123 MAIN STREET", (40, 120),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.8, (0, 0, 0), 4, cv2.LINE_AA)
+    out = refine_box_with_text(frame, [20, 30, 700, 160])
+    assert out is not None, "EAST가 합성 주소 글자를 찾지 못함"
+    assert 20 <= out[0] and out[2] <= 700, out
+    assert out[2] - out[0] < 680, f"박스가 정제되지 않음: {out}"
+
+
 def test_tracker_extrapolates_on_miss():
     t = FaceTracker()
     for det in _moving_dets(10, 10):

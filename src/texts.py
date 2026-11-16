@@ -68,7 +68,12 @@ def _get_net():
 
 
 def detect_text_quads(crop_bgr, conf=None):
-    """크롭에서 글자 쿼드 목록. returns [4x2 array, ...] (크롭 좌표)."""
+    """크롭에서 글자 쿼드 목록. returns [4x2 array, ...] (크롭 좌표).
+
+    EAST는 입력을 640x640으로 강제로 늘리면 세로 간판/작은 글자가
+    찌그러져 검출되지 않는다. 비율을 유지해 확대/축소하고, 32의 배수로
+    패딩한 뒤 원래 좌표로 되돌린다.
+    """
     if crop_bgr is None or crop_bgr.size == 0:
         return []
     det = _get_net()
@@ -77,17 +82,30 @@ def detect_text_quads(crop_bgr, conf=None):
     h, w = crop_bgr.shape[:2]
     if h < 32 or w < 32:
         return []
-    small = cv2.resize(crop_bgr, (640, 640), interpolation=cv2.INTER_AREA)
+    # 작은 간판은 최대 6배까지 확대하고, 큰 크롭은 640 기준으로 축소한다.
+    scale = min(6.0, 640.0 / float(max(w, h)))
+    nw = max(1, int(round(w * scale)))
+    nh = max(1, int(round(h * scale)))
+    nw = max(32, ((nw + 31) // 32) * 32)
+    nh = max(32, ((nh + 31) // 32) * 32)
+    # 원본 비율을 유지한 채 nw x nh 안에 맞춘다(패딩은 바깥).
+    fit = min(nw / float(w), nh / float(h))
+    rw = max(1, int(round(w * fit)))
+    rh = max(1, int(round(h * fit)))
+    interp = cv2.INTER_AREA if fit < 1.0 else cv2.INTER_LINEAR
+    small = cv2.resize(crop_bgr, (rw, rh), interpolation=interp)
+    canvas = np.zeros((nh, nw, 3), np.uint8)
+    canvas[:rh, :rw] = small
     try:
         with _net_lock:
             try:
                 det.setConfidenceThreshold(
                     float(conf if conf is not None else _conf()))
-                det.setInputParams(1.0, (640, 640),
+                det.setInputParams(1.0, (nw, nh),
                                     (123.68, 116.78, 103.94), True)
             except Exception:
                 pass
-            boxes, _confs = det.detect(small)
+            boxes, _confs = det.detect(canvas)
     except Exception:
         return []
     if boxes is None:
@@ -96,8 +114,8 @@ def detect_text_quads(crop_bgr, conf=None):
     try:
         for b in boxes:
             pts = np.asarray(b, np.float32).reshape(-1, 2)
-            pts[:, 0] *= w / 640.0
-            pts[:, 1] *= h / 640.0
+            pts[:, 0] *= w / float(rw)
+            pts[:, 1] *= h / float(rh)
             out.append(pts)
     except (TypeError, ValueError):
         return []
