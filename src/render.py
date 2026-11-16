@@ -307,11 +307,25 @@ def strip_audio(video_path):
 
 
 def normalize_video(input_path, output_path, max_width=1920):
-    """브라우저/OpenCV 호환성을 위해 H.264 MP4로 다시 인코딩한다."""
+    """브라우저/OpenCV 호환성을 위해 H.264 MP4로 다시 인코딩한다.
+
+    4K 가로 영상을 1920으로 줄일 때 높이를 그대로 두면 화면이 찌그러진다.
+    원본 종횡비를 유지하도록 폭만 제한하고 높이는 -2(짝수 자동)로 맡긴다.
+    """
     ff = imageio_ffmpeg.get_ffmpeg_exe()
     cleanup_tmp(output_path)
-    vf = (f"scale=trunc(min({int(max_width)},iw)/2)*2:"
-          "trunc(ih/2)*2")
+    src_w = 0
+    try:
+        cap = cv2.VideoCapture(input_path)
+        src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        cap.release()
+    except Exception:
+        src_w = 0
+    if src_w > int(max_width):
+        vf = f"scale={int(max_width)}:-2"
+    else:
+        # 세로 영상/일반 영상은 원본 크기를 유지하되 홀수만 보정한다.
+        vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2"
     cmd = [ff, "-y", "-i", input_path, "-vf", vf,
            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
            "-pix_fmt", "yuv420p", "-profile:v", "main", "-bf", "0",

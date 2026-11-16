@@ -371,11 +371,94 @@ def t_mosaic_blocks():
     assert np.count_nonzero(np.diff(mos[:, 0, 0])) < h // 2
 
 
+def t_normalize_aspect_and_audio():
+    """4K/세로/한글 파일명/오디오 제거가 깨지지 않는지 확인."""
+    import cv2
+    import numpy as np
+    import imageio_ffmpeg
+    from src.render import normalize_video, strip_audio
+
+    base = os.path.join(os.environ.get("TEMP", "."), "mosaic_robust_norm")
+    os.makedirs(base, exist_ok=True)
+    ff = imageio_ffmpeg.get_ffmpeg_exe()
+
+    def make(path, w, h, fps=10, sec=1, audio=False):
+        vw = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"),
+                             fps, (w, h))
+        for i in range(fps * sec):
+            f = np.zeros((h, w, 3), np.uint8)
+            f[:, :, 0] = i * 3 % 255
+            vw.write(f)
+        vw.release()
+        if audio:
+            out = path + ".a.mp4"
+            import subprocess
+            subprocess.run(
+                [ff, "-y", "-i", path, "-f", "lavfi", "-i",
+                 f"sine=frequency=440:duration={sec}", "-shortest",
+                 "-c:v", "copy", "-c:a", "aac", out],
+                check=True, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+            os.replace(out, path)
+
+    def dims(path):
+        cap = cv2.VideoCapture(path)
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        return w, h, n
+
+    def has_audio(path):
+        import subprocess
+        r = subprocess.run([ff, "-hide_banner", "-i", path],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return b"Audio:" in (r.stderr or b"")
+
+    src = os.path.join(base, "4k.mp4")
+    n4 = os.path.join(base, "4k_norm.mp4")
+    make(src, 640, 360, 10, 1)  # 4K 생성은 느려서 비율 로직만 640으로 확인
+    normalize_video(src, n4)
+    assert dims(n4)[:2] == (640, 360)
+
+    # 실제 4K 한 프레임을 normalize해 가로만 줄고 세로 비율이 유지되는지.
+    src4 = os.path.join(base, "4k_real.mp4")
+    vw = cv2.VideoWriter(src4, cv2.VideoWriter_fourcc(*"mp4v"),
+                         5, (3840, 2160))
+    for _ in range(2):
+        vw.write(np.zeros((2160, 3840, 3), np.uint8))
+    vw.release()
+    n4 = os.path.join(base, "4k_real_norm.mp4")
+    normalize_video(src4, n4)
+    assert dims(n4)[:2] == (1920, 1080), dims(n4)
+
+    src_p = os.path.join(base, "세로 영상.mp4")
+    n_p = os.path.join(base, "세로 정규화.mp4")
+    make(src_p, 720, 1280, 30, 1, audio=True)
+    normalize_video(src_p, n_p)
+    assert dims(n_p)[:2] == (720, 1280), dims(n_p)
+    assert has_audio(n_p)
+    strip_audio(n_p)
+    assert not has_audio(n_p), "오디오 제거 실패"
+    assert dims(n_p)[:2] == (720, 1280)
+
+
+def t_long_gap_interpolation_quality():
+    """긴 샘플 간격에서도 번호판 박스가 보간되는지(기존 품질 검사)."""
+    from src.pipeline import _interpolate_boxes
+    prev = [{"xyxy": [100, 100, 200, 140], "conf": 1.0}]
+    nxt = [{"xyxy": [160, 100, 260, 140], "conf": 1.0}]
+    mid = _interpolate_boxes(prev, nxt, 0.5)
+    assert mid and mid[0]["xyxy"][0] >= 100
+
+
 def main():
     fails = 0
     fails += check("preview-0person", t_preview_no_person)
     fails += check("preview-closeup", t_preview_closeup)
     fails += check("black-video", t_black_video)
+    fails += check("normalize-aspect-audio", t_normalize_aspect_and_audio)
+    fails += check("long-gap-interpolation", t_long_gap_interpolation_quality)
     fails += check("vlm-parse-normalize", t_vlm_parse_and_normalize)
     fails += check("vlm-provider", t_vlm_provider)
     fails += check("vlm-requires-key", t_vlm_requires_key)
