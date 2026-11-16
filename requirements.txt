@@ -1,12 +1,12 @@
 --extra-index-url https://download.pytorch.org/whl/cpu
-ultralytics==8.4.174
+ultralytics==8.4.212
 opencv-python-headless==5.0.0.93
-streamlit==1.65.0
-numpy==2.2.6
-imageio-ffmpeg==0.6.0
-torch==2.14.1
-torchvision==0.29.1
+streamlit==1.67.0
+numpy==2.5.4
+imageio-ffmpeg==0.8.1
+torch==2.15.0+cpu
+torchvision==0.29.2+cpu
 # MediaPipe face landmark (falls back to fixed face shape if unavailable)
 mediapipe==1.2.3
 # OpenAI-compatible HTTP client for Gemini
-openai==3.28.0
+openai==3.51.0
