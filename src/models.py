@@ -1,11 +1,22 @@
 """모델 로딩 캐시. weights/ 우선, 프로젝트 루트도 검색.
 여러 세션이 같은 모델/트래커를 동시에 만지지 않도록 공용 락도 제공한다."""
+import logging
 import os
 import threading
 from ultralytics import YOLO
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_WEIGHT_DIRS = (os.path.join(ROOT_DIR, "weights"), ROOT_DIR)
+_HOME_DIR = os.path.expanduser("~")
+log = logging.getLogger("mosaic.models")
+# MOSAIC_WEIGHTS_DIR(예: Modal 이미지 빌드 때 받아 둔 /opt/weights)를 먼저 본다.
+_WEIGHT_DIRS = tuple(d for d in (
+    os.environ.get("MOSAIC_WEIGHTS_DIR"),
+    os.path.join(ROOT_DIR, "weights"),
+    ROOT_DIR,
+    os.path.join(_HOME_DIR, "weights"),
+    _HOME_DIR,
+) if d)
+FALLBACK_SEG = "yolo11n-seg.pt"
 
 # 추적/추론은 상태를 가진 모델을 쓰므로 프로세스 단위로 한 번에 하나만 실행한다.
 MODEL_LOCK = threading.RLock()
@@ -36,7 +47,15 @@ class ModelStore:
     def get(self, name="yolo11n-seg.pt"):
         with self._lock:
             if name not in self._models:
-                self._models[name] = YOLO(self._resolve(name))
+                try:
+                    self._models[name] = YOLO(self._resolve(name))
+                except Exception:
+                    # 큰 모델 가중치를 못 받으면 기본 nano 모델로 대체한다.
+                    if name == FALLBACK_SEG or not name.endswith("-seg.pt"):
+                        raise
+                    log.exception("%s 로드 실패 - %s 로 대체", name,
+                                  FALLBACK_SEG)
+                    self._models[name] = YOLO(self._resolve(FALLBACK_SEG))
             return self._models[name]
 
 

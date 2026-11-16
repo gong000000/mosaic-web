@@ -8,9 +8,19 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-FACE = r"C:\Users\gong0000\Downloads\face.mp4"
-YTDOWN = (r"C:\Users\gong0000\Downloads\YTDown.com_YouTube_Media__"
-          r"VuJA-VQRcY_Central-Cee-Doja-Official-Music-Video_002_720p.mp4")
+def _sample(env, name):
+    """테스트 영상 경로: 환경변수 > 저장소의 samples/ > ~/Downloads."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for p in (os.environ.get(env),
+              os.path.join(root, "samples", name),
+              os.path.join(os.path.expanduser("~"), "Downloads", name)):
+        if p and os.path.exists(p):
+            return p
+    return os.path.join(root, "samples", name)
+
+
+FACE = _sample("MOSAIC_TEST_FACE", "face.mp4")
+YTDOWN = _sample("MOSAIC_TEST_LONG", "long.mp4")
 TMP = os.path.join(os.environ.get("TEMP", "."), "mosaic_robust_black.mp4")
 
 

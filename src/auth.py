@@ -37,7 +37,63 @@ def _conn():
         " pw_hash TEXT NOT NULL,"
         " created_at TEXT NOT NULL)"
     )
+    # 로그인 실패 횟수는 세션이 아니라 DB에 아이디 기준으로 저장한다.
+    # (탭을 새로 열어도 잠금이 초기화되지 않게)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS login_attempts ("
+        " username TEXT PRIMARY KEY,"
+        " fails INTEGER NOT NULL DEFAULT 0,"
+        " locked_until REAL NOT NULL DEFAULT 0)"
+    )
     return conn
+
+
+def invite_required():
+    """MOSAIC_INVITE_CODE 환경변수가 있으면 가입 시 초대 코드를 요구한다."""
+    return bool(os.environ.get("MOSAIC_INVITE_CODE", "").strip())
+
+
+def check_invite(code):
+    want = os.environ.get("MOSAIC_INVITE_CODE", "").strip()
+    if not want:
+        return True
+    return hmac.compare_digest((code or "").strip().encode("utf-8"),
+                               want.encode("utf-8"))
+
+
+def lock_remaining(username):
+    """해당 아이디가 잠겨 있으면 남은 초, 아니면 0."""
+    username = (username or "").strip()
+    with closing(_conn()) as conn:
+        row = conn.execute(
+            "SELECT locked_until FROM login_attempts WHERE username = ?",
+            (username,)).fetchone()
+    if not row:
+        return 0
+    return max(0, int(row[0] - time.time()))
+
+
+def record_login_result(username, ok):
+    """성공이면 실패 횟수 초기화, 실패면 증가시키고 한도 초과 시 잠근다."""
+    username = (username or "").strip()[:64]
+    with closing(_conn()) as conn, conn:
+        if ok:
+            conn.execute("DELETE FROM login_attempts WHERE username = ?",
+                         (username,))
+            return
+        row = conn.execute(
+            "SELECT fails FROM login_attempts WHERE username = ?",
+            (username,)).fetchone()
+        fails = (row[0] if row else 0) + 1
+        locked = 0.0
+        if fails >= MAX_FAILS:
+            locked = time.time() + LOCK_SECONDS
+            fails = 0
+        conn.execute(
+            "INSERT INTO login_attempts (username, fails, locked_until)"
+            " VALUES (?, ?, ?) ON CONFLICT(username) DO UPDATE SET"
+            " fails = excluded.fails, locked_until = excluded.locked_until",
+            (username, fails, locked))
 
 
 def _hash(password, salt_hex):
@@ -81,11 +137,6 @@ def verify(username, password):
     return hmac.compare_digest(_hash(password or "", row[0]), row[1])
 
 
-def _locked_seconds():
-    until = st.session_state.get("login_locked_until", 0)
-    return max(0, int(until - time.time()))
-
-
 def require_login():
     """로그인된 아이디를 반환한다. 로그인 전이면 화면을 그리고 멈춘다."""
     user = st.session_state.get("user")
@@ -102,20 +153,15 @@ def require_login():
             pw = st.text_input("비밀번호", type="password")
             go = st.form_submit_button("로그인")
         if go:
-            wait = _locked_seconds()
+            wait = lock_remaining(uid)
             if wait:
                 st.error(f"로그인 시도가 너무 많습니다. {wait}초 후 다시 시도하세요.")
             elif verify(uid, pw):
+                record_login_result(uid, True)
                 st.session_state["user"] = uid.strip()
-                st.session_state["login_fails"] = 0
                 st.rerun()
             else:
-                fails = st.session_state.get("login_fails", 0) + 1
-                st.session_state["login_fails"] = fails
-                if fails >= MAX_FAILS:
-                    st.session_state["login_locked_until"] = (
-                        time.time() + LOCK_SECONDS)
-                    st.session_state["login_fails"] = 0
+                record_login_result(uid, False)
                 st.error("아이디 또는 비밀번호가 올바르지 않습니다.")
 
     with tab_up:
@@ -123,9 +169,13 @@ def require_login():
             nu = st.text_input("새 아이디 (영문/숫자/_ 3~20자)")
             np1 = st.text_input("새 비밀번호 (8자 이상)", type="password")
             np2 = st.text_input("비밀번호 확인", type="password")
+            invite = (st.text_input("초대 코드", type="password")
+                      if invite_required() else "")
             go = st.form_submit_button("가입하기")
         if go:
-            if np1 != np2:
+            if not check_invite(invite):
+                st.error("초대 코드가 올바르지 않습니다.")
+            elif np1 != np2:
                 st.error("비밀번호가 서로 다릅니다.")
             else:
                 ok, msg = register(nu, np1)

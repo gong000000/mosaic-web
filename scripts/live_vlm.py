@@ -1,10 +1,11 @@
 """실제 Gemini API 키로 분석 품질을 확인하는 스크립트.
 
-앱과 같은 고정 설정(샘플 4장, yolo11n-seg, imgsz 480)으로 분석하고,
+앱과 같은 운영 설정(샘플 6~16장, 모델/해상도 환경변수)으로 분석하고,
 찾은 카테고리/박스 수/소요 시간을 출력한다. 키는 화면에 출력하지 않는다.
 
 사용:
-  python scripts/live_vlm.py C:\\path\\video.mp4
+  python scripts/live_vlm.py <video.mp4>
+  MOSAIC_TEST_FACE=... python scripts/live_vlm.py
 
 키는 `.env`/환경변수에서 읽고, 없으면 getpass로 안전하게 입력받는다.
 """
@@ -32,10 +33,19 @@ def _safe(text, api_key):
     return text
 
 
+def _default_video():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for p in (os.environ.get("MOSAIC_TEST_FACE"),
+              os.path.join(root, "samples", "face.mp4"),
+              os.path.join(os.path.expanduser("~"), "Downloads", "face.mp4")):
+        if p and os.path.exists(p):
+            return p
+    return os.path.join(root, "samples", "face.mp4")
+
+
 def main():
     parser = argparse.ArgumentParser(description="실제 Gemini VLM 분석 검증")
-    parser.add_argument("video", nargs="?",
-                        default=r"C:\Users\gong0000\Downloads\face.mp4")
+    parser.add_argument("video", nargs="?", default=_default_video())
     parser.add_argument("--vlm-model", default="",
                         help="Gemini 모델명 (비우면 .env의 VLM_MODEL)")
     args = parser.parse_args()
@@ -63,13 +73,16 @@ def main():
     err = None
     anno, persons, items = None, [], []
     try:
-        detector = get_model("yolo11n-seg.pt")
+        detector = get_model(os.environ.get("MOSAIC_MODEL", "yolo11m-seg.pt"))
         anno, persons, items = analyze_video(
-            args.video, detector, conf=0.20, imgsz=480, samples=4,
+            args.video, detector, conf=0.20,
+            imgsz=int(os.environ.get("MOSAIC_IMGSZ", "960")), samples=6,
+            max_samples=16,
             query_raw="얼굴, 차량번호판, 주소·간판, 명찰, 신분증, "
                       "휴대폰 화면, 차량동승자를 모두 찾아줘",
             targets=list(CANDS), api_key=api_key, vlm_model=model_name,
-            vlm_base_url=GEMINI_BASE_URL)
+            vlm_base_url=GEMINI_BASE_URL,
+            plate_zoom_budget=20, parallel_workers=6)
     except Exception as e:
         err = _safe(f"{type(e).__name__}: {e}", api_key)
 

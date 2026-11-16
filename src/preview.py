@@ -382,6 +382,20 @@ def analyze_first_frame_items(frame, model, conf, imgsz,
             if tightened != list(box["xyxy"]):
                 box = dict(box)
                 box["xyxy"] = tightened
+            # 주소·문서는 글자 위치에 맞춰 한 번 더 조인다. EAST가 글자를
+            # 못 찾으면 VLM 박스를 유지한다(노출 방지).
+            try:
+                from .texts import REFINE_CATS, refine_box_with_text
+                if cat in REFINE_CATS:
+                    refined = refine_box_with_text(frame, box["xyxy"])
+                    if refined is not None and plausible_box(
+                            cat, *refined, frame.shape[1],
+                            frame.shape[0]):
+                        box = dict(box)
+                        box["xyxy"] = refined
+                        box["source"] = "vlm+text"
+            except Exception:
+                pass
         if cat in prompt_set:
             box = dict(box)
             box["matches_prompt"] = True
@@ -444,9 +458,9 @@ def _merge_items(all_items, person_total=0):
 
 def analyze_video(video_path, model, conf, imgsz,
                   query_raw="", targets=None, api_key=None,
-                  vlm_model=VLM_MODEL, samples=12, vlm_base_url=None,
-                  plate_zoom_budget=10, parallel_workers=3,
-                  max_samples=10, sample_plan=None):
+                  vlm_model=VLM_MODEL, samples=6, vlm_base_url=None,
+                  plate_zoom_budget=20, parallel_workers=6,
+                  max_samples=16, sample_plan=None):
     """영상의 개인정보 후보를 찾아 체크리스트 항목을 만든다.
 
     샘플 프레임은 균등 배치만 쓰지 않는다. 균등 기본 샘플에 더해

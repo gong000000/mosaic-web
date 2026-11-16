@@ -11,45 +11,56 @@
 """
 import hashlib
 import json
+import logging
 import os
 import secrets
 import shutil
 import tempfile
+import threading
 import time
 
 import cv2
 import streamlit as st
 
 from src.config import (CANDS, CATEGORY_TYPE, GEMINI_BASE_URL, OUTPUT_DIR,
-                        PRESETS, ROOT_DIR, VLM_MODEL, env_api_key, label_ko)
+                        PRESET_CATS, ROOT_DIR, VLM_MODEL, env_api_key,
+                        label_ko)
 from src.models import get_model
 from src.preview import analyze_video
-from src.render import normalize_video, trim_video
+from src.render import normalize_video, strip_audio, trim_video
 from src.render_service import MosaicSettings, RenderPlan
-from src.vlm_package import prompt_categories
 from src import history as H
 from src import retention as RT
 from src.auth import require_login
 
 # blur.me 스튜디오처럼 항상 빠른 고정 설정을 쓴다.
-FAST_MODEL = "yolo11n-seg.pt"
-# imgsz 를 키우면 사람 마스크(세그먼트)가 정밀해져 모자이크가 사람
-# 형태에 더 정확히 붙는다. T4 에서도 충분히 빠르다.
-FAST_IMGSZ = 640
+# GPU(L4)에서는 yolo11m-seg + 960px가 충분히 빠르고, 사람 마스크 경계가
+# n/640보다 훨씬 정밀하다. 테스트/저사양 환경은 환경변수로 낮출 수 있다.
+FAST_MODEL = (os.environ.get("MOSAIC_MODEL")
+              or os.environ.get("MOSAIC_SEG_MODEL")
+              or "yolo11m-seg.pt")
+try:
+    FAST_IMGSZ = int(os.environ.get("MOSAIC_IMGSZ", "960"))
+except (TypeError, ValueError):
+    FAST_IMGSZ = 960
 FAST_STRIDE = 15
-# FAST_SAMPLES 는 균등 기본 샘플 수이고, 실제로는 여기에 '장면 전환'과
-# '움직임 피크' 샘플이 더해져 FAST_MAX_SAMPLES 까지 선택된다.
-FAST_SAMPLES = 4
-FAST_MAX_SAMPLES = 10
+# FAST_SAMPLES 는 균등 기본 샘플 수이고, 실제로는 여기에 '장면 전환',
+# '컷 직전', '움직임 피크' 샘플이 더해져 FAST_MAX_SAMPLES 까지 선택된다.
+FAST_SAMPLES = 8
+FAST_MAX_SAMPLES = 20
 FAST_PRESET = "veryfast"
 FAST_CONF = 0.20
 # 번호판 확대 탐지(차량 크롭) 허용 호출 수. 영상 1개 기준.
-FAST_PLATE_BUDGET = 10
+FAST_PLATE_BUDGET = 28
 
 # 렌더 단계에서 VLM을 다시 호출하지 않는다. 체크리스트 분석 결과
 # (priors)와 YOLO 추적만으로 전체 영상을 만든다. 같은 영상에 VLM 비용을
 # 두 번 쓰지 않고, 렌더 결과도 분석 결과와 일치한다.
 RENDER_VLM_CALLS = 0
+
+# 한 컨테이너에서 여러 세션이 동시에 렌더할 때 순번 대기를 알리기 위한 락.
+_RENDER_JOB_LOCK = threading.Lock()
+_HISTORY_PAGE_SIZE = 10
 
 
 st.set_page_config(
@@ -84,7 +95,7 @@ def _friendly_vlm_error(err, api_key=""):
     if ("401" in msg or "403" in msg or "invalid api key" in low
             or "unauthorized" in low or "permission" in low):
         return ("Gemini API 키가 올바르지 않거나 권한이 없습니다. "
-                "`.env`의 `GEMINI_API_KEY`를 확인하세요.")
+                "서버의 `GEMINI_API_KEY` 설정을 확인하세요(관리자에게 문의).")
     if ("429" in msg or "quota" in low or "rate limit" in low
             or "resource_exhausted" in low):
         compact = low.replace(" ", "").replace("_", "")
@@ -99,11 +110,12 @@ def _friendly_vlm_error(err, api_key=""):
         return ("Gemini 호출 한도를 초과했습니다. 잠시 후 다시 시도하거나 "
                 "더 짧은 영상을 사용하세요.")
     if "404" in msg or "model not found" in low:
-        return ("모델명을 찾을 수 없습니다. `.env`의 `VLM_MODEL` 값을 "
-                "확인하세요.")
+        return ("모델명을 찾을 수 없습니다. 서버의 `VLM_MODEL` 설정을 "
+                "확인하세요(관리자에게 문의).")
     if "json" in low and "해석" in msg:
         return msg
-    return msg
+    logging.getLogger("mosaic.app").error("VLM 오류(미분류): %s", msg[:500])
+    return "분석 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."
 
 
 def _unique_out_path(src_name, user):
@@ -145,7 +157,7 @@ def _sweep_old_temp_dirs(max_hours=24):
 
 
 def _probe_video(path):
-    """열기·첫 프레임·길이를 한 번에 확인한다. 실패하면 None."""
+    """열기·첫 프레임·길이·해상도를 한 번에 확인한다. 실패하면 None."""
     cap = cv2.VideoCapture(path)
     try:
         if not cap.isOpened():
@@ -155,7 +167,8 @@ def _probe_video(path):
             return None
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
-        return total, fps
+        h, w = frame.shape[:2]
+        return total, fps, w, h
     finally:
         cap.release()
 
@@ -177,21 +190,17 @@ def _invalidate_work():
         st.session_state.pop(key, None)
 
 
-def _build_items(base_items, prompt_cats):
-    """분석 결과를 체크리스트 항목으로 바꾼다.
-
-    프롬프트가 요구했지만 샘플에서 못 찾은 항목도 '못 찾음'으로 남겨
-    처리 단계에서 다시 찾을 수 있게 한다.
-    """
+def _build_items(base_items, preset_cats):
+    """분석 결과를 체크리스트 항목으로 바꾼다."""
     items = []
     seen = set()
     for item in base_items or []:
         copy = dict(item)
         copy["samples"] = dict(item.get("samples") or {})
-        copy["prompt_match"] = copy.get("category") in prompt_cats
+        copy["prompt_match"] = copy.get("category") in preset_cats
         items.append(copy)
         seen.add(copy.get("category"))
-    for cat in sorted(prompt_cats - seen):
+    for cat in sorted(preset_cats - seen):
         items.append({
             "category": cat,
             "label_ko": label_ko(cat),
@@ -228,15 +237,21 @@ def _fmt_size(path):
 
 
 def _render_history(user, expanded=False):
-    """로그인한 계정의 지난 작업만 보여준다. 업로드 전에도 호출한다."""
+    """로그인한 계정의 지난 작업만 페이지 단위로 보여준다."""
     with st.expander("지난 작업", expanded=expanded):
-        prefix = f"{user}--"
-        rows = [r for r in H.all_rows()
-                if str(r.get("file", "")).startswith(prefix)]
+        rows = H.all_rows(user=user)
         if not rows:
             st.write("저장된 작업이 없습니다.")
             return
-        for row in rows:
+        total_pages = max(1, (len(rows) + _HISTORY_PAGE_SIZE - 1)
+                          // _HISTORY_PAGE_SIZE)
+        page = 1
+        if total_pages > 1:
+            page = int(st.number_input(
+                f"페이지 (총 {len(rows)}건)", 1, total_pages, 1,
+                key="hist_page"))
+        start = (page - 1) * _HISTORY_PAGE_SIZE
+        for row in rows[start:start + _HISTORY_PAGE_SIZE]:
             fname = row.get("file")
             if not fname:
                 continue
@@ -258,19 +273,19 @@ def _render_history(user, expanded=False):
                     st.rerun()
 
 
-def _render_checklist(items, analysis_id, prompt_cats):
+def _render_checklist(items, analysis_id, preset_cats):
     """체크리스트를 그리고 선택된 카테고리 목록을 돌려준다."""
     if not items:
         return []
 
-    prompt_items = [it for it in items if it.get("category") in prompt_cats]
-    extra_items = [it for it in items if it.get("category") not in prompt_cats]
+    prompt_items = [it for it in items if it.get("category") in preset_cats]
+    extra_items = [it for it in items if it.get("category") not in preset_cats]
     filter_id = hashlib.sha1(
-        ("|".join(sorted(prompt_cats)) or "all").encode("utf-8")
+        ("|".join(sorted(preset_cats)) or "all").encode("utf-8")
     ).hexdigest()[:8]
 
     def _default_checked(cat):
-        return (cat in prompt_cats) if prompt_cats else True
+        return (cat in preset_cats) if preset_cats else False
 
     def _check_key(cat):
         return f"chk_{analysis_id}_{filter_id}_{cat}"
@@ -287,8 +302,6 @@ def _render_checklist(items, analysis_id, prompt_cats):
                 except Exception:
                     pass
         with c2:
-            # 샘플에서 못 찾은 항목은 렌더 단계에서 VLM을 다시 부르지
-            # 않으므로 가릴 위치가 없다. 얼굴만 사람 추적으로 적용한다.
             missing = bool(item.get("missing"))
             allowed = (not missing) or cat == "face"
             st.checkbox(_item_label(item),
@@ -317,16 +330,10 @@ if not st.session_state.get("tmp_swept"):
     st.session_state["tmp_swept"] = True
 
 
-def _apply_preset():
-    text = PRESETS.get(st.session_state.get("preset_sel", ""), "")
-    st.session_state["prompt_txt"] = text
-
-
-if "prompt_txt" not in st.session_state:
-    st.session_state["prompt_txt"] = PRESETS["얼굴 + 차량번호판"]
-
-# 프롬프트는 사이드바에서 한 번만 입력한다.
-prompt_raw = st.session_state.get("prompt_txt", "")
+# VLM 분석은 항상 모든 개인정보 후보를 찾는다(프라이버시 우선).
+# 사용자가 고른 프리셋은 '자동으로 체크할 항목'만 정한다.
+ANALYSIS_QUERY = ("얼굴, 차량번호판, 주소·간판, 명찰, 신분증, "
+                  "휴대폰 화면, 차량동승자를 모두 찾아줘")
 
 st.markdown(
     """
@@ -337,8 +344,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-RT.purge_old()
-H.remove_missing()
+# 위젯을 누를 때마다 앱이 다시 실행되므로, 디스크 스캔성 정리는 세션당
+# 5분에 한 번만 한다.
+if time.time() - st.session_state.get("_last_purge", 0) > 300:
+    RT.purge_old()
+    H.remove_missing()
+    st.session_state["_last_purge"] = time.time()
 
 with st.sidebar:
     st.caption(f"로그인: {current_user}")
@@ -353,20 +364,26 @@ with st.sidebar:
 
     st.subheader("영상")
     uploaded = st.file_uploader("mp4, mov, avi", type=["mp4", "mov", "avi"])
+    st.caption(
+        "분석을 위해 영상에서 뽑은 일부 프레임(모자이크 전 원본)이 "
+        "Google Gemini API로 전송됩니다. 업로드하면 이에 동의한 것으로 봅니다.")
 
     st.subheader("가릴 항목")
-    st.selectbox("프리셋", list(PRESETS.keys()), key="preset_sel",
-                 on_change=_apply_preset)
-    st.text_area("프롬프트", key="prompt_txt", height=90)
+    preset_name = st.selectbox("프리셋", list(PRESET_CATS.keys()),
+                               key="preset_sel")
+    preset_cats = set(PRESET_CATS.get(preset_name, ()))
+    if preset_name == "직접 선택":
+        st.caption("분석 후 아래 체크리스트에서 가릴 항목을 직접 고르세요.")
 
     st.divider()
+    strip_audio_opt = st.checkbox(
+        "오디오 제거", value=False,
+        help="목소리·대화 속 이름/주소가 남지 않도록 결과 영상에서 소리를 뺍니다.")
     auto_del = st.checkbox("받으면 결과 자동 삭제", value=False)
 
 # 로그인만 해도 지난 작업을 볼 수 있게 업로드 여부와 무관하게 보여준다.
-# 영상이 없을 때는 펼쳐서 바로 확인하고, 작업 중에는 접어 둔다.
 _render_history(current_user, expanded=not uploaded)
 
-# Gemini 하나만 쓴다. 모델명은 .env의 VLM_MODEL, 엔드포인트는 고정이다.
 vlm_model = VLM_MODEL
 vlm_base_url = GEMINI_BASE_URL
 api_key = env_api_key()
@@ -375,14 +392,20 @@ if not uploaded:
     st.write("영상을 업로드하세요.")
     st.stop()
 
-# 세션마다 임시 폴더 1개만 쓴다. 업로드가 바뀔 때만 다시 기록한다.
 tmp_dir = st.session_state.get("tmp_dir")
 if not tmp_dir or not os.path.isdir(tmp_dir):
     tmp_dir = tempfile.mkdtemp(prefix="mosaic_")
     st.session_state["tmp_dir"] = tmp_dir
 
 raw_bytes = uploaded.getvalue()
-digest = hashlib.sha256(raw_bytes).hexdigest()[:16]
+_fid = getattr(uploaded, "file_id", None)
+_cached = st.session_state.get("_digest_cache")
+if _fid is not None and _cached and _cached[0] == _fid:
+    digest = _cached[1]
+else:
+    digest = hashlib.sha256(raw_bytes).hexdigest()[:16]
+    if _fid is not None:
+        st.session_state["_digest_cache"] = (_fid, digest)
 upload_id = (uploaded.name, uploaded.size, digest)
 raw_suffix = os.path.splitext(uploaded.name)[1].lower()
 suffix = raw_suffix if raw_suffix in (".mp4", ".mov", ".avi") else ".mp4"
@@ -401,8 +424,8 @@ if st.session_state.get("upload_id") != upload_id or not os.path.exists(in_path)
     _invalidate_work()
 
 probe = _probe_video(in_path)
-# MOV/AVI는 브라우저 미리보기와 OpenCV 읽기가 불안정하므로 MP4 사본을 만든다.
-needs_norm = suffix != ".mp4" or probe is None
+needs_norm = (suffix != ".mp4" or probe is None
+              or (probe is not None and max(probe[2], probe[3]) > 1920))
 if needs_norm:
     if not os.path.exists(norm_path):
         with st.spinner("브라우저 호환 MP4로 변환 중..."):
@@ -420,11 +443,19 @@ if probe is None:
     st.error("영상을 읽을 수 없습니다. 손상되었거나 지원하지 않는 코덱입니다. "
              "MP4(H.264)로 변환해 다시 올려주세요.")
     st.stop()
-total0, fps0 = probe
+total0, fps0, width0, height0 = probe
 if not (fps0 > 0):
     fps0 = 30.0
 dur = total0 / fps0
-st.write(f"길이 {dur:.1f}초 · {total0}프레임")
+try:
+    max_seconds = float(os.environ.get("MOSAIC_MAX_SECONDS", "900"))
+except (TypeError, ValueError):
+    max_seconds = 900.0
+if max_seconds > 0 and dur > max_seconds:
+    st.warning(f"영상이 깁니다({dur:.0f}초). 구간을 자르지 않으면 "
+               f"최대 {max_seconds:.0f}초 제한에 걸립니다.")
+st.write(f"길이 {dur:.1f}초 · {total0}프레임 · "
+         f"{width0}×{height0}")
 
 use_trim = st.checkbox("구간만 처리", value=False)
 trim_sig = None
@@ -462,15 +493,24 @@ else:
     proc_in = src_path
 
 if st.session_state.get("trim_key") != trim_sig:
-    # 구간 설정을 껐다 켜거나 바꾸면 이전 분석/렌더는 현재 영상과 다르다.
     if st.session_state.get("trim_key") is not None or trim_sig is not None:
         _invalidate_work()
     st.session_state["trim_key"] = trim_sig
 
+_proc_probe = _probe_video(proc_in)
+if _proc_probe is not None:
+    _ptot, _pfps = _proc_probe[0], _proc_probe[1]
+    _pdur = _ptot / (_pfps if _pfps > 0 else 30.0)
+    if max_seconds > 0 and _pdur > max_seconds:
+        st.error(f"처리 구간이 너무 깁니다({_pdur:.0f}초). "
+                 f"최대 {max_seconds:.0f}초까지 처리할 수 있습니다. "
+                 "'구간만 처리'로 필요한 부분만 선택하세요.")
+        st.stop()
+
 st.subheader("개인정보 항목")
 
 if not api_key:
-    st.error("`.env`에 `GEMINI_API_KEY`를 설정한 뒤 앱을 다시 실행하세요.")
+    st.error("GEMINI_API_KEY 가 설정되지 않았습니다. 서버 설정(.env 또는 Modal Secret)을 확인하세요.")
     st.stop()
 
 key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
@@ -491,7 +531,7 @@ if st.session_state.get("analysis_key") != analysis_key:
             detector = get_model(FAST_MODEL)
             anno, persons, found = analyze_video(
                 proc_in, detector, conf=FAST_CONF, imgsz=FAST_IMGSZ,
-                query_raw=prompt_raw, targets=list(CANDS),
+                query_raw=ANALYSIS_QUERY, targets=list(CANDS),
                 api_key=api_key, vlm_model=vlm_model,
                 vlm_base_url=vlm_base_url, samples=FAST_SAMPLES,
                 max_samples=FAST_MAX_SAMPLES,
@@ -521,15 +561,14 @@ if preview_err:
 elif ok:
     st.write(f"사람 {person_total}명 · 개인정보 후보 {len(base_items)}종")
 
-prompt_cats = prompt_categories(prompt_raw)
-items = _build_items(base_items, prompt_cats) if ok else []
+items = _build_items(base_items, preset_cats) if ok else []
 
 selected_cats = []
 if items:
     analysis_id = hashlib.sha1(
         json.dumps(analysis_key, default=str, ensure_ascii=False)
         .encode("utf-8")).hexdigest()[:8]
-    selected_cats = _render_checklist(items, analysis_id, prompt_cats)
+    selected_cats = _render_checklist(items, analysis_id, preset_cats)
 elif ok:
     st.warning("이번 샘플에서 가릴 항목을 찾지 못했습니다.")
 
@@ -574,13 +613,17 @@ if not ok:
 elif not selected_cats:
     st.warning("가릴 항목을 하나 이상 체크하세요.")
 else:
-    source_token = f"{upload_id[2]}|{trim_sig}"
+    source_token = (f"{upload_id[2]}|{trim_sig}"
+                    + ("|noaudio" if strip_audio_opt else ""))
     plan = RenderPlan.from_items(items, selected_cats, settings)
     current_sig = plan.render_signature(
         source_token, FAST_MODEL, FAST_IMGSZ, FAST_STRIDE, FAST_CONF)
 
     if st.button("모자이크 시작", type="primary", key="start_mosaic"):
         out_path = _unique_out_path(uploaded.name, current_user)
+        if _RENDER_JOB_LOCK.locked():
+            st.info("다른 사용자의 모자이크 작업이 진행 중입니다. "
+                    "순서대로 자동 시작됩니다...")
         progress = st.progress(0.0, text="렌더 준비 중...")
 
         def on_progress(frac, done, total, elapsed):
@@ -593,25 +636,25 @@ else:
                 pass
 
         try:
-            pass1_sig = plan.pass1_signature(
-                source_token, FAST_MODEL, FAST_IMGSZ, FAST_STRIDE,
-                FAST_CONF)
-            cache_path = os.path.join(tmp_dir, f"pass1_{pass1_sig}.pkl")
-            started = time.time()
-            stats = plan.render(
-                proc_in, out_path,
-                model_name=FAST_MODEL, imgsz=FAST_IMGSZ,
-                stride=FAST_STRIDE, conf=FAST_CONF, preset=FAST_PRESET,
-                progress_fn=on_progress, query_raw=prompt_raw,
-                api_key=api_key, vlm_model=vlm_model,
-                vlm_base_url=vlm_base_url, cache_path=cache_path,
-                use_cache=True, vlm_call_limit=RENDER_VLM_CALLS)
-            elapsed = time.time() - started
-            if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-                raise RuntimeError("결과 영상이 만들어지지 않았습니다.")
-            # 인원수는 렌더 중 동시 트랙 수보다 분석 체크리스트의
-            # 동시 인원(person_total)을 쓴다. 로컬 추적은 해상/중복으로
-            # 순간 최대값이 부풀 수 있어 요약이 실제보다 커진다.
+            with _RENDER_JOB_LOCK:
+                pass1_sig = plan.pass1_signature(
+                    source_token, FAST_MODEL, FAST_IMGSZ, FAST_STRIDE,
+                    FAST_CONF)
+                cache_path = os.path.join(tmp_dir, f"pass1_{pass1_sig}.json")
+                started = time.time()
+                stats = plan.render(
+                    proc_in, out_path,
+                    model_name=FAST_MODEL, imgsz=FAST_IMGSZ,
+                    stride=FAST_STRIDE, conf=FAST_CONF, preset=FAST_PRESET,
+                    progress_fn=on_progress, query_raw=ANALYSIS_QUERY,
+                    api_key=api_key, vlm_model=vlm_model,
+                    vlm_base_url=vlm_base_url, cache_path=cache_path,
+                    use_cache=True, vlm_call_limit=RENDER_VLM_CALLS)
+                elapsed = time.time() - started
+                if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+                    raise RuntimeError("결과 영상이 만들어지지 않았습니다.")
+                if strip_audio_opt:
+                    strip_audio(out_path)
             person_selected = any(
                 CATEGORY_TYPE.get(c) == "person" for c in selected_cats)
             if "face" in selected_cats:
@@ -631,10 +674,11 @@ else:
             st.session_state["render_sig"] = current_sig
             st.session_state["render_summary"] = summary
             st.session_state["render_sec"] = elapsed
-            H.add(src_name=uploaded.name, prompt=prompt_raw,
+            H.add(src_name=uploaded.name, prompt=preset_name,
                   target=",".join(selected_cats), invert=False,
                   out_name=os.path.basename(out_path), seconds=elapsed,
-                  query_raw=prompt_raw, selector="vlm", summary=summary)
+                  query_raw=preset_name, selector="vlm", summary=summary,
+                  user=current_user)
             progress.progress(1.0, text="완료")
             st.rerun()
         except Exception as e:
@@ -656,12 +700,7 @@ if render_valid:
         summary, _fmt_size(render_out)) if part)
     if detail:
         st.caption(detail)
-    try:
-        with open(render_out, "rb") as f:
-            video_bytes = f.read()
-    except OSError:
-        video_bytes = b""
-    if video_bytes:
+    if os.path.getsize(render_out) > 0:
         download_name = (os.path.splitext(uploaded.name)[0]
                          + "_mosaic.mp4")
         out_name = os.path.basename(render_out)
@@ -674,10 +713,10 @@ if render_valid:
                 st.session_state.pop("render_summary", None)
                 st.session_state.pop("render_sec", None)
 
-        st.download_button(
-            "모자이크 영상 다운로드", video_bytes,
-            file_name=download_name, mime="video/mp4",
-            on_click=_after_download, key="download_mosaic")
+        with open(render_out, "rb") as f:
+            st.download_button(
+                "모자이크 영상 다운로드", f,
+                file_name=download_name, mime="video/mp4",
+                on_click=_after_download, key="download_mosaic")
 else:
     st.write("모자이크 시작을 누르면 영상이 여기에 표시됩니다.")
-

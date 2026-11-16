@@ -104,32 +104,37 @@ def _too_close(idx, others, gap):
     return False
 
 
-def plan_samples(video_path, base_count=4, max_count=10, max_cuts=4,
-                  max_peaks=3, min_gap_ratio=0.05, scan_max=480):
+def plan_samples(video_path, base_count=6, max_count=16, max_cuts=4,
+                  max_peaks=4, max_pre_cuts=2, min_gap_ratio=0.05,
+                  scan_max=900):
     """분석에 쓸 프레임 인덱스를 고른다.
 
     base_count : 균등 기본 샘플 수 (항상 포함)
     max_count  : 전체 상한. 이 값을 넘으면 움직임 피크 → 컷 순으로 버린다.
     max_cuts   : 장면 전환 샘플 최대 개수
     max_peaks  : 움직임 피크 샘플 최대 개수
+    max_pre_cuts : 장면 전환 '직전' 샘플 최대 개수. 컷 직전 프레임에만
+                   스치는 물체를 잡기 위한 보조 샘플이다.
     min_gap_ratio : 샘플 사이 최소 간격 (영상 길이 대비)
 
-    returns dict(indices, cuts, peaks, total, motion)
+    returns dict(indices, cuts, peaks, pre_cuts, total, motion)
     """
     base_count = max(1, int(base_count))
     max_count = max(base_count, int(max_count))
     max_cuts = max(0, int(max_cuts))
     max_peaks = max(0, int(max_peaks))
+    max_pre_cuts = max(0, int(max_pre_cuts))
 
     total, motion = scan_motion(video_path, scan_max=scan_max)
-    empty = {"indices": [], "cuts": [], "peaks": [], "all_cuts": [],
-             "total": total, "motion": motion}
+    empty = {"indices": [], "cuts": [], "peaks": [], "pre_cuts": [],
+             "all_cuts": [], "total": total, "motion": motion}
     if total <= 0:
         return empty
     if total <= base_count:
         # 영상이 짧으면 모든 프레임을 본다.
         return {"indices": list(range(total)), "cuts": [], "peaks": [],
-                "all_cuts": [], "total": total, "motion": motion}
+                "pre_cuts": [], "all_cuts": [], "total": total,
+                "motion": motion}
 
     base = sorted({int(round(v)) for v in
                    np.linspace(0, total - 1, base_count)})
@@ -156,7 +161,21 @@ def plan_samples(video_path, base_count=4, max_count=10, max_cuts=4,
         if len(cuts) >= max_cuts:
             break
 
-    # 2) 움직임 피크: 변화량의 국소 최댓값. 컷 없는 CCTV에서 사람이
+    # 2) 장면 전환 직전: 컷 직후만 보면 전환 순간 사라지는 물체를 놓친다.
+    #    컷과는 가까워도 되도록 더 작은 간격으로 검사한다.
+    pre_cuts = []
+    pre_gap = max(1, min_gap // 3)
+    for idx in cuts:
+        if len(pre_cuts) >= max_pre_cuts:
+            break
+        target = max(0, int(idx) - max(1, min_gap // 2))
+        if target in cuts or any(abs(target - c) < pre_gap for c in pre_cuts):
+            continue
+        if _too_close(target, base + cuts, pre_gap):
+            continue
+        pre_cuts.append(target)
+
+    # 3) 움직임 피크: 변화량의 국소 최댓값. 컷 없는 CCTV에서 사람이
     #    스치는 지점을 잡는다. 같은 움직임의 연속 프레임이 중복으로
     #    잡히지 않도록 이웃 2프레임까지 비교한다.
     peak_candidates = []
@@ -170,19 +189,25 @@ def plan_samples(video_path, base_count=4, max_count=10, max_cuts=4,
         peak_candidates.append((int(idx), score))
     peaks = []
     for idx, _score in sorted(peak_candidates, key=lambda x: -x[1]):
-        if _too_close(idx, base + cuts + peaks, min_gap):
+        if _too_close(idx, base + cuts + pre_cuts + peaks, min_gap):
             continue
         peaks.append(int(idx))
         if len(peaks) >= max_peaks:
             break
 
-    # 우선순위: 기본 샘플 > 컷 > 피크. 상한을 넘으면 낮은 우선순위부터 버린다.
+    # 우선순위: 기본 샘플 > 컷 > 컷 직전 > 피크. 상한을 넘으면 낮은
+    # 우선순위부터 버린다.
     picked = list(base)
     picked += cuts
+    picked += pre_cuts
     picked += peaks
     if len(picked) > max_count:
         keep = list(base)
         for idx in cuts:
+            if len(keep) >= max_count:
+                break
+            keep.append(idx)
+        for idx in pre_cuts:
             if len(keep) >= max_count:
                 break
             keep.append(idx)
@@ -194,6 +219,7 @@ def plan_samples(video_path, base_count=4, max_count=10, max_cuts=4,
 
     return {"indices": sorted(set(int(i) for i in picked)),
             "cuts": sorted(set(cuts)), "peaks": sorted(set(peaks)),
+            "pre_cuts": sorted(set(pre_cuts)),
             "all_cuts": sorted(set(all_cuts)),
             "total": total, "motion": motion}
 

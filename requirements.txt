@@ -6,6 +6,8 @@ numpy==2.2.6
 imageio-ffmpeg==0.6.0
 torch==2.6.0
 torchvision==0.21.0
+# 얼굴 개인별 실루엣용 랜드마크. 없으면 고정 얼굴형으로 대체된다.
+mediapipe==1.2.3
 # Gemini의 OpenAI 호환 엔드포인트에 접속하기 위한 HTTP 클라이언트.
 # ChatGPT/OpenAI 모델은 사용하지 않는다.
-openai>=1.0
+openai==3.28.0

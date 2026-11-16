@@ -106,7 +106,13 @@ def main():
     b = [{"xyxy": [10, 0, 20, 10]}]
     mid = _sample_boxes({0: a, 1: b}, 0, frame_idx=1,
                         stride=2, interpolate=True)
-    assert mid and mid[0]["xyxy"] == [5, 0, 15, 10], mid
+    assert mid, mid
+    mx1, my1, mx2, my2 = mid[0]["xyxy"]
+    # 움직임이 큰 객체는 보간 박스에 여유(패딩)가 붙는다. 중심은 두 박스
+    # 사이에 있고, 앞뒤 박스를 모두 포함해야 한다.
+    assert mx1 <= 5 and mx2 >= 15, mid
+    assert my1 <= 0 and my2 >= 10, mid
+    assert 10 <= mx2 - mx1 <= 24, mid
 
     tmp = tempfile.mkdtemp(prefix="mosaic_check_")
     src = os.path.join(tmp, "in.mp4")

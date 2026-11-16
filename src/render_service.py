@@ -11,6 +11,7 @@ import json
 from dataclasses import dataclass, field
 
 from .config import CATEGORY_TYPE, category_type
+from .manual import normalize_regions, regions_signature
 from .pipeline import mosaic_video
 
 
@@ -70,9 +71,10 @@ class RenderPlan:
     person_priors: dict = field(default_factory=dict)
     mask_all_persons: bool = False
     settings: MosaicSettings = field(default_factory=MosaicSettings)
+    manual_regions: list = field(default_factory=list)
 
     @classmethod
-    def from_items(cls, items, selected_cats, settings):
+    def from_items(cls, items, selected_cats, settings, manual_regions=None):
         selected = set(selected_cats or [])
         targets = []
         region_priors = {}
@@ -95,7 +97,8 @@ class RenderPlan:
         # 적용한다(프라이버시 우선). 명찰/동승자는 찾은 위치만 쓴다.
         mask_all_persons = "face" in selected
         return cls(tuple(sorted(set(targets))), region_priors,
-                   person_priors, mask_all_persons, settings)
+                   person_priors, mask_all_persons, settings,
+                   normalize_regions(manual_regions))
 
     def pass1_signature(self, source_token, model_name, imgsz, stride, conf):
         payload = {
@@ -120,6 +123,7 @@ class RenderPlan:
             "pass1": self.pass1_signature(source_token, model_name,
                                            imgsz, stride, conf),
             "settings": self.settings.as_dict(),
+            "manual": regions_signature(self.manual_regions),
         }
         raw = json.dumps(payload, sort_keys=True,
                          ensure_ascii=False).encode("utf-8")
@@ -128,7 +132,7 @@ class RenderPlan:
     def render(self, input_path, output_path, *, model_name, imgsz, stride,
                conf, preset, progress_fn=None, query_raw="", api_key=None,
                vlm_model=None, vlm_base_url=None, cache_path=None,
-               use_cache=True, vlm_call_limit=0):
+               use_cache=True, vlm_call_limit=0, debug_path=None):
         """pipeline에 렌더를 위임한다. VLM 재호출은 기본 0회."""
         return mosaic_video(
             input_path, output_path,
@@ -154,4 +158,6 @@ class RenderPlan:
             use_cache=use_cache,
             vlm_call_limit=vlm_call_limit,
             mask_all_persons=self.mask_all_persons,
+            manual_regions=self.manual_regions,
+            debug_path=debug_path,
         )

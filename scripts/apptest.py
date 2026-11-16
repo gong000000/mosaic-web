@@ -17,6 +17,12 @@ os.environ["MOSAIC_SKIP_DOTENV"] = "1"
 for _name in ("GOOGLE_API_KEY", "VLM_API_KEY"):
     os.environ[_name] = ""
 os.environ["GEMINI_API_KEY"] = "fake-key"
+# 테스트는 CPU에서 빠르게 돌아야 하므로 가벼운 모델/해상도를 쓴다.
+# 실제 배포 기본값은 yolo11m-seg.pt / 960이다.
+os.environ["MOSAIC_MODEL"] = "yolo11n-seg.pt"
+os.environ["MOSAIC_IMGSZ"] = "640"
+os.environ["MOSAIC_HEAD_POSE"] = "0"
+os.environ["MOSAIC_FACE_MULTISCALE"] = "0"
 
 from streamlit.testing.v1 import AppTest
 
@@ -25,8 +31,20 @@ from streamlit.testing.v1 import AppTest
 from src import retention as RT
 RT.purge_old = lambda *args, **kwargs: 0
 
-FACE = r"C:\Users\gong0000\Downloads\face.mp4"
-STREET = r"C:\Users\gong0000\Downloads\street.mp4"
+
+def _sample(env, name):
+    """테스트 영상 경로: 환경변수 > 저장소의 samples/ > ~/Downloads."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for p in (os.environ.get(env),
+              os.path.join(root, "samples", name),
+              os.path.join(os.path.expanduser("~"), "Downloads", name)):
+        if p and os.path.exists(p):
+            return p
+    return os.path.join(root, "samples", name)
+
+
+FACE = _sample("MOSAIC_TEST_FACE", "face.mp4")
+STREET = _sample("MOSAIC_TEST_STREET", "street.mp4")
 
 
 _SEEN_QUERIES = []
@@ -131,11 +149,11 @@ def _click_start(at):
     return out
 
 
-def _upload_and_analyze(at, video, prompt, stub):
+def _upload_and_analyze(at, video, preset, stub):
     _patch(stub)
     at.run()
-    # 프롬프트를 먼저 정하고 업로드해야 분석 호출에 프롬프트가 들어간다.
-    at.sidebar.text_area(key="prompt_txt").input(prompt)
+    # 프리셋은 분석 후 체크리스트의 기본 선택 항목을 정한다.
+    at.sidebar.selectbox(key="preset_sel").select(preset)
     at.run()
     at.sidebar.file_uploader[0].upload(
         os.path.basename(video), open(video, "rb").read(), "video/mp4")
@@ -149,14 +167,15 @@ def _upload_and_analyze(at, video, prompt, stub):
 def run_face():
     _SEEN_QUERIES.clear()
     at = _open_app()
-    _upload_and_analyze(at, FACE, "얼굴만 모자이크해줘", _face_stub)
+    _upload_and_analyze(at, FACE, "얼굴만", _face_stub)
 
     assert "분석 실패" not in _warnings(at), _warnings(at)
     items = at.session_state["analysis"]["items"]
     cats = {it["category"] for it in items}
     assert "face" in cats, cats
     assert "얼굴" in _checkboxes(at), _checkboxes(at)
-    assert "얼굴만 모자이크해줘" in _SEEN_QUERIES, _SEEN_QUERIES
+    assert any("얼굴" in q and "차량번호판" in q for q in _SEEN_QUERIES), \
+        _SEEN_QUERIES
 
     out = _click_start(at)
     assert at.session_state.get("render_sig"), "렌더 서명 없음"
@@ -169,7 +188,7 @@ def run_face():
 def run_plate():
     _SEEN_QUERIES.clear()
     at = _open_app()
-    _upload_and_analyze(at, STREET, "차량번호판만 모자이크해줘", _plate_stub)
+    _upload_and_analyze(at, STREET, "번호판만", _plate_stub)
 
     assert "분석 실패" not in _warnings(at), _warnings(at)
     items = at.session_state["analysis"]["items"]
@@ -178,7 +197,7 @@ def run_plate():
     plate = next(it for it in items if it["category"] == "license_plate")
     assert plate["type"] == "region"
     assert "차량번호판" in _checkboxes(at), _checkboxes(at)
-    assert "차량번호판만 모자이크해줘" in _SEEN_QUERIES, _SEEN_QUERIES
+    assert any("차량번호판" in q for q in _SEEN_QUERIES), _SEEN_QUERIES
 
     out = _click_start(at)
     assert "download_mosaic" in _keys(at), _keys(at)
@@ -190,7 +209,7 @@ def run_plate():
 def run_missing_region():
     """샘플에서 못 찾은 배경 항목은 선택할 수 없고, 얼굴은 선택된다."""
     at = _open_app()
-    _upload_and_analyze(at, FACE, "얼굴과 차량번호판 모자이크", _face_stub)
+    _upload_and_analyze(at, FACE, "얼굴 + 번호판", _face_stub)
 
     plate_cb = next((c for c in at.checkbox
                      if "차량번호판" in str(c.label)), None)
@@ -205,12 +224,11 @@ def run_missing_region():
     print("OK missing-region")
 
 
-def run_prompt_switch():
-    """프롬프트 변경 시 VLM 재분석 없이 체크리스트가 즉시 갱신되는지."""
+def run_preset_switch():
+    """프리셋 변경 시 VLM 재분석 없이 체크리스트가 즉시 갱신되는지."""
     _SEEN_QUERIES.clear()
     at = _open_app()
-    _upload_and_analyze(at, FACE, "얼굴과 차량번호판 모자이크",
-                        _face_plate_stub)
+    _upload_and_analyze(at, FACE, "얼굴 + 번호판", _face_plate_stub)
 
     items = at.session_state["analysis"]["items"]
     cats = {it["category"] for it in items}
@@ -226,10 +244,9 @@ def run_prompt_switch():
     assert "차량번호판" in _checkboxes(at), _checkboxes(at)
 
     calls_before = len(_SEEN_QUERIES)
-    # 사이드바 프롬프트를 '얼굴만'으로 바꾼다. 체크박스 키에 프롬프트
-    # 필터 ID가 포함되므로 번호판 체크는 자동으로 사라지고, VLM은 다시
-    # 부르지 않는다(체크리스트만 갱신).
-    at.sidebar.text_area(key="prompt_txt").input("얼굴만 모자이크")
+    # 프리셋을 '얼굴만'으로 바꾼다. 체크박스 키에 프리셋 필터 ID가
+    # 포함되므로 번호판 체크는 자동으로 사라지고, VLM은 다시 부르지 않는다.
+    at.sidebar.selectbox(key="preset_sel").select("얼굴만")
     at.run()
     second = set()
     for c in at.checkbox:
@@ -244,11 +261,11 @@ def run_prompt_switch():
     assert not any(c.value for c in plate_boxes), _checkboxes(at)
     face_boxes = [c for c in at.checkbox if "얼굴" in str(c.label)]
     assert face_boxes and face_boxes[0].value, _checkboxes(at)
-    assert len(_SEEN_QUERIES) == calls_before, "프롬프트 변경에 VLM 재호출됨"
+    assert len(_SEEN_QUERIES) == calls_before, "프리셋 변경에 VLM 재호출됨"
 
     assert not [e for e in at.error], [e.value for e in at.error]
     _cleanup(at)
-    print("OK prompt-switch")
+    print("OK preset-switch")
 
 
 def main():
@@ -259,7 +276,7 @@ def main():
     run_face()
     run_plate()
     run_missing_region()
-    run_prompt_switch()
+    run_preset_switch()
     print("APPTEST_PASS")
     return 0
 

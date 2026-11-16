@@ -17,7 +17,18 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import cv2
 import numpy as np
 
-FACE = r"C:\Users\gong0000\Downloads\face.mp4"
+def _sample(env, name):
+    """테스트 영상 경로: 환경변수 > 저장소의 samples/ > ~/Downloads."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for p in (os.environ.get(env),
+              os.path.join(root, "samples", name),
+              os.path.join(os.path.expanduser("~"), "Downloads", name)):
+        if p and os.path.exists(p):
+            return p
+    return os.path.join(root, "samples", name)
+
+
+FACE = _sample("MOSAIC_TEST_FACE", "face.mp4")
 
 # face.mp4 첫 프레임 1번 사람 박스 [47, 61, 395, 647] 안쪽에 겹치는 영역
 STUB_BOX = [150, 250, 320, 500]

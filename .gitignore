@@ -5,9 +5,10 @@ __pycache__/
 .pytest_cache/
 *.pt
 !weights/yolo11n-seg.pt
+!weights/license-plate-finetune-v1n.pt
+*.pb
 outputs/*.mp4
 outputs/jobs.json
-/docs/
 .env
 .env.*
 !.env.example

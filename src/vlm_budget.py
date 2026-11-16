@@ -5,13 +5,23 @@ Gemini 호출 한도를 초과하지 않도록 영상 단위 예산을 관리하
 수' 제한도 걸려 있으므로, 전역 스로틀(분당 N회)로 호출 자체를 천천히
 분산한다.
 """
+import os
 import threading
 import time
 from collections import deque
 
-# 무료 티어 분당 한도는 모델에 따라 15회 내외다. 여유를 두어 12회로
-# 제한하고, 429가 나면 아래 재시도 경로가 대신 기다린다.
-DEFAULT_CALLS_PER_MINUTE = 12
+
+def _default_rpm():
+    """분당 호출 상한. 배포 환경에서 MOSAIC_VLM_RPM으로 조절한다."""
+    try:
+        return max(1, int(os.environ.get("MOSAIC_VLM_RPM", "90")))
+    except (TypeError, ValueError):
+        return 90
+
+
+# 병렬 분석(기본 6워커)에서도 전체 호출량을 예측 가능하게 유지한다.
+# 무료/유료 한도가 낮은 키를 쓸 때는 MOSAIC_VLM_RPM=12 처럼 낮춘다.
+DEFAULT_CALLS_PER_MINUTE = _default_rpm()
 
 
 class VLMThrottle:
