@@ -34,10 +34,11 @@
 - **보관 정책**: 24시간 만료 + 결과 500개/20GB 상한. `MOSAIC_MAX_OUTPUT_FILES`,
   `MOSAIC_MAX_OUTPUT_GB`로 조정한다. `jobs.db`/WAL은 삭제 대상에서 제외한다.
 - **저장소 보안**: GitHub 저장소를 private로 전환하고, 실제 얼굴이 있는 테스트
-  영상 4개를 git 히스토리에서 제거했다. `docs/*.mp4`는 `.gitignore`로 제외하고
-  `docs/TEST_VIDEOS.md`에 로컬 전용 사용법을 기록했다. 저장소 팩 크기는
-  13.75MiB로 줄었다. 이후 사용자 선택으로 저장소를 **public**으로 전환했고,
-  `master`에 `unit`, `lint` 필수 체크와 force-push/삭제 금지를 설정했다.
+  영상 4개를 git 히스토리에서 제거했다. `docs/` 폴더(영상·문서)는 저장소와
+  로컬에서 삭제했고, 테스트 영상은 `samples/` 또는 `MOSAIC_TEST_*` 환경변수로
+  지정한다. 저장소 팩 크기는 13MiB대로 줄었다. 이후 사용자 선택으로 저장소를
+  **public**으로 전환했고, `master`에 `unit`, `lint` 필수 체크와
+  force-push/삭제 금지를 설정했다.
   (히스토리 rewrite 전 커밋은 GitHub GC 전까지 과거 SHA로 접근될 수 있다.)
 - **CI**: `pytest>=8.0,<10`이 bash 리다이렉션으로 해석돼 실패하던 것을 따옴표로
   고쳤다. `pip check`, Dependabot(pip/GitHub Actions) 추가. 취약점 알림/자동

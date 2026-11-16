@@ -283,8 +283,8 @@ python scripts/leak_metrics.py 결과.mp4   # YuNet 재검출 대리 지표
 - `qualitytest.py`는 마스크가 사람 밖으로 번지지 않는지, 강도가 높을수록
   블록이 커지는지, 기울어진 얼굴·긴 샘플 간격 보간이 유지되는지 봅니다.
 - 테스트 영상은 `MOSAIC_TEST_FACE`, `MOSAIC_TEST_STREET` 환경변수나
-  `docs/face.mp4`, `docs/street.mp4`로 지정합니다. 실제 얼굴이 있어 git에는
-  커밋하지 않으며, 파일명과 사용법은 `docs/TEST_VIDEOS.md`에 있습니다.
+  `samples/face.mp4`, `samples/street.mp4`로 지정합니다. 저장소에는 포함하지
+  않으며, 없으면 해당 테스트는 건너뜁니다.
 - `python scripts/live_vlm.py <영상 경로>`는 실제 Gemini 분석 결과를
   확인합니다(키 필요).
 - CI(`.github/workflows/ci.yml`)는 `tests/`와 정적 검사를 실행합니다.
