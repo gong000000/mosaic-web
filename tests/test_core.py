@@ -4,12 +4,14 @@ import sys
 import tempfile
 import types
 
-import numpy as np
+import numpy as np  # noqa: E402
+import cv2  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from src.faces import FaceTracker, expand_face_box  # noqa: E402
+from src.faces import (FaceTracker, expand_face_box, detect_faces,
+                       filter_faces_by_person)  # noqa: E402
 
 
 def _moving_dets(n, speed):
@@ -75,6 +77,41 @@ def test_plate_tracker_holds_big_jump_until_confirmed():
     tr = t.tracks[1]
     assert tr.pending_box is None
     assert list(tr.committed_box) == [100, 121, 160, 151]
+
+
+def test_dog_face_is_not_mosaicked():
+    # CC0 Boxer-dog.jpg (Karen Arnold, Wikimedia Commons)
+    path = os.path.join(ROOT, "tests", "fixtures", "boxer_dog.jpg")
+    frame = cv2.imread(path)
+    assert frame is not None, path
+    assert detect_faces(frame) == [], "강아지 얼굴을 사람 얼굴로 검출함"
+
+
+def test_hand_and_background_have_no_face():
+    frame = np.full((480, 640, 3), (60, 70, 80), np.uint8)
+    skin = (120, 160, 210)
+    cv2.ellipse(frame, (320, 300), (80, 110), 0, 0, 360, skin, -1)
+    for dx in (-60, -30, 0, 30, 60):
+        cv2.line(frame, (320 + dx, 260), (320 + dx, 110),
+                 skin, 24, cv2.LINE_AA)
+    assert detect_faces(frame) == [], "손 모양을 얼굴로 검출함"
+
+    rng = np.random.default_rng(7)
+    bg = rng.integers(0, 255, (480, 640, 3), dtype=np.uint8)
+    bg = cv2.GaussianBlur(bg, (9, 9), 0)
+    for i in range(0, 640, 40):
+        cv2.line(bg, (i, 0), (i, 480), (255, 255, 255), 2)
+    for j in range(0, 480, 40):
+        cv2.line(bg, (0, j), (640, j), (255, 255, 255), 2)
+    assert detect_faces(bg) == [], "배경 무늬를 얼굴로 검출함"
+
+
+def test_person_gate_drops_ambiguous_face_outside_person():
+    fake = [([400, 200, 500, 300], 0.55)]
+    persons = [[0, 0, 200, 600]]
+    out = filter_faces_by_person(
+        fake, persons, frame_area=1280 * 720)
+    assert out == [], "사람 밖의 애매한 얼굴 검출을 거르지 못함"
 
 
 def test_tracker_extrapolates_on_miss():
