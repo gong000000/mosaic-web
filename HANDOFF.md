@@ -36,11 +36,12 @@
 - **저장소 보안**: GitHub 저장소를 private로 전환하고, 실제 얼굴이 있는 테스트
   영상 4개를 git 히스토리에서 제거했다. `docs/*.mp4`는 `.gitignore`로 제외하고
   `docs/TEST_VIDEOS.md`에 로컬 전용 사용법을 기록했다. 저장소 팩 크기는
-  13.75MiB로 줄었다.
+  13.75MiB로 줄었다. 이후 사용자 선택으로 저장소를 **public**으로 전환했고,
+  `master`에 `unit`, `lint` 필수 체크와 force-push/삭제 금지를 설정했다.
+  (히스토리 rewrite 전 커밋은 GitHub GC 전까지 과거 SHA로 접근될 수 있다.)
 - **CI**: `pytest>=8.0,<10`이 bash 리다이렉션으로 해석돼 실패하던 것을 따옴표로
   고쳤다. `pip check`, Dependabot(pip/GitHub Actions) 추가. 취약점 알림/자동
-  보안 수정은 활성화했다. **브랜치 보호는 GitHub Free private 저장소라 403**
-  (Pro 업그레이드 또는 public 전환 필요).
+  보안 수정은 활성화했다. 브랜치 보호는 public 전환 후 정상 적용됐다.
 - **의존성 취약점**: Dependabot이 torch 2.6.0에서 high 2건 포함 18건을 보고해
   `torch==2.14.1`, `torchvision==0.29.1`(cu126)로 올렸다. Modal T4에서
   torch 2.14.1+cu126 / CUDA True / yolo11m-seg 960 추론 54.9ms로 정상 동작하고,
@@ -347,16 +348,14 @@ YuNet이 오른쪽 남성을 1프레임 놓쳤다가 다시 잡으면서 모자�
 - SAM2, 실시간 스트림은 범위 밖이다.
 
 ## 남은 일 (우선순위)
-1. **브랜치 보호**: GitHub Free private 저장소라 API가 403이다. Pro 업그레이드
-   또는 public 전환 후 `master`에 `unit`, `lint` 필수 체크를 걸어야 한다.
-2. **주소 정밀도/재현율 라벨링**: 현재는 EAST 정제율/타이트함만 측정했다.
+1. **주소 정밀도/재현율 라벨링**: 현재는 EAST 정제율/타이트함만 측정했다.
    street/NY 20~30프레임에 실제 주소·간판 박스를 라벨링해 precision/recall을
    측정하면 좋다.
-3. **지속형 작업 큐**: `RenderGate`는 한 프로세스 안에서 동시 렌더만 막는다.
+2. **지속형 작업 큐**: `RenderGate`는 한 프로세스 안에서 동시 렌더만 막는다.
    컨테이너 재시작/다중 컨테이너까지 고려하려면 SQLite 작업 테이블 + 워커
    스레드로 확장해야 한다. 현재 `max_containers=1`이라 급하지 않다.
-4. **CI 통합 테스트**: 테스트 영상이 로컬 전용이라 `apptest`/`regression`은
+3. **CI 통합 테스트**: 테스트 영상이 로컬 전용이라 `apptest`/`regression`은
    CI에서 돌지 않는다. 공개 가능한 합성/짧은 샘플을 `tests/fixtures`에 넣고
    apptest를 CI에 추가하는 방법이 있다.
-5. **SAM2/얼굴 파싱**: 사람 경계 정밀도가 실제 불만이 될 때만 검토. 현재
+4. **SAM2/얼굴 파싱**: 사람 경계 정밀도가 실제 불만이 될 때만 검토. 현재
    문제(깜빡임·번호판·군중)는 해결되지 않고 렌더만 느려진다.
