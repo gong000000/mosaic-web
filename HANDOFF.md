@@ -41,6 +41,10 @@
   고쳤다. `pip check`, Dependabot(pip/GitHub Actions) 추가. 취약점 알림/자동
   보안 수정은 활성화했다. **브랜치 보호는 GitHub Free private 저장소라 403**
   (Pro 업그레이드 또는 public 전환 필요).
+- **의존성 취약점**: Dependabot이 torch 2.6.0에서 high 2건 포함 18건을 보고해
+  `torch==2.14.1`, `torchvision==0.29.1`(cu126)로 올렸다. Modal T4에서
+  torch 2.14.1+cu126 / CUDA True / yolo11m-seg 960 추론 54.9ms로 정상 동작하고,
+  face.mp4 live E2E도 PASS(분석 10.7초, 렌더 12.5초)했다.
 
 ### 강건성
 - 4K 3840×2160 → 1920×1080 종횡비 보존(기존에는 1920×2160으로 찌그러짐).
