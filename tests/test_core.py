@@ -501,8 +501,11 @@ def test_render_queue_cancel_queued_and_running():
             preset="veryfast", query_raw="q")
 
     queued = add()
+    queued_input = q.get(queued)["input_path"]
+    assert os.path.exists(queued_input)
     assert q.cancel(queued, "alice") is True
     assert q.get(queued)["status"] == "cancelled"
+    assert not os.path.exists(queued_input), "취소된 queued 입력 파일이 남음"
     assert q.claim() is None
 
     running = add()

@@ -184,16 +184,18 @@ class RenderQueue:
 
     def cancel(self, job_id, user):
         """queued면 즉시 취소, running이면 취소 요청 플래그를 세운다."""
+        remove_path = ""
         with self._db() as c:
             row = c.execute(
-                "SELECT id, user, status FROM render_jobs WHERE id=?",
-                (int(job_id),)).fetchone()
+                "SELECT id, user, status, input_path FROM render_jobs "
+                "WHERE id=?", (int(job_id),)).fetchone()
             if row is None or str(row["user"]) != str(user or ""):
                 return False
             if row["status"] == "queued":
+                remove_path = row["input_path"] or ""
                 c.execute(
                     "UPDATE render_jobs SET status='cancelled', finished=?, "
-                    "progress=0, error='사용자 취소' WHERE id=?",
+                    "progress=0, error='사용자 취소', input_path='' WHERE id=?",
                     (time.time(), int(job_id)))
             elif row["status"] == "running":
                 c.execute(
@@ -201,6 +203,11 @@ class RenderQueue:
                     (int(job_id),))
             else:
                 return False
+        if remove_path:
+            try:
+                os.remove(remove_path)
+            except OSError:
+                pass
         return True
 
     def is_cancel_requested(self, job_id):
@@ -248,12 +255,23 @@ class RenderQueue:
 
     def recover_running(self):
         """이전 프로세스가 남긴 running 작업을 다시 queued로 되돌린다."""
+        stale_inputs = []
         with self._db() as c:
+            rows = c.execute(
+                "SELECT input_path FROM render_jobs WHERE status='running' "
+                "AND cancel_requested=1").fetchall()
+            stale_inputs = [r["input_path"] for r in rows if r["input_path"]]
             c.execute("UPDATE render_jobs SET status='cancelled', finished=?, "
-                      "error='서버 재시작으로 중단됨' WHERE status='running' "
-                      "AND cancel_requested=1", (time.time(),))
+                      "error='서버 재시작으로 중단됨', input_path='' "
+                      "WHERE status='running' AND cancel_requested=1",
+                      (time.time(),))
             c.execute("UPDATE render_jobs SET status='queued', started=0, "
                       "progress=0 WHERE status='running'")
+        for path in stale_inputs:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
 
     def run_job(self, job):
         payload = json.loads(job.get("payload") or "{}")
@@ -339,7 +357,25 @@ class RenderQueue:
             except OSError:
                 pass
 
+    def cleanup_finished_inputs(self):
+        """완료/실패/취소된 작업의 남은 입력 파일을 정리한다."""
+        with self._db() as c:
+            rows = c.execute(
+                "SELECT id, input_path FROM render_jobs WHERE status IN "
+                "('done','failed','cancelled') AND input_path<>''").fetchall()
+            for row in rows:
+                path = row["input_path"]
+                try:
+                    if path and os.path.exists(path):
+                        os.remove(path)
+                except OSError:
+                    pass
+                c.execute("UPDATE render_jobs SET input_path='' WHERE id=?",
+                          (int(row["id"]),))
+            return len(rows)
+
     def worker_loop(self):
+        self.cleanup_finished_inputs()
         self.recover_running()
         while True:
             job = self.claim()
