@@ -5,6 +5,10 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    ignore:
+      # CUDA 휠(cu126)과 짝이 맞아야 하므로 torch/torchvision은 수동 관리한다.
+      - dependency-name: "torch"
+      - dependency-name: "torchvision"
     groups:
       python-deps:
         patterns: ["*"]
