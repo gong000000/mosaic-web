@@ -766,7 +766,7 @@ for jid in list(st.session_state.get("job_ids") or []):
 jobs = []
 for pos, jid in enumerate(job_ids, 1):
     job = JQ.get(jid)
-    if job:
+    if job and str(job.get("user")) == str(current_user):
         jobs.append((pos, job))
 
 if not jobs:
