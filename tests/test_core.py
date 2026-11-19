@@ -386,6 +386,20 @@ def test_retention_purges_old_and_quota_keeps_db():
     assert os.path.exists(os.path.join(d, "jobs.db-wal")) is True
 
 
+def test_address_eval_matching_and_summary():
+    from scripts.address_eval import match_boxes, summarize
+    preds = [[0, 0, 100, 50]]
+    gts = [[0, 0, 100, 50], [200, 200, 250, 250]]
+    matched_p, matched_g = match_boxes(preds, gts, iou_thresh=0.3)
+    assert matched_p == {0}
+    assert matched_g == {0}
+    rows = [{"tag": "x", "pred": 1, "gt": 2, "tp": 1, "tp_gt": 1,
+             "fp": 0, "fn": 1}]
+    s = summarize(rows)
+    assert s["precision"] == 1.0, s
+    assert s["recall"] == 0.5, s
+
+
 def test_face_mesh_falls_back_without_model():
     from src.face_mesh import FaceMeshRefiner
     ref = FaceMeshRefiner(model_path="/nonexistent/model.task")

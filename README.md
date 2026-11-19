@@ -282,6 +282,9 @@ python scripts/leak_metrics.py 결과.mp4   # YuNet 재검출 대리 지표
   `모자이크 시작` → 결과 파일 생성 → 다운로드 버튼 노출까지 확인합니다.
 - `qualitytest.py`는 마스크가 사람 밖으로 번지지 않는지, 강도가 높을수록
   블록이 커지는지, 기울어진 얼굴·긴 샘플 간격 보간이 유지되는지 봅니다.
+- `address_eval.py`는 `tests/fixtures/address_predictions.json`과
+  `tests/fixtures/address_labels.json`으로 주소·간판 precision/recall을
+  계산합니다. 로컬 테스트 영상 경로는 `--video-dir`로 넘깁니다.
 - 테스트 영상은 `MOSAIC_TEST_FACE`, `MOSAIC_TEST_STREET` 환경변수나
   `samples/face.mp4`, `samples/street.mp4`로 지정합니다. 저장소에는 포함하지
   않으며, 없으면 해당 테스트는 건너뜁니다.
@@ -338,7 +341,7 @@ assets/style.css            앱 스타일
 tests/                       pytest 단위·통합 테스트
 scripts/
   smoke/authtest/checklist/qualitytest/sampletest/freeform/regression/
-  robustness/apptest/golden_run/leak_metrics/live_apptest  자동 검사/측정
+  robustness/apptest/golden_run/leak_metrics/live_apptest/address_eval  자동 검사/측정
   live_vlm.py               실제 Gemini 분석 확인용
 HANDOFF.md                  인수인계/검증 결과/남은 일
 ```

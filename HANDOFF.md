@@ -24,6 +24,15 @@
   street 주소 후보 154개 중 1개만 정제되던 것을, 비율 유지 letterbox(32배수
   패딩, 최대 6배 확대)로 고쳐 54개를 정제했다. 정제된 박스 면적 중앙값은 원본의
   37%로 타이트해졌다. 글자가 없는 로고/조명은 VLM 박스를 그대로 유지한다.
+- **주소 precision/recall**: street/NY 각 10프레임, 총 20프레임을
+  `scripts/address_eval.py`로 평가했다. reference는 EAST를 3×3 타일로 돌려
+  글자 영역을 합친 뒤 사람/차량 내부 텍스트를 제외한 박스다.
+  - 전체: precision **0.575**, recall **0.438**, F1 **0.497**
+  - street: precision 0.604, recall 0.464
+  - NY: precision 0.518, recall 0.410
+  - GT 라벨은 `tests/fixtures/address_labels.json`에 있고, 수동 보정이 가능하다.
+  - VLM이 작은 간판을 많이 놓쳐 recall이 낮다. 주소 프리셋에서 EAST-only 글자
+    영역을 추가하면 recall을 올릴 수 있지만, 셔츠/번호판 오검출 필터가 필요하다.
 
 ### 운영/보안
 - **SQLite 작업 기록**: `jobs.json` 전체 재쓰기를 `jobs.db`(WAL) INSERT/DELETE로
@@ -64,7 +73,8 @@
   `robustness` ROBUSTNESS_PASS, live apptest 3종 PASS.
 - face.mp4 모자이크 픽셀 변화는 평균 1.82/최대 4.37로 수치상 큰 변화는 없지만,
   59~61프레임 육안 확인에서 오른쪽 남성 모자이크가 안정적으로 유지된다.
-- 주소 정밀도/재현율은 아직 라벨링 세트가 없다. EAST 정제율/타이트함만 측정했다.
+- 주소 precision/recall: 20프레임 EAST reference 기준 P 0.575 / R 0.438 /
+  F1 0.497. GT는 `tests/fixtures/address_labels.json`에 있다.
 
 ## 15차: 옆모습·모양 지연·머리/번호판 트랙·군중 얼굴 (2026-11-16)
 
@@ -337,9 +347,9 @@ YuNet이 오른쪽 남성을 1프레임 놓쳤다가 다시 잡으면서 모자�
   지표로 아직 산출하지 않았다.
 
 ## 남은 일 (우선순위)
-1. **주소 정밀도/재현율 라벨링**: 현재는 EAST 정제율/타이트함만 측정했다.
-   street/NY 20~30프레임에 실제 주소·간판 박스를 라벨링해 precision/recall을
-   측정하면 좋다.
+1. **주소 recall 개선**: 20프레임 평가에서 recall 0.438로 VLM이 작은 간판을
+   많이 놓쳤다. 주소 프리셋에서 EAST-only 글자 영역을 추가하되, 사람/차량 내부
+   텍스트(셔츠·번호판)를 제외하는 필터를 붙이면 recall을 올릴 수 있다.
 2. **지속형 작업 큐**: `RenderGate`는 한 프로세스 안에서 동시 렌더만 막는다.
    컨테이너 재시작/다중 컨테이너까지 고려하려면 SQLite 작업 테이블 + 워커
    스레드로 확장해야 한다. 현재 `max_containers=1`이라 급하지 않다.
