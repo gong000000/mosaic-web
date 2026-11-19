@@ -482,6 +482,71 @@ def test_east_text_regions_returns_list():
     assert isinstance(out, list)
 
 
+def test_render_queue_cancel_queued_and_running():
+    from src.jobqueue import RenderQueue
+    from src.render_service import MosaicSettings
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, "in.mp4")
+    with open(src, "wb") as f:
+        f.write(b"video")
+    q = RenderQueue(db_path=os.path.join(d, "jobs.db"),
+                    input_dir=os.path.join(d, "inputs"))
+
+    def add():
+        return q.enqueue(
+            user="alice", input_path=src,
+            output_path=os.path.join(d, "out.mp4"), items=[],
+            selected_cats=["face"], settings=MosaicSettings(),
+            model_name="yolo11n-seg.pt", imgsz=640, stride=15, conf=0.2,
+            preset="veryfast", query_raw="q")
+
+    queued = add()
+    assert q.cancel(queued, "alice") is True
+    assert q.get(queued)["status"] == "cancelled"
+    assert q.claim() is None
+
+    running = add()
+    job = q.claim()
+    assert job["id"] == running
+    assert q.cancel(running, "alice") is True
+    assert q.is_cancel_requested(running) is True
+    q.finish(running, "cancelled", error="사용자 취소")
+    assert q.get(running)["status"] == "cancelled"
+
+
+def test_failed_queue_job_cleans_input_and_result():
+    from src.jobqueue import RenderQueue, RenderCancelled
+    from src.render_service import MosaicSettings
+
+    class CancelPlan:
+        @classmethod
+        def from_items(cls, *args, **kwargs):
+            return cls()
+
+        def render(self, input_path, output_path, **kwargs):
+            raise RenderCancelled()
+
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, "in.mp4")
+    with open(src, "wb") as f:
+        f.write(b"video")
+    q = RenderQueue(db_path=os.path.join(d, "jobs.db"),
+                    input_dir=os.path.join(d, "inputs"))
+    job_id = q.enqueue(
+        user="alice", input_path=src,
+        output_path=os.path.join(d, "out.mp4"), items=[],
+        selected_cats=["face"], settings=MosaicSettings(),
+        model_name="yolo11n-seg.pt", imgsz=640, stride=15, conf=0.2,
+        preset="veryfast", query_raw="q")
+    job = q.claim()
+    from unittest.mock import patch
+    with patch("src.jobqueue.RenderPlan", CancelPlan), \
+            patch("src.jobqueue.H.add", lambda **kwargs: None):
+        q.run_job(job)
+    assert q.get(job_id)["status"] == "cancelled"
+    assert not os.path.exists(job["input_path"])
+
+
 def test_face_mesh_falls_back_without_model():
     from src.face_mesh import FaceMeshRefiner
     ref = FaceMeshRefiner(model_path="/nonexistent/model.task")

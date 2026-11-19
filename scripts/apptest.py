@@ -7,6 +7,7 @@
 """
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -122,6 +123,10 @@ def _keys(at):
     return [str(getattr(el, "key", "")) for el in elements]
 
 
+def _has_download(at):
+    return any(k.startswith("download_mosaic") for k in _keys(at))
+
+
 def _cleanup(at):
     out = at.session_state.get("render_out") or ""
     if not out:
@@ -143,7 +148,13 @@ def _click_start(at):
     assert buttons, "모자이크 시작 버튼 없음: " + str(_keys(at))
     buttons[0].click()
     at.run(timeout=1800)
-    out = at.session_state.get("render_out") or ""
+    out = ""
+    for _ in range(240):
+        out = at.session_state.get("render_out") or ""
+        if out and os.path.exists(out):
+            break
+        time.sleep(1.0)
+        at.run(timeout=1800)
     assert out and os.path.exists(out), "렌더 결과 파일 없음"
     assert os.path.getsize(out) > 1024, "렌더 결과가 비어 있음"
     return out
@@ -161,7 +172,7 @@ def _upload_and_analyze(at, video, preset, stub):
 
     # 분석만으로는 렌더하지 않는다(자동 모자이크 금지).
     assert not at.session_state.get("render_out"), "분석만으로 자동 렌더됨"
-    assert "download_mosaic" not in _keys(at), "다운로드 버튼이 미리 노출됨"
+    assert not _has_download(at), "다운로드 버튼이 미리 노출됨"
 
 
 def run_face():
@@ -178,11 +189,43 @@ def run_face():
         _SEEN_QUERIES
 
     out = _click_start(at)
-    assert at.session_state.get("render_sig"), "렌더 서명 없음"
-    assert "download_mosaic" in _keys(at), _keys(at)
+    assert _has_download(at), _keys(at)
     assert not [e for e in at.error], [e.value for e in at.error]
     print(f"OK face-flow ({os.path.getsize(out) // 1024} KB)")
     _cleanup(at)
+
+
+def run_queue_cancel():
+    """두 작업을 연속 등록하고 두 번째를 취소한다."""
+    _SEEN_QUERIES.clear()
+    at = _open_app()
+    _upload_and_analyze(at, FACE, "얼굴만", _face_stub)
+    for _ in range(2):
+        buttons = [b for b in at.button if b.key == "start_mosaic"]
+        assert buttons, "모자이크 시작 버튼 없음: " + str(_keys(at))
+        buttons[0].click()
+        at.run(timeout=1800)
+    ids = list(at.session_state.get("job_ids") or [])
+    assert len(ids) >= 2, f"작업이 2개 등록되지 않음: {ids}"
+    from src.jobqueue import cancel as qcancel, get as qget
+    last = ids[-1]
+    assert qcancel(last, "apptest") is True
+    for _ in range(90):
+        status = (qget(last) or {}).get("status")
+        if status == "cancelled":
+            break
+        time.sleep(1.0)
+        at.run(timeout=1800)
+    assert (qget(last) or {}).get("status") == "cancelled", qget(last)
+    for _ in range(240):
+        at.run(timeout=1800)
+        if _has_download(at):
+            break
+        time.sleep(1.0)
+    assert _has_download(at), "첫 번째 작업 결과가 표시되지 않음"
+    assert not [e for e in at.error], [e.value for e in at.error]
+    _cleanup(at)
+    print("OK queue-cancel")
 
 
 def run_plate():
@@ -200,7 +243,7 @@ def run_plate():
     assert any("차량번호판" in q for q in _SEEN_QUERIES), _SEEN_QUERIES
 
     out = _click_start(at)
-    assert "download_mosaic" in _keys(at), _keys(at)
+    assert _has_download(at), _keys(at)
     assert not [e for e in at.error], [e.value for e in at.error]
     print(f"OK plate-flow ({os.path.getsize(out) // 1024} KB)")
     _cleanup(at)
@@ -274,6 +317,7 @@ def main():
         print("SKIP 파일 없음: " + ", ".join(missing))
         return 0
     run_face()
+    run_queue_cancel()
     run_plate()
     run_missing_region()
     run_preset_switch()

@@ -20,6 +20,7 @@ from contextlib import contextmanager
 
 from .config import (CATEGORY_TYPE, GEMINI_BASE_URL, OUTPUT_DIR, VLM_MODEL,
                      env_api_key)
+from .errors import RenderCancelled
 from .render import strip_audio
 from .render_service import MosaicSettings, RenderPlan
 from . import history as H
@@ -37,9 +38,14 @@ CREATE TABLE IF NOT EXISTS render_jobs (
     output_path TEXT NOT NULL DEFAULT '',
     payload TEXT NOT NULL DEFAULT '{}',
     summary TEXT NOT NULL DEFAULT '',
-    error TEXT NOT NULL DEFAULT ''
+    error TEXT NOT NULL DEFAULT '',
+    cancel_requested INTEGER NOT NULL DEFAULT 0
 )
 """
+
+
+class JobCancelled(Exception):
+    pass
 
 _ITEM_KEYS = ("category", "label_ko", "type", "samples", "boxes",
               "region_type", "source", "count")
@@ -102,6 +108,13 @@ class RenderQueue:
         os.makedirs(self.input_dir, exist_ok=True)
         with self._db() as c:
             c.execute(_SCHEMA)
+            cols = {r[1] for r in c.execute(
+                "PRAGMA table_info(render_jobs)").fetchall()}
+            if "cancel_requested" not in cols:
+                c.execute("ALTER TABLE render_jobs ADD COLUMN "
+                          "cancel_requested INTEGER NOT NULL DEFAULT 0")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_render_jobs_status "
+                      "ON render_jobs(status, id)")
 
     def enqueue(self, user, input_path, output_path, items, selected_cats,
                 settings, model_name, imgsz, stride, conf, preset,
@@ -164,10 +177,39 @@ class RenderQueue:
         """해당 사용자의 queued/running 작업 목록."""
         with self._db() as c:
             rows = [dict(r) for r in c.execute(
-                "SELECT id, status, progress, created, started, output_path "
-                "FROM render_jobs WHERE user=? AND status IN "
+                "SELECT id, status, progress, created, started, output_path, "
+                "cancel_requested FROM render_jobs WHERE user=? AND status IN "
                 "('queued','running') ORDER BY id", (user or "",)).fetchall()]
         return rows
+
+    def cancel(self, job_id, user):
+        """queued면 즉시 취소, running이면 취소 요청 플래그를 세운다."""
+        with self._db() as c:
+            row = c.execute(
+                "SELECT id, user, status FROM render_jobs WHERE id=?",
+                (int(job_id),)).fetchone()
+            if row is None or str(row["user"]) != str(user or ""):
+                return False
+            if row["status"] == "queued":
+                c.execute(
+                    "UPDATE render_jobs SET status='cancelled', finished=?, "
+                    "progress=0, error='사용자 취소' WHERE id=?",
+                    (time.time(), int(job_id)))
+            elif row["status"] == "running":
+                c.execute(
+                    "UPDATE render_jobs SET cancel_requested=1 WHERE id=?",
+                    (int(job_id),))
+            else:
+                return False
+        return True
+
+    def is_cancel_requested(self, job_id):
+        with self._db() as c:
+            row = c.execute(
+                "SELECT cancel_requested, status FROM render_jobs WHERE id=?",
+                (int(job_id),)).fetchone()
+        return bool(row and (row["cancel_requested"]
+                             or row["status"] == "cancelled"))
 
     def claim(self):
         """queued 작업 1개를 원자적으로 running으로 바꾼다."""
@@ -207,6 +249,9 @@ class RenderQueue:
     def recover_running(self):
         """이전 프로세스가 남긴 running 작업을 다시 queued로 되돌린다."""
         with self._db() as c:
+            c.execute("UPDATE render_jobs SET status='cancelled', finished=?, "
+                      "error='서버 재시작으로 중단됨' WHERE status='running' "
+                      "AND cancel_requested=1", (time.time(),))
             c.execute("UPDATE render_jobs SET status='queued', started=0, "
                       "progress=0 WHERE status='running'")
 
@@ -229,6 +274,8 @@ class RenderQueue:
                     last[0] = now
                     self.update_progress(job_id, frac)
 
+            if self.is_cancel_requested(job_id):
+                raise RenderCancelled()
             stats = plan.render(
                 job["input_path"], output_path,
                 model_name=payload.get("model_name") or "yolo11m-seg.pt",
@@ -241,7 +288,8 @@ class RenderQueue:
                 api_key=env_api_key(),
                 vlm_model=payload.get("vlm_model") or VLM_MODEL,
                 vlm_base_url=payload.get("vlm_base_url") or GEMINI_BASE_URL,
-                use_cache=False, vlm_call_limit=0)
+                use_cache=False, vlm_call_limit=0,
+                cancel_fn=lambda: self.is_cancel_requested(job_id))
             if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
                 raise RuntimeError("결과 영상이 만들어지지 않았습니다.")
             if payload.get("strip_audio"):
@@ -269,6 +317,13 @@ class RenderQueue:
                   selector="vlm", summary=summary,
                   user=job.get("user") or "")
             self.finish(job_id, "done", summary=summary)
+        except RenderCancelled:
+            try:
+                if output_path and os.path.exists(output_path):
+                    os.remove(output_path)
+            except OSError:
+                pass
+            self.finish(job_id, "cancelled", error="사용자 취소")
         except Exception as e:
             try:
                 if output_path and os.path.exists(output_path):
@@ -324,6 +379,14 @@ def position(job_id):
 
 def active_jobs(user):
     return _QUEUE.active_jobs(user)
+
+
+def cancel(job_id, user):
+    return _QUEUE.cancel(job_id, user)
+
+
+def is_cancel_requested(job_id):
+    return _QUEUE.is_cancel_requested(job_id)
 
 
 def update_progress(job_id, frac):

@@ -46,6 +46,10 @@ def _keys(at):
     return [str(getattr(el, "key", "")) for el in els]
 
 
+def _has_download(at):
+    return any(k.startswith("download_mosaic") for k in _keys(at))
+
+
 def _errors(at):
     return [str(e.value) for e in at.error]
 
@@ -122,12 +126,18 @@ def main():
     t2 = time.time()
     buttons[0].click()
     at.run(timeout=1800)
+    out = ""
+    for _ in range(600):
+        out = at.session_state.get("render_out") or ""
+        if out and os.path.exists(out):
+            break
+        time.sleep(1.0)
+        at.run(timeout=1800)
     render_sec = time.time() - t2
-    out = at.session_state.get("render_out") or ""
     if not out or not os.path.exists(out) or os.path.getsize(out) < 1024:
         print("FAIL 렌더 결과 없음:", out, _errors(at))
         return 1
-    if "download_mosaic" not in _keys(at):
+    if not _has_download(at):
         print("FAIL 다운로드 버튼 없음:", _keys(at))
         return 1
     print(f"OK 렌더 {render_sec:.1f}초 · {os.path.getsize(out)/1024:.0f} KB")

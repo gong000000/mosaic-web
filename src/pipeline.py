@@ -42,6 +42,7 @@ from .offline import (backfill_and_smooth, bridge_gaps, find_gap_ranges,
                       missing_track_boxes, nearest_track_values,
                       temporal_smooth)
 from .manual import apply_manual, normalize_regions
+from .errors import RenderCancelled
 from .select import VLMSelector
 from .vlm_budget import VLMBudget, classify_vlm_error
 
@@ -911,7 +912,7 @@ class MosaicJob:
                  region_priors=None, person_priors=None,
                  cache_path=None, use_cache=False,
                  vlm_call_limit=None, mask_all_persons=False,
-                 manual_regions=None, debug_path=None):
+                 manual_regions=None, debug_path=None, cancel_fn=None):
         self.input_path = input_path
         self.output_path = output_path
         self.targets = ([targets] if isinstance(targets, str)
@@ -940,6 +941,7 @@ class MosaicJob:
         self.mask_all_persons = bool(mask_all_persons)
         self.manual_regions = normalize_regions(manual_regions)
         self.debug_path = debug_path or None
+        self.cancel_fn = cancel_fn
 
     def _open_debug_writer(self, width, height, fps, audio_src=None):
         """디버그 영상은 최종 결과와 분리해 별도 파일로 저장한다."""
@@ -1084,6 +1086,8 @@ class MosaicJob:
                     ok, frame = cap.read()
                     if not ok:
                         break
+                    if self.cancel_fn is not None and self.cancel_fn():
+                        raise RenderCancelled()
                     idx = len(face_frames)
                     if is_scene_cut(prev_sig, frame):
                         tracker.reset()
@@ -1278,6 +1282,8 @@ class MosaicJob:
                     ok, frame = cap.read()
                     if not ok:
                         break
+                    if self.cancel_fn is not None and self.cancel_fn():
+                        raise RenderCancelled()
                     gray_plate = cv2.cvtColor(
                         frame, cv2.COLOR_BGR2GRAY)
                     if done in cuts:
@@ -1829,6 +1835,8 @@ class MosaicJob:
         try:
             chunk = []
             for frame_idx, r in _iter1():
+                if self.cancel_fn is not None and self.cancel_fn():
+                    raise RenderCancelled()
                 if recorder is not None and needs_person_pass1:
                     recorder.add(r)
                 if progress_fn and total > 0 and frame_idx % 5 == 0:
@@ -2153,6 +2161,8 @@ class MosaicJob:
                 tracker=_TRACKER_CFG, conf=p.conf, classes=[0],
                 verbose=False, imgsz=p.imgsz, iou=0.5, max_det=30)
             for _ri, _res in enumerate(rec_stream):
+                if self.cancel_fn is not None and self.cancel_fn():
+                    raise RenderCancelled()
                 recorder.add(_res)
                 if progress_fn and total > 0 and _ri % 5 == 0:
                     try:
@@ -2773,7 +2783,7 @@ def mosaic_video(input_path, output_path, targets=None, invert=False,
                  vlm_base_url=None, region_priors=None, person_priors=None,
                  cache_path=None, use_cache=False,
                  vlm_call_limit=None, mask_all_persons=False,
-                 manual_regions=None, debug_path=None):
+                 manual_regions=None, debug_path=None, cancel_fn=None):
     """호환 래퍼."""
     job = MosaicJob(input_path, output_path, targets=targets, invert=invert,
                     conf=conf, model_name=model_name, imgsz=imgsz,
@@ -2788,5 +2798,5 @@ def mosaic_video(input_path, output_path, targets=None, invert=False,
                     vlm_call_limit=vlm_call_limit,
                     mask_all_persons=mask_all_persons,
                     manual_regions=manual_regions,
-                    debug_path=debug_path)
+                    debug_path=debug_path, cancel_fn=cancel_fn)
     return job.run(progress_fn)

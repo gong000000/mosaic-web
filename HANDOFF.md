@@ -41,10 +41,13 @@
   `jobs.json.migrated`로 보존된다. 사용자별 100건 상한 유지.
 - **렌더 대기/지속형 큐**: `RenderGate`로 동시 렌더를 직렬화하는 것에 더해,
   `render_jobs` SQLite 테이블과 백그라운드 워커를 추가했다. 작업 상태는
-  `queued → running → done/failed`로 저장되고, 창을 닫아도 계속된다.
-  입력 영상은 볼륨 `job_inputs/`에 복사하고 완료/실패 시 삭제한다. 서버
+  `queued → running → done/failed/cancelled`로 저장되고, 창을 닫아도 계속된다.
+  시작 버튼은 즉시 큐에 넣고, `작업 진행 · 결과` 영역에 작업별 카드로
+  진행률/대기 순번/취소/완료 미리보기/다운로드를 표시한다. 취소는 queued면
+  즉시, running이면 `RenderCancelled`로 프레임 루프에서 중단한다.
+  입력 영상은 볼륨 `job_inputs/`에 복사하고 완료/실패/취소 시 삭제한다. 서버
   재시작 시 이전 `running` 작업은 `queued`로 되돌려 이어간다.
-  `지난 작업` 화면에 현재 사용자의 queued/running 작업과 대기 순번/진행률을
+  `지난 작업` 화면에도 현재 사용자의 queued/running 작업과 대기 순번/진행률을
   표시한다. `max_containers=1`에서는 안전하며, 다중 컨테이너 전역 큐는 외부
   DB/분산 락이 필요하다.
 - **보관 정책**: 24시간 만료 + 결과 500개/20GB 상한. `MOSAIC_MAX_OUTPUT_FILES`,
@@ -71,6 +74,8 @@
 
 ### live E2E (실제 Gemini, T4)
 - face.mp4 · `얼굴만`: 분석 24.3초, 렌더 13.5초, 556KB, PASS.
+- face.mp4 · `얼굴만` (다중 작업 카드 UI): 분석 32.6초, 렌더 19.2초,
+  557KB, PASS. 취소/다중 큐는 apptest `queue-cancel`에서 검증.
 - street.mp4 · `얼굴 + 번호판 + 주소`: 분석 27.2초, 렌더 47.5초, 7.3MB, PASS.
 - street.mp4 · `주소·간판` (EAST-only 보완): 분석 40.8초, 렌더 23.9초,
   7.3MB, PASS. EAST-only 추가로 분석 시간이 약 14초 늘었다.
@@ -78,7 +83,7 @@
   24.1MB, PASS.
 
 ### 검증
-- `pytest` 46 passed, `apptest` APPTEST_PASS, `qualitytest` PASS,
+- `pytest` 48 passed, `apptest` APPTEST_PASS, `qualitytest` PASS,
   `robustness` ROBUSTNESS_PASS, live apptest 3종 PASS.
 - CI에 합성 영상 기반 `apptest` job을 추가했다. 실제 얼굴 영상 없이
   업로드→분석→큐 렌더→다운로드 흐름을 GitHub Actions에서 검사한다.

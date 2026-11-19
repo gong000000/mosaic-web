@@ -132,7 +132,8 @@ class RenderPlan:
     def render(self, input_path, output_path, *, model_name, imgsz, stride,
                conf, preset, progress_fn=None, query_raw="", api_key=None,
                vlm_model=None, vlm_base_url=None, cache_path=None,
-               use_cache=True, vlm_call_limit=0, debug_path=None):
+               use_cache=True, vlm_call_limit=0, debug_path=None,
+               cancel_fn=None):
         """pipeline에 렌더를 위임한다. VLM 재호출은 기본 0회."""
         return mosaic_video(
             input_path, output_path,
@@ -160,4 +161,5 @@ class RenderPlan:
             mask_all_persons=self.mask_all_persons,
             manual_regions=self.manual_regions,
             debug_path=debug_path,
+            cancel_fn=cancel_fn,
         )

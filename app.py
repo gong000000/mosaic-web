@@ -27,7 +27,7 @@ from src.config import (CANDS, CATEGORY_TYPE, GEMINI_BASE_URL, OUTPUT_DIR,
 from src.models import get_model
 from src.preview import analyze_video
 from src.render import normalize_video, trim_video
-from src.render_service import MosaicSettings, RenderPlan
+from src.render_service import MosaicSettings
 from src import history as H
 from src import jobqueue as JQ
 from src import retention as RT
@@ -235,6 +235,88 @@ def _fmt_size(path):
     return f"{size / 1024:.0f} KB"
 
 
+def _job_status_label(job):
+    status = job.get("status")
+    if status == "queued":
+        return "대기 중"
+    if status == "running":
+        return "렌더 중"
+    if status == "done":
+        return "완료"
+    if status == "cancelled":
+        return "취소됨"
+    if status == "failed":
+        return "실패"
+    return str(status or "-")
+
+
+def _render_job_card(job, pos, user):
+    jid = int(job["id"])
+    status = job.get("status")
+    with st.container(border=True):
+        c1, c2 = st.columns([5, 1])
+        with c1:
+            st.markdown(f"**{pos}번째 작업** · {_job_status_label(job)}")
+            st.caption(
+                f"#{jid} · "
+                f"{time.strftime('%m-%d %H:%M', time.localtime(float(job.get('created') or 0)))}")
+        with c2:
+            if status in ("queued", "running"):
+                if job.get("cancel_requested"):
+                    st.button("취소 중", key=f"cancel_{jid}", disabled=True)
+                elif st.button("취소", key=f"cancel_{jid}"):
+                    JQ.cancel(jid, user)
+                    st.rerun()
+        frac = min(1.0, max(0.0, float(job.get("progress") or 0)))
+        if status == "queued":
+            st.progress(0.0, text=f"대기 중 · {JQ.position(jid)}번째")
+        elif status == "running":
+            st.progress(frac, text=f"렌더 중 · {int(frac * 100)}%")
+        elif status == "cancelled":
+            st.warning("작업이 취소되었습니다.")
+        elif status == "failed":
+            st.error(f"렌더 실패: {job.get('error') or ''}")
+        elif status == "done":
+            out = job.get("output_path") or ""
+            if not out or not os.path.exists(out):
+                st.warning("결과 파일이 삭제되었습니다.")
+                return
+            st.video(out, format="video/mp4", width="stretch")
+            detail = " · ".join(part for part in (
+                job.get("summary") or "", _fmt_size(out)) if part)
+            if detail:
+                st.caption(detail)
+            out_name = os.path.basename(out)
+
+            def _after_download(jid=jid, name=out_name, path=out):
+                if st.session_state.get("auto_del", False):
+                    H.delete(name)
+                    ids = list(st.session_state.get("job_ids") or [])
+                    st.session_state["job_ids"] = [
+                        x for x in ids if int(x) != int(jid)]
+                    if st.session_state.get("render_out") == path:
+                        st.session_state.pop("render_out", None)
+
+            with open(out, "rb") as f:
+                st.download_button(
+                    "모자이크 영상 다운로드", f,
+                    file_name=out_name, mime="video/mp4",
+                    on_click=_after_download,
+                    key=f"download_mosaic_{jid}")
+
+
+@st.fragment(run_every=2.0)
+def _render_active_job_cards(items, user):
+    for pos, jid in items:
+        job = JQ.get(jid)
+        if not job:
+            continue
+        if job.get("status") not in ("queued", "running"):
+            st.rerun()
+            return
+        _render_job_card(job, pos, user)
+
+
 def _render_history(user, expanded=False):
     """로그인한 계정의 지난 작업만 페이지 단위로 보여준다."""
     with st.expander("지난 작업", expanded=expanded):
@@ -405,6 +487,7 @@ with st.sidebar:
         "오디오 제거", value=False,
         help="목소리·대화 속 이름/주소가 남지 않도록 결과 영상에서 소리를 뺍니다.")
     auto_del = st.checkbox("받으면 결과 자동 삭제", value=False)
+    st.session_state["auto_del"] = bool(auto_del)
 
 # 로그인만 해도 지난 작업을 볼 수 있게 업로드 여부와 무관하게 보여준다.
 _render_history(current_user, expanded=not uploaded)
@@ -638,12 +721,6 @@ if not ok:
 elif not selected_cats:
     st.warning("가릴 항목을 하나 이상 체크하세요.")
 else:
-    source_token = (f"{upload_id[2]}|{trim_sig}"
-                    + ("|noaudio" if strip_audio_opt else ""))
-    plan = RenderPlan.from_items(items, selected_cats, settings)
-    current_sig = plan.render_signature(
-        source_token, FAST_MODEL, FAST_IMGSZ, FAST_STRIDE, FAST_CONF)
-
     if st.button("모자이크 시작", type="primary", key="start_mosaic"):
         out_path = _unique_out_path(uploaded.name, current_user)
         try:
@@ -672,74 +749,45 @@ else:
             st.error(f"렌더 작업 등록 실패: "
                      f"{_friendly_vlm_error(e, api_key)}")
         else:
-            progress = st.progress(0.0, text="대기 중...")
-            deadline = time.time() + 3600
-            try:
-                while True:
-                    job = JQ.get(job_id)
-                    if not job:
-                        raise RuntimeError("렌더 작업을 찾을 수 없습니다.")
-                    status = job.get("status")
-                    if status == "done":
-                        out_path = job.get("output_path") or out_path
-                        elapsed = max(
-                            0.0, float(job.get("finished") or 0)
-                            - float(job.get("started") or 0))
-                        st.session_state["render_out"] = out_path
-                        st.session_state["render_sig"] = current_sig
-                        st.session_state["render_summary"] = (
-                            job.get("summary") or "")
-                        st.session_state["render_sec"] = elapsed
-                        progress.progress(1.0, text="완료")
-                        break
-                    if status == "failed":
-                        raise RuntimeError(job.get("error") or "렌더 실패")
-                    frac = min(1.0, max(0.0, float(job.get("progress") or 0)))
-                    if status == "queued":
-                        text = f"대기 중 · {JQ.position(job_id)}번째"
-                    else:
-                        text = f"렌더 중 · {int(frac * 100)}%"
-                    progress.progress(frac, text=text)
-                    if time.time() > deadline:
-                        raise RuntimeError("렌더 대기 시간이 초과되었습니다.")
-                    time.sleep(1.0)
-                st.rerun()
-            except Exception as e:
-                st.session_state.pop("render_out", None)
-                st.session_state.pop("render_sig", None)
-                st.session_state.pop("render_summary", None)
-                _unlink_quiet(out_path)
-                st.error(f"모자이크 렌더 실패: "
-                         f"{_friendly_vlm_error(e, api_key)}")
+            ids = list(st.session_state.get("job_ids") or [])
+            if job_id not in ids:
+                ids.append(job_id)
+            st.session_state["job_ids"] = ids[-20:]
+            st.rerun()
 
-# ---------------------------------------------------------------- 미리보기/다운로드
-st.subheader("미리보기 · 다운로드")
-render_out = st.session_state.get("render_out")
-render_valid = bool(render_out and os.path.exists(render_out))
-if render_valid:
-    st.video(render_out, format="video/mp4", width="stretch")
-    summary = st.session_state.get("render_summary") or ""
-    detail = " · ".join(part for part in (
-        summary, _fmt_size(render_out)) if part)
-    if detail:
-        st.caption(detail)
-    if os.path.getsize(render_out) > 0:
-        download_name = (os.path.splitext(uploaded.name)[0]
-                         + "_mosaic.mp4")
-        out_name = os.path.basename(render_out)
+# ---------------------------------------------------------------- 작업 카드
+st.subheader("작업 진행 · 결과")
+job_ids = []
+for jid in list(st.session_state.get("job_ids") or []):
+    try:
+        job_ids.append(int(jid))
+    except (TypeError, ValueError):
+        pass
+jobs = []
+for pos, jid in enumerate(job_ids, 1):
+    job = JQ.get(jid)
+    if job:
+        jobs.append((pos, job))
 
-        def _after_download(name=out_name):
-            if auto_del:
-                H.delete(name)
-                st.session_state.pop("render_out", None)
-                st.session_state.pop("render_sig", None)
-                st.session_state.pop("render_summary", None)
-                st.session_state.pop("render_sec", None)
-
-        with open(render_out, "rb") as f:
-            st.download_button(
-                "모자이크 영상 다운로드", f,
-                file_name=download_name, mime="video/mp4",
-                on_click=_after_download, key="download_mosaic")
-else:
+if not jobs:
     st.write("모자이크 시작을 누르면 영상이 여기에 표시됩니다.")
+else:
+    done_jobs = [(pos, job) for pos, job in jobs
+                 if job.get("status") == "done"]
+    active_jobs = ((pos, job["id"]) for pos, job in jobs
+                   if job.get("status") in ("queued", "running"))
+    other_jobs = [(pos, job) for pos, job in jobs
+                  if job.get("status") in ("cancelled", "failed")]
+    for pos, job in done_jobs:
+        _render_job_card(job, pos, current_user)
+    if done_jobs:
+        _last = done_jobs[-1][1]
+        st.session_state["render_out"] = _last.get("output_path") or ""
+        st.session_state["render_summary"] = _last.get("summary") or ""
+        st.session_state["render_sec"] = max(
+            0.0, float(_last.get("finished") or 0)
+            - float(_last.get("started") or 0))
+    if active_jobs:
+        _render_active_job_cards(tuple(active_jobs), current_user)
+    for pos, job in other_jobs:
+        _render_job_card(job, pos, current_user)
