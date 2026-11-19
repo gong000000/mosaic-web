@@ -135,7 +135,7 @@
 | 근접 얼굴 | 화면의 50%까지 허용하되, 큰 박스는 높은 신뢰도에서만 사용 |
 | 동승자 | `얼굴만` 범위에서는 YuNet 얼굴형으로 가리고, 사람 마스크가 있으면 VLM 직사각형을 중복으로 그리지 않습니다 |
 | 번호판 | YOLO11n 번호판 모델이 2프레임마다 직접 검출하고 광학 흐름으로 잇는다. 여백을 물체 크기 비례(최대 12px)로 주고, 차량 안에 있을 때만 그려 벽보 오검출을 줄인다. VLM 앵커는 백업으로 유지한다. |
-| 영역 박스 | VLM이 넓게 잡은 주소·문서 박스를 EAST 글자 영역에 맞춰 조인다. 번호판 박스는 에지 영역에 맞춰 조임(최소 60% 유지). 글자가 안 보이면 VLM 박스를 유지한다. |
+| 영역 박스 | VLM이 넓게 잡은 주소·문서 박스를 EAST 글자 영역에 맞춰 조인다. 주소 프리셋에서는 사람/차량/번호판 내부를 제외한 EAST-only 글자 영역도 추가한다(`MOSAIC_ADDRESS_EAST=1`). 번호판 박스는 에지 영역에 맞춰 조임(최소 60% 유지). 글자가 안 보이면 VLM 박스를 유지한다. |
 | 시간 보간 | 샘플 간격이 길어져도 최대 180프레임까지 보간하고, 이동 거리에 비례해 박스를 넓혀 누락 방지 |
 
 ## 로그인 · 계정
@@ -288,9 +288,10 @@ python scripts/leak_metrics.py 결과.mp4   # YuNet 재검출 대리 지표
   실제 영상이 없으면 `scripts/make_ci_video.py`로 합성 MP4를 만들 수 있습니다.
 - `qualitytest.py`는 마스크가 사람 밖으로 번지지 않는지, 강도가 높을수록
   블록이 커지는지, 기울어진 얼굴·긴 샘플 간격 보간이 유지되는지 봅니다.
-- `address_eval.py`는 `tests/fixtures/address_predictions.json`과
-  `tests/fixtures/address_labels.json`으로 주소·간판 precision/recall을
-  계산합니다. 로컬 테스트 영상 경로는 `--video-dir`로 넘깁니다.
+- `address_eval.py`는 `tests/fixtures/address_predictions.json`(VLM) 또는
+  `address_predictions_east.json`(VLM+EAST-only)과 `address_labels.json`으로
+  주소·간판 precision/recall을 계산합니다. 로컬 테스트 영상 경로는
+  `--video-dir`로 넘깁니다.
 - 테스트 영상은 `MOSAIC_TEST_FACE`, `MOSAIC_TEST_STREET` 환경변수나
   `samples/face.mp4`, `samples/street.mp4`로 지정합니다. 저장소에는 포함하지
   않으며, 없으면 해당 테스트는 건너뜁니다.

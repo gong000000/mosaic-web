@@ -27,12 +27,13 @@
 - **주소 precision/recall**: street/NY 각 10프레임, 총 20프레임을
   `scripts/address_eval.py`로 평가했다. reference는 EAST를 3×3 타일로 돌려
   글자 영역을 합친 뒤 사람/차량 내부 텍스트를 제외한 박스다.
-  - 전체: precision **0.575**, recall **0.438**, F1 **0.497**
-  - street: precision 0.604, recall 0.464
-  - NY: precision 0.518, recall 0.410
+  - VLM만: precision **0.575**, recall **0.438**, F1 **0.497**
+  - VLM + EAST-only: precision **0.762**, recall **0.821**, F1 **0.790**
+  - street: P 0.766 / R 0.786, NY: P 0.756 / R 0.859
   - GT 라벨은 `tests/fixtures/address_labels.json`에 있고, 수동 보정이 가능하다.
-  - VLM이 작은 간판을 많이 놓쳐 recall이 낮다. 주소 프리셋에서 EAST-only 글자
-    영역을 추가하면 recall을 올릴 수 있지만, 셔츠/번호판 오검출 필터가 필요하다.
+  - 주소 프리셋에서 `MOSAIC_ADDRESS_EAST=1`(기본)이면 사람/차량/번호판 내부
+    텍스트를 제외한 EAST-only 글자 영역을 추가한다. EAST reference와 같은
+    계열이라 recall 0.821은 상한선에 가깝다. 독립 수동 GT로 최종 검증이 필요하다.
 
 ### 운영/보안
 - **SQLite 작업 기록**: `jobs.json` 전체 재쓰기를 `jobs.db`(WAL) INSERT/DELETE로
@@ -70,18 +71,21 @@
 ### live E2E (실제 Gemini, T4)
 - face.mp4 · `얼굴만`: 분석 24.3초, 렌더 13.5초, 556KB, PASS.
 - street.mp4 · `얼굴 + 번호판 + 주소`: 분석 27.2초, 렌더 47.5초, 7.3MB, PASS.
+- street.mp4 · `주소·간판` (EAST-only 보완): 분석 40.0초, 렌더 30.7초,
+  7.3MB, PASS. EAST-only 추가로 분석 시간이 약 13초 늘었다.
 - Walking in New York City.mp4 · `얼굴 + 번호판`: 분석 21.4초, 렌더 195.0초,
   24.1MB, PASS.
 
 ### 검증
-- `pytest` 45 passed, `apptest` APPTEST_PASS, `qualitytest` PASS,
+- `pytest` 46 passed, `apptest` APPTEST_PASS, `qualitytest` PASS,
   `robustness` ROBUSTNESS_PASS, live apptest 3종 PASS.
 - CI에 합성 영상 기반 `apptest` job을 추가했다. 실제 얼굴 영상 없이
   업로드→분석→큐 렌더→다운로드 흐름을 GitHub Actions에서 검사한다.
 - face.mp4 모자이크 픽셀 변화는 평균 1.82/최대 4.37로 수치상 큰 변화는 없지만,
   59~61프레임 육안 확인에서 오른쪽 남성 모자이크가 안정적으로 유지된다.
-- 주소 precision/recall: 20프레임 EAST reference 기준 P 0.575 / R 0.438 /
-  F1 0.497. GT는 `tests/fixtures/address_labels.json`에 있다.
+- 주소 precision/recall(EAST reference): VLM만 P 0.575 / R 0.438,
+  VLM+EAST-only P 0.762 / R 0.821. GT는 `tests/fixtures/address_labels.json`,
+  개선 예측은 `tests/fixtures/address_predictions_east.json`.
 
 ## 15차: 옆모습·모양 지연·머리/번호판 트랙·군중 얼굴 (2026-11-16)
 

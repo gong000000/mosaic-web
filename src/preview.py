@@ -4,6 +4,7 @@ VLM이 찾는다. VLM이 찾은 항목을 카테고리별 체크리스트로 묶
 """
 import cv2
 import numpy as np
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -403,6 +404,53 @@ def analyze_first_frame_items(frame, model, conf, imgsz,
         if rtype == "person" or category_type(cat) == "person":
             person = _match_person(box["xyxy"], cand)
         _add_box(items, cat, box, person, frame_idx)
+
+    # VLM이 놓친 주소·간판을 EAST 글자 영역으로 보완한다. 사람/차량 내부
+    # 텍스트(셔츠·번호판·차량 광고)는 제외해 오검출을 줄인다.
+    if "address" in targets and os.environ.get(
+            "MOSAIC_ADDRESS_EAST", "1") != "0":
+        try:
+            from .texts import detect_text_regions
+            h0, w0 = frame.shape[:2]
+            veh_boxes = []
+            try:
+                with MODEL_LOCK:
+                    vr = list(model.predict(
+                        source=frame, conf=conf, classes=VEHICLE_CLASSES,
+                        verbose=False, imgsz=imgsz))[0]
+                if vr.boxes is not None:
+                    veh_boxes = [[float(v) for v in b[:4]]
+                                 for b in vr.boxes.xyxy.cpu().numpy()]
+            except Exception:
+                veh_boxes = []
+            plate_boxes = []
+            try:
+                from .plates import detect_plates
+                plate_boxes = detect_plates(frame) or []
+            except Exception:
+                plate_boxes = []
+            existing = [b for b in items.get("address", {}).get("boxes", [])]
+            regions = detect_text_regions(
+                frame, persons=[c["xyxy"] for c in cand],
+                vehicles=veh_boxes, plates=plate_boxes)
+            for r in regions:
+                if any(iou(r, b) > 0.30 for b in existing):
+                    continue
+                if not plausible_box("address", *r, w0, h0):
+                    continue
+                box = {
+                    "category": "address",
+                    "label_ko": label_ko("address"),
+                    "xyxy": r,
+                    "conf": 0.6,
+                    "matches_prompt": "address" in prompt_set,
+                    "region_type": "region",
+                    "source": "east",
+                }
+                _add_box(items, "address", box, None, frame_idx)
+                existing.append(r)
+        except Exception:
+            pass
 
     final = _finalize(items, frame)
     # 배경 개인정보 박스(번호판·간판 등)를 미리보기 화면에 표시한다.

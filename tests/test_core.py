@@ -473,6 +473,13 @@ def test_queue_worker_completes_job_without_model():
     assert not os.path.exists(job["input_path"]), "입력 임시 파일이 남음"
 
 
+def test_east_text_regions_returns_list():
+    from src.texts import detect_text_regions
+    frame = np.zeros((120, 160, 3), np.uint8)
+    out = detect_text_regions(frame)
+    assert isinstance(out, list)
+
+
 def test_face_mesh_falls_back_without_model():
     from src.face_mesh import FaceMeshRefiner
     ref = FaceMeshRefiner(model_path="/nonexistent/model.task")
