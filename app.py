@@ -248,6 +248,23 @@ def _render_history(user, expanded=False):
                 f"{u['max_bytes'] / (1024 ** 3):.0f} GB)")
         except Exception:
             pass
+        try:
+            active = JQ.active_jobs(user)
+        except Exception:
+            active = []
+        if active:
+            st.markdown("**대기/진행 중**")
+            for j in active:
+                if j.get("status") == "queued":
+                    text = f"대기 {JQ.position(j['id'])}번째"
+                else:
+                    pct = int(float(j.get("progress") or 0) * 100)
+                    text = f"렌더 중 {pct}%"
+                at = time.strftime(
+                    "%m-%d %H:%M",
+                    time.localtime(float(j.get("created") or 0)))
+                st.caption(f"#{j.get('id')} · {text} · {at}")
+            st.caption("완료되면 아래 지난 작업에 표시됩니다.")
         if not rows:
             st.write("저장된 작업이 없습니다.")
             return

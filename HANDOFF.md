@@ -44,8 +44,9 @@
   `queued → running → done/failed`로 저장되고, 창을 닫아도 계속된다.
   입력 영상은 볼륨 `job_inputs/`에 복사하고 완료/실패 시 삭제한다. 서버
   재시작 시 이전 `running` 작업은 `queued`로 되돌려 이어간다.
-  `max_containers=1`에서는 안전하며, 다중 컨테이너 전역 큐는 외부 DB/분산 락이
-  필요하다.
+  `지난 작업` 화면에 현재 사용자의 queued/running 작업과 대기 순번/진행률을
+  표시한다. `max_containers=1`에서는 안전하며, 다중 컨테이너 전역 큐는 외부
+  DB/분산 락이 필요하다.
 - **보관 정책**: 24시간 만료 + 결과 500개/20GB 상한. `MOSAIC_MAX_OUTPUT_FILES`,
   `MOSAIC_MAX_OUTPUT_GB`로 조정한다. `jobs.db`/WAL은 삭제 대상에서 제외한다.
 - **저장소 보안**: GitHub 저장소를 private로 전환하고, 실제 얼굴이 있는 테스트

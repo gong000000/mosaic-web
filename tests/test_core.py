@@ -425,6 +425,8 @@ def test_render_queue_persists_and_claims_one_job():
         preset="veryfast", query_raw="q", src_name="in.mp4",
         preset_name="얼굴만")
     assert q.position(job2) == 2
+    assert len(q.active_jobs("alice")) == 1
+    assert q.active_jobs("alice")[0]["status"] == "queued"
     claimed = q.claim()
     assert claimed and claimed["id"] == job1
     assert "thumb" not in claimed["payload"]

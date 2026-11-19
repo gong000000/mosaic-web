@@ -160,6 +160,15 @@ class RenderQueue:
                 (int(job_id),)).fetchone()[0]
         return int(n) + 1
 
+    def active_jobs(self, user):
+        """해당 사용자의 queued/running 작업 목록."""
+        with self._db() as c:
+            rows = [dict(r) for r in c.execute(
+                "SELECT id, status, progress, created, started, output_path "
+                "FROM render_jobs WHERE user=? AND status IN "
+                "('queued','running') ORDER BY id", (user or "",)).fetchall()]
+        return rows
+
     def claim(self):
         """queued 작업 1개를 원자적으로 running으로 바꾼다."""
         with self._db() as c:
@@ -311,6 +320,10 @@ def get(job_id):
 
 def position(job_id):
     return _QUEUE.position(job_id)
+
+
+def active_jobs(user):
+    return _QUEUE.active_jobs(user)
 
 
 def update_progress(job_id, frac):
