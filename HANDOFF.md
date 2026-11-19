@@ -24,6 +24,8 @@
   - street · 주소·간판: 분석 40.8초 / 렌더 23.9초
   - street · 얼굴+번호판+주소: 분석 27.2초 / 렌더 47.5초
   - NY · 얼굴+번호판: 분석 21.4초 / 렌더 195.0초
+  - live T4 AppTest: face-flow, **queue-cancel**, plate-flow,
+    missing-region, preset-switch 모두 PASS
 - 주소·간판 20프레임 평가 (EAST reference 기준)
   - VLM만: P 0.575 / R 0.438
   - VLM + EAST-only: **P 0.762 / R 0.821**
