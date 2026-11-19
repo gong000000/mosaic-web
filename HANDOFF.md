@@ -72,8 +72,8 @@
 ### live E2E (실제 Gemini, T4)
 - face.mp4 · `얼굴만`: 분석 24.3초, 렌더 13.5초, 556KB, PASS.
 - street.mp4 · `얼굴 + 번호판 + 주소`: 분석 27.2초, 렌더 47.5초, 7.3MB, PASS.
-- street.mp4 · `주소·간판` (EAST-only 보완): 분석 40.0초, 렌더 30.7초,
-  7.3MB, PASS. EAST-only 추가로 분석 시간이 약 13초 늘었다.
+- street.mp4 · `주소·간판` (EAST-only 보완): 분석 40.8초, 렌더 23.9초,
+  7.3MB, PASS. EAST-only 추가로 분석 시간이 약 14초 늘었다.
 - Walking in New York City.mp4 · `얼굴 + 번호판`: 분석 21.4초, 렌더 195.0초,
   24.1MB, PASS.
 
