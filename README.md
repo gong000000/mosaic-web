@@ -354,6 +354,7 @@ scripts/
   smoke/authtest/checklist/qualitytest/sampletest/freeform/regression/
   robustness/apptest/golden_run/leak_metrics/live_apptest/address_eval  자동 검사/측정
   make_ci_video.py          CI용 합성 테스트 영상 생성
+  bench_gpu.py              GPU 전체 렌더 FPS/피크 VRAM 측정
   live_vlm.py               실제 Gemini 분석 확인용
 HANDOFF.md                  인수인계/검증 결과/남은 일
 ```

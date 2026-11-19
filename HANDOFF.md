@@ -348,10 +348,10 @@ YuNet이 오른쪽 남성을 1프레임 놓쳤다가 다시 잡으면서 모자�
 - 운영 `users.db`에 테스트 계정은 만들지 않았다(AppTest 세션 우회).
 
 ## 검증 상태 메모
-- **L4 전체 렌더 FPS/메모리**: 초기 `face.mp4` 72프레임 4.9초 기록은 있지만,
-  최신 파이프라인(매 프레임 mesh + PlateTracker + 군중 크롭) 기준 FPS와 피크
-  메모리는 아직 측정하지 않았다. L4가 배정되면 `MosaicJob` + `nvidia-smi`로
-  측정할 수 있다(불가능한 항목이 아니라 미측정).
+- **L4 전체 렌더 FPS/메모리**: L4 용량이 없어 아직 미측정이다. 같은 조건의
+  T4 전체 렌더는 face.mp4 72프레임 **19.31초(3.73 fps)**, 피크 VRAM
+  **230MB**(nvidia-smi), torch alloc 0.06GB로 측정됐다. L4가 배정되면
+  `scripts/bench_gpu.py`로 같은 수치를 측정할 수 있다.
 - **실제 Gemini/Modal 업로드/볼륨**: 16차 live E2E 3종에서 검증 완료.
   `jobs.json`→`jobs.db` 마이그레이션과 볼륨 commit도 live에서 확인했다.
 - **원거리 군중**: 사람-얼굴 커버리지 street 78.0→84.8%, NY 92.7→95.0%,
