@@ -181,7 +181,7 @@ modal deploy modal_app.py
 - 가입을 제한하려면 Secret에 `MOSAIC_INVITE_CODE`를 추가하세요.
   `modal secret create mosaic-gemini --from-dotenv .env --force`로 갱신하면
   같은 Secret에 함께 들어갑니다.
-- 로그: `modal app logs mosaic-web --tail 100` (실시간은 `-f`)
+- 로그: `modal app logs mosaic-web --tail 100` (계속 보려면 `-f`)
 - 중지: `modal app stop mosaic-web`
 - 탭을 열어둔 채 방치하면 GPU가 계속 과금됩니다.
 
