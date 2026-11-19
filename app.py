@@ -247,6 +247,8 @@ def _job_status_label(job):
         return "취소됨"
     if status == "failed":
         return "실패"
+    if status == "retried":
+        return "재시도됨"
     return str(status or "-")
 
 
@@ -276,6 +278,16 @@ def _render_job_card(job, pos, user):
             st.warning("작업이 취소되었습니다.")
         elif status == "failed":
             st.error(f"렌더 실패: {job.get('error') or ''}")
+            if job.get("input_path") and os.path.exists(job["input_path"]):
+                if st.button("다시 시도", key=f"retry_{jid}"):
+                    new_id = JQ.retry(jid, user)
+                    if new_id:
+                        ids = list(st.session_state.get("job_ids") or [])
+                        ids.append(new_id)
+                        st.session_state["job_ids"] = ids[-20:]
+                        st.rerun()
+                    else:
+                        st.error("입력 영상이 만료되어 다시 시도할 수 없습니다.")
         elif status == "done":
             out = job.get("output_path") or ""
             if not out or not os.path.exists(out):

@@ -352,17 +352,21 @@ class RenderQueue:
                         error=f"{type(e).__name__}: {e}")
         finally:
             try:
-                if job.get("input_path") and os.path.exists(job["input_path"]):
-                    os.remove(job["input_path"])
-            except OSError:
+                status = (self.get(job_id) or {}).get("status")
+                if status in ("done", "cancelled"):
+                    if job.get("input_path") and os.path.exists(
+                            job["input_path"]):
+                        os.remove(job["input_path"])
+                    self.clear_input_path(job_id)
+            except Exception:
                 pass
 
     def cleanup_finished_inputs(self):
-        """완료/실패/취소된 작업의 남은 입력 파일을 정리한다."""
+        """완료/취소된 작업의 남은 입력 파일을 정리한다. 실패는 재시도용으로 보관."""
         with self._db() as c:
             rows = c.execute(
                 "SELECT id, input_path FROM render_jobs WHERE status IN "
-                "('done','failed','cancelled') AND input_path<>''").fetchall()
+                "('done','cancelled') AND input_path<>''").fetchall()
             for row in rows:
                 path = row["input_path"]
                 try:
@@ -374,10 +378,62 @@ class RenderQueue:
                           (int(row["id"]),))
             return len(rows)
 
+    def cleanup_failed_inputs(self, max_age=24 * 3600):
+        """오래된 실패 작업의 입력 파일을 정리한다."""
+        cutoff = time.time() - max(0, float(max_age))
+        with self._db() as c:
+            rows = c.execute(
+                "SELECT id, input_path FROM render_jobs WHERE status='failed' "
+                "AND input_path<>'' AND finished<?", (cutoff,)).fetchall()
+            for row in rows:
+                path = row["input_path"]
+                try:
+                    if path and os.path.exists(path):
+                        os.remove(path)
+                except OSError:
+                    pass
+                c.execute("UPDATE render_jobs SET input_path='' WHERE id=?",
+                          (int(row["id"]),))
+            return len(rows)
+
+    def clear_input_path(self, job_id):
+        with self._db() as c:
+            c.execute("UPDATE render_jobs SET input_path='' WHERE id=?",
+                      (int(job_id),))
+
+    def retry(self, job_id, user):
+        """실패한 작업을 같은 입력/설정으로 다시 queued에 넣는다."""
+        with self._db() as c:
+            row = c.execute(
+                "SELECT * FROM render_jobs WHERE id=?", (int(job_id),)
+            ).fetchone()
+            if row is None or str(row["user"]) != str(user or ""):
+                return None
+            if row["status"] != "failed":
+                return None
+            input_path = row["input_path"] or ""
+            if not input_path or not os.path.exists(input_path):
+                return None
+            cur = c.execute(
+                "INSERT INTO render_jobs (user, status, created, progress, "
+                "input_path, output_path, payload, cancel_requested) "
+                "VALUES (?,?,?,?,?,?,?,0)",
+                (row["user"], "queued", time.time(), 0.0, input_path,
+                 row["output_path"] or "", row["payload"] or "{}"))
+            c.execute("UPDATE render_jobs SET status='retried', "
+                      "input_path='' WHERE id=?", (int(job_id),))
+            return int(cur.lastrowid)
+
     def worker_loop(self):
         self.cleanup_finished_inputs()
+        self.cleanup_failed_inputs()
         self.recover_running()
+        last_cleanup = time.time()
         while True:
+            if time.time() - last_cleanup > 3600:
+                self.cleanup_finished_inputs()
+                self.cleanup_failed_inputs()
+                last_cleanup = time.time()
             job = self.claim()
             if job is None:
                 time.sleep(1.5)
@@ -423,6 +479,10 @@ def cancel(job_id, user):
 
 def is_cancel_requested(job_id):
     return _QUEUE.is_cancel_requested(job_id)
+
+
+def retry(job_id, user):
+    return _QUEUE.retry(job_id, user)
 
 
 def update_progress(job_id, frac):
