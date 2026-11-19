@@ -74,8 +74,10 @@
   24.1MB, PASS.
 
 ### 검증
-- `pytest` 42 passed, `apptest` APPTEST_PASS, `qualitytest` PASS,
+- `pytest` 45 passed, `apptest` APPTEST_PASS, `qualitytest` PASS,
   `robustness` ROBUSTNESS_PASS, live apptest 3종 PASS.
+- CI에 합성 영상 기반 `apptest` job을 추가했다. 실제 얼굴 영상 없이
+  업로드→분석→큐 렌더→다운로드 흐름을 GitHub Actions에서 검사한다.
 - face.mp4 모자이크 픽셀 변화는 평균 1.82/최대 4.37로 수치상 큰 변화는 없지만,
   59~61프레임 육안 확인에서 오른쪽 남성 모자이크가 안정적으로 유지된다.
 - 주소 precision/recall: 20프레임 EAST reference 기준 P 0.575 / R 0.438 /
@@ -358,6 +360,6 @@ YuNet이 오른쪽 남성을 1프레임 놓쳤다가 다시 잡으면서 모자�
 2. **다중 컨테이너 큐**: 현재 지속형 큐는 SQLite + 단일 워커라
    `max_containers=1`에서 안전하다. 여러 컨테이너로 늘리려면 외부 DB
    (Postgres 등)와 분산 락이 필요하다.
-3. **CI 통합 테스트**: 테스트 영상이 로컬 전용이라 `apptest`/`regression`은
-   CI에서 돌지 않는다. 공개 가능한 합성/짧은 샘플을 `tests/fixtures`에 넣고
-   apptest를 CI에 추가하는 방법이 있다.
+3. **실제 영상 회귀**: 합성 `apptest`는 CI에 들어갔지만, 실제 얼굴·간판
+   영상 회귀는 개인정보 때문에 로컬에서만 돌린다. 필요하면 공개 가능한
+   짧은 샘플을 별도 비공개 아티팩트로 두고 주기 실행하는 방법이 있다.

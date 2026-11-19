@@ -271,7 +271,8 @@ python scripts/sampletest.py
 python scripts/freeform.py
 python scripts/regression.py              # 샘플 영상 필요
 python scripts/robustness.py
-python scripts/apptest.py                 # 샘플 영상 필요
+python scripts/apptest.py                 # 샘플 영상 필요(없으면 make_ci_video.py)
+python scripts/make_ci_video.py /tmp/mosaic_ci.mp4
 python scripts/live_apptest.py /data/_smoke/face.mp4  # 배포 컨테이너 안에서 실행
 python scripts/golden_run.py --out golden.json
 python scripts/leak_metrics.py 결과.mp4   # YuNet 재검출 대리 지표
@@ -284,6 +285,7 @@ python scripts/leak_metrics.py 결과.mp4   # YuNet 재검출 대리 지표
   `MOSAIC_MODEL=yolo11n-seg.pt`, `MOSAIC_IMGSZ=640`을 지정하세요.
 - `apptest.py`는 로그인 세션을 주입한 뒤 업로드 → 분석 목록 →
   `모자이크 시작` → 결과 파일 생성 → 다운로드 버튼 노출까지 확인합니다.
+  실제 영상이 없으면 `scripts/make_ci_video.py`로 합성 MP4를 만들 수 있습니다.
 - `qualitytest.py`는 마스크가 사람 밖으로 번지지 않는지, 강도가 높을수록
   블록이 커지는지, 기울어진 얼굴·긴 샘플 간격 보간이 유지되는지 봅니다.
 - `address_eval.py`는 `tests/fixtures/address_predictions.json`과
@@ -294,8 +296,8 @@ python scripts/leak_metrics.py 결과.mp4   # YuNet 재검출 대리 지표
   않으며, 없으면 해당 테스트는 건너뜁니다.
 - `python scripts/live_vlm.py <영상 경로>`는 실제 Gemini 분석 결과를
   확인합니다(키 필요).
-- CI(`.github/workflows/ci.yml`)는 `tests/`와 정적 검사를 실행합니다.
-  `pip check`와 Dependabot도 설정되어 있습니다.
+- CI(`.github/workflows/ci.yml`)는 `tests/`와 정적 검사, 그리고 합성 영상
+  `apptest`를 실행합니다. `pip check`와 Dependabot도 설정되어 있습니다.
 
 ## 개인정보 처리
 
@@ -349,6 +351,7 @@ tests/                       pytest 단위·통합 테스트
 scripts/
   smoke/authtest/checklist/qualitytest/sampletest/freeform/regression/
   robustness/apptest/golden_run/leak_metrics/live_apptest/address_eval  자동 검사/측정
+  make_ci_video.py          CI용 합성 테스트 영상 생성
   live_vlm.py               실제 Gemini 분석 확인용
 HANDOFF.md                  인수인계/검증 결과/남은 일
 ```
