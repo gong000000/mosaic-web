@@ -400,6 +400,79 @@ def test_address_eval_matching_and_summary():
     assert s["recall"] == 0.5, s
 
 
+def test_render_queue_persists_and_claims_one_job():
+    from src.jobqueue import RenderQueue
+    from src.render_service import MosaicSettings
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, "in.mp4")
+    with open(src, "wb") as f:
+        f.write(b"video")
+    q = RenderQueue(db_path=os.path.join(d, "jobs.db"),
+                    input_dir=os.path.join(d, "inputs"))
+    items = [{"category": "face", "type": "person",
+              "samples": {"0": [[1, 2, 3, 4]]},
+              "thumb": np.zeros((2, 2, 3), np.uint8)}]
+    job1 = q.enqueue(
+        user="alice", input_path=src, output_path=os.path.join(d, "out1.mp4"),
+        items=items, selected_cats=["face"], settings=MosaicSettings(),
+        model_name="yolo11n-seg.pt", imgsz=640, stride=15, conf=0.2,
+        preset="veryfast", query_raw="q", src_name="in.mp4",
+        preset_name="얼굴만")
+    job2 = q.enqueue(
+        user="bob", input_path=src, output_path=os.path.join(d, "out2.mp4"),
+        items=items, selected_cats=["face"], settings=MosaicSettings(),
+        model_name="yolo11n-seg.pt", imgsz=640, stride=15, conf=0.2,
+        preset="veryfast", query_raw="q", src_name="in.mp4",
+        preset_name="얼굴만")
+    assert q.position(job2) == 2
+    claimed = q.claim()
+    assert claimed and claimed["id"] == job1
+    assert "thumb" not in claimed["payload"]
+    assert q.claim() is None, "동시에 두 작업을 잡으면 안 된다"
+    q.finish(job1, "done", summary="1개 항목")
+    assert q.get(job1)["status"] == "done"
+    assert q.get(job2)["status"] == "queued"
+    q.recover_running()
+    assert q.get(job1)["status"] == "done"
+
+
+def test_queue_worker_completes_job_without_model():
+    from unittest.mock import patch
+    from src.jobqueue import RenderQueue
+    from src.render_service import MosaicSettings
+
+    class FakePlan:
+        @classmethod
+        def from_items(cls, *args, **kwargs):
+            return cls()
+
+        def render(self, input_path, output_path, **kwargs):
+            with open(output_path, "wb") as f:
+                f.write(b"x" * 2048)
+            return {"_faces": 1, "_regions": 0}
+
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, "in.mp4")
+    with open(src, "wb") as f:
+        f.write(b"video")
+    q = RenderQueue(db_path=os.path.join(d, "jobs.db"),
+                    input_dir=os.path.join(d, "inputs"))
+    job_id = q.enqueue(
+        user="alice", input_path=src, output_path=os.path.join(d, "out.mp4"),
+        items=[], selected_cats=["face"], settings=MosaicSettings(),
+        model_name="yolo11n-seg.pt", imgsz=640, stride=15, conf=0.2,
+        preset="veryfast", query_raw="q", src_name="in.mp4",
+        preset_name="얼굴만", person_total=1)
+    job = q.claim()
+    with patch("src.jobqueue.RenderPlan", FakePlan), \
+            patch("src.jobqueue.H.add", lambda **kwargs: None):
+        q.run_job(job)
+    row = q.get(job_id)
+    assert row["status"] == "done", row
+    assert os.path.exists(row["output_path"])
+    assert not os.path.exists(job["input_path"]), "입력 임시 파일이 남음"
+
+
 def test_face_mesh_falls_back_without_model():
     from src.face_mesh import FaceMeshRefiner
     ref = FaceMeshRefiner(model_path="/nonexistent/model.task")

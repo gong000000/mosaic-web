@@ -12,6 +12,7 @@ outputs/jobs.json
 outputs/jobs.json.migrated
 outputs/jobs.db
 outputs/jobs.db-*
+outputs/job_inputs/
 .env
 .env.*
 !.env.example

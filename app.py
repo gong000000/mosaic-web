@@ -26,10 +26,10 @@ from src.config import (CANDS, CATEGORY_TYPE, GEMINI_BASE_URL, OUTPUT_DIR,
                         label_ko)
 from src.models import get_model
 from src.preview import analyze_video
-from src.render import normalize_video, strip_audio, trim_video
+from src.render import normalize_video, trim_video
 from src.render_service import MosaicSettings, RenderPlan
-from src.render_queue import RenderGate
 from src import history as H
+from src import jobqueue as JQ
 from src import retention as RT
 from src.auth import require_login
 
@@ -56,10 +56,8 @@ FAST_PLATE_BUDGET = 28
 # 렌더 단계에서 VLM을 다시 호출하지 않는다. 체크리스트 분석 결과
 # (priors)와 YOLO 추적만으로 전체 영상을 만든다. 같은 영상에 VLM 비용을
 # 두 번 쓰지 않고, 렌더 결과도 분석 결과와 일치한다.
-RENDER_VLM_CALLS = 0
 
-# 한 컨테이너에서 여러 세션이 동시에 렌더할 때 순번 대기를 알리기 위한 게이트.
-_RENDER_GATE = RenderGate()
+# 렌더는 지속형 큐가 백그라운드에서 하나씩 처리한다.
 _HISTORY_PAGE_SIZE = 10
 
 
@@ -69,6 +67,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+JQ.start_worker()
 
 
 def _load_css():
@@ -630,75 +629,71 @@ else:
 
     if st.button("모자이크 시작", type="primary", key="start_mosaic"):
         out_path = _unique_out_path(uploaded.name, current_user)
-        _RENDER_GATE.enter()
-        if _RENDER_GATE.waiting() > 0:
-            st.info("다른 사용자의 모자이크 작업이 진행 중입니다. "
-                    f"대기 순번: {_RENDER_GATE.waiting() + 1}번째. "
-                    "순서대로 자동 시작됩니다...")
-        progress = st.progress(0.0, text="렌더 준비 중...")
-
-        def on_progress(frac, done, total, elapsed):
-            try:
-                progress.progress(
-                    min(1.0, max(0.0, float(frac))),
-                    text=f"{int(done)}/{max(1, int(total))} 프레임 · "
-                         f"{float(elapsed):.0f}초")
-            except Exception:
-                pass
-
         try:
-            with _RENDER_GATE:
-                pass1_sig = plan.pass1_signature(
-                    source_token, FAST_MODEL, FAST_IMGSZ, FAST_STRIDE,
-                    FAST_CONF)
-                cache_path = os.path.join(tmp_dir, f"pass1_{pass1_sig}.json")
-                started = time.time()
-                stats = plan.render(
-                    proc_in, out_path,
-                    model_name=FAST_MODEL, imgsz=FAST_IMGSZ,
-                    stride=FAST_STRIDE, conf=FAST_CONF, preset=FAST_PRESET,
-                    progress_fn=on_progress, query_raw=ANALYSIS_QUERY,
-                    api_key=api_key, vlm_model=vlm_model,
-                    vlm_base_url=vlm_base_url, cache_path=cache_path,
-                    use_cache=True, vlm_call_limit=RENDER_VLM_CALLS)
-                elapsed = time.time() - started
-                if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-                    raise RuntimeError("결과 영상이 만들어지지 않았습니다.")
-                if strip_audio_opt:
-                    strip_audio(out_path)
-            person_selected = any(
-                CATEGORY_TYPE.get(c) == "person" for c in selected_cats)
-            if "face" in selected_cats:
-                face_count = person_total
-            else:
-                face_count = stats.get("_faces")
-            if face_count is None:
-                face_count = sum(1 for key, value in stats.items()
-                                 if isinstance(key, int) and value.get("mosaic"))
-            summary = f"{len(selected_cats)}개 항목"
-            if person_selected:
-                summary += f" · 사람 {int(face_count)}명"
-            regions = int(stats.get("_regions", 0) or 0)
-            if regions:
-                summary += f" · 배경 {regions}곳"
-            st.session_state["render_out"] = out_path
-            st.session_state["render_sig"] = current_sig
-            st.session_state["render_summary"] = summary
-            st.session_state["render_sec"] = elapsed
-            H.add(src_name=uploaded.name, prompt=preset_name,
-                  target=",".join(selected_cats), invert=False,
-                  out_name=os.path.basename(out_path), seconds=elapsed,
-                  query_raw=preset_name, selector="vlm", summary=summary,
-                  user=current_user)
-            progress.progress(1.0, text="완료")
-            st.rerun()
+            job_id = JQ.enqueue(
+                user=current_user,
+                input_path=proc_in,
+                output_path=out_path,
+                items=items,
+                selected_cats=selected_cats,
+                settings=settings,
+                model_name=FAST_MODEL,
+                imgsz=FAST_IMGSZ,
+                stride=FAST_STRIDE,
+                conf=FAST_CONF,
+                preset=FAST_PRESET,
+                query_raw=ANALYSIS_QUERY,
+                vlm_model=vlm_model,
+                vlm_base_url=vlm_base_url,
+                src_name=uploaded.name,
+                preset_name=preset_name,
+                person_total=person_total,
+                strip_audio=strip_audio_opt,
+            )
         except Exception as e:
-            st.session_state.pop("render_out", None)
-            st.session_state.pop("render_sig", None)
-            st.session_state.pop("render_summary", None)
             _unlink_quiet(out_path)
-            st.error(f"모자이크 렌더 실패: "
+            st.error(f"렌더 작업 등록 실패: "
                      f"{_friendly_vlm_error(e, api_key)}")
+        else:
+            progress = st.progress(0.0, text="대기 중...")
+            deadline = time.time() + 3600
+            try:
+                while True:
+                    job = JQ.get(job_id)
+                    if not job:
+                        raise RuntimeError("렌더 작업을 찾을 수 없습니다.")
+                    status = job.get("status")
+                    if status == "done":
+                        out_path = job.get("output_path") or out_path
+                        elapsed = max(
+                            0.0, float(job.get("finished") or 0)
+                            - float(job.get("started") or 0))
+                        st.session_state["render_out"] = out_path
+                        st.session_state["render_sig"] = current_sig
+                        st.session_state["render_summary"] = (
+                            job.get("summary") or "")
+                        st.session_state["render_sec"] = elapsed
+                        progress.progress(1.0, text="완료")
+                        break
+                    if status == "failed":
+                        raise RuntimeError(job.get("error") or "렌더 실패")
+                    frac = min(1.0, max(0.0, float(job.get("progress") or 0)))
+                    if status == "queued":
+                        text = f"대기 중 · {JQ.position(job_id)}번째"
+                    else:
+                        text = f"렌더 중 · {int(frac * 100)}%"
+                    progress.progress(frac, text=text)
+                    if time.time() > deadline:
+                        raise RuntimeError("렌더 대기 시간이 초과되었습니다.")
+                    time.sleep(1.0)
+                st.rerun()
+            except Exception as e:
+                st.session_state.pop("render_out", None)
+                st.session_state.pop("render_sig", None)
+                st.session_state.pop("render_summary", None)
+                _unlink_quiet(out_path)
+                st.error(f"모자이크 렌더 실패: "
+                         f"{_friendly_vlm_error(e, api_key)}")
 
 # ---------------------------------------------------------------- 미리보기/다운로드
 st.subheader("미리보기 · 다운로드")

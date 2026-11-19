@@ -68,6 +68,10 @@
      `MOSAIC_PLATE_DET=0`이면 VLM만 씁니다.
    - `veryfast` H.264 MP4로 인코딩하며 원본 오디오와 영상 길이를 유지합니다.
      사이드바의 `오디오 제거`를 켜면 목소리도 제거합니다.
+   - 렌더 작업은 SQLite 큐(`render_jobs`)에 저장되고 백그라운드 워커가
+     하나씩 처리합니다. 창을 닫아도 계속되며, 서버가 재시작되면 queued 작업을
+     이어갑니다. 입력 영상은 볼륨의 `job_inputs/`에 복사한 뒤 완료/실패 시
+     삭제합니다.
 
 4. **미리보기 · 다운로드**
    - 사진이 아니라 **모자이크가 실제로 적용된 동영상**을 재생해 확인합니다.
@@ -295,7 +299,9 @@ python scripts/leak_metrics.py 결과.mp4   # YuNet 재검출 대리 지표
 
 ## 개인정보 처리
 
-- 원본 영상은 실행 환경의 임시 폴더에서만 처리됩니다.
+- 원본 영상은 실행 환경의 임시 폴더에서만 처리됩니다. 렌더 큐에 등록된
+  작업은 처리 동안 볼륨의 `job_inputs/`에 임시 복사되고, 완료/실패하면
+  즉시 삭제됩니다.
 - VLM에는 **샘플 프레임 이미지**와 선택적 차량 크롭만 전송하며 영상 파일
   전체를 보내지 않습니다. 업로드 화면에 이 사실을 고지합니다.
 - 결과 파일은 `outputs/`에 저장되며, 기본 24시간이 지난 파일은 자동 정리됩니다.
@@ -326,6 +332,7 @@ src/pipeline.py             YOLO 추적 + 모자이크 렌더 파이프라인
 src/render.py               모자이크/FFmpeg H.264 유틸
 src/render_service.py       체크리스트 → 렌더 요청 변환/서명/캐시
 src/render_queue.py         동시 렌더 직렬화/대기 순번
+src/jobqueue.py             지속형 렌더 작업 큐(SQLite) + 백그라운드 워커
 src/history.py              사용자별 결과 기록 (SQLite jobs.db)
 src/retention.py            보관/삭제 정책 (24시간·개수·용량)
 requirements.txt            CPU/headless 의존성

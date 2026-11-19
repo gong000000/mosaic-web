@@ -38,8 +38,13 @@
 - **SQLite 작업 기록**: `jobs.json` 전체 재쓰기를 `jobs.db`(WAL) INSERT/DELETE로
   교체했다. 기존 `jobs.json`은 최초 실행 때 자동 마이그레이션되고
   `jobs.json.migrated`로 보존된다. 사용자별 100건 상한 유지.
-- **렌더 대기 순번**: `RenderGate`로 동시 렌더를 직렬화하고, 대기 중인 세션에
-  "대기 순번 N번째"를 표시한다.
+- **렌더 대기/지속형 큐**: `RenderGate`로 동시 렌더를 직렬화하는 것에 더해,
+  `render_jobs` SQLite 테이블과 백그라운드 워커를 추가했다. 작업 상태는
+  `queued → running → done/failed`로 저장되고, 창을 닫아도 계속된다.
+  입력 영상은 볼륨 `job_inputs/`에 복사하고 완료/실패 시 삭제한다. 서버
+  재시작 시 이전 `running` 작업은 `queued`로 되돌려 이어간다.
+  `max_containers=1`에서는 안전하며, 다중 컨테이너 전역 큐는 외부 DB/분산 락이
+  필요하다.
 - **보관 정책**: 24시간 만료 + 결과 500개/20GB 상한. `MOSAIC_MAX_OUTPUT_FILES`,
   `MOSAIC_MAX_OUTPUT_GB`로 조정한다. `jobs.db`/WAL은 삭제 대상에서 제외한다.
 - **저장소 보안**: GitHub 저장소를 private로 전환하고, 실제 얼굴이 있는 테스트
@@ -350,9 +355,9 @@ YuNet이 오른쪽 남성을 1프레임 놓쳤다가 다시 잡으면서 모자�
 1. **주소 recall 개선**: 20프레임 평가에서 recall 0.438로 VLM이 작은 간판을
    많이 놓쳤다. 주소 프리셋에서 EAST-only 글자 영역을 추가하되, 사람/차량 내부
    텍스트(셔츠·번호판)를 제외하는 필터를 붙이면 recall을 올릴 수 있다.
-2. **지속형 작업 큐**: `RenderGate`는 한 프로세스 안에서 동시 렌더만 막는다.
-   컨테이너 재시작/다중 컨테이너까지 고려하려면 SQLite 작업 테이블 + 워커
-   스레드로 확장해야 한다. 현재 `max_containers=1`이라 급하지 않다.
+2. **다중 컨테이너 큐**: 현재 지속형 큐는 SQLite + 단일 워커라
+   `max_containers=1`에서 안전하다. 여러 컨테이너로 늘리려면 외부 DB
+   (Postgres 등)와 분산 락이 필요하다.
 3. **CI 통합 테스트**: 테스트 영상이 로컬 전용이라 `apptest`/`regression`은
    CI에서 돌지 않는다. 공개 가능한 합성/짧은 샘플을 `tests/fixtures`에 넣고
    apptest를 CI에 추가하는 방법이 있다.
