@@ -8,8 +8,8 @@ import cv2
 import imageio_ffmpeg
 import pytest
 
-from src.chunk_render import (_shift_manual, _shift_priors,
-                              render_resumable)
+from src.chunk_render import (_auto_chunk_seconds, _shift_manual,
+                              _shift_priors, render_resumable)
 from src.render_service import MosaicSettings
 
 
@@ -47,6 +47,14 @@ def _make_video(path, seconds=7):
     ]
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL,
                    stderr=subprocess.PIPE)
+
+
+def test_auto_chunk_seconds_scales_with_resolution():
+    assert _auto_chunk_seconds(3840, 2160) == 20.0
+    assert _auto_chunk_seconds(2560, 1440) == 30.0
+    assert _auto_chunk_seconds(1920, 1080) == 45.0
+    assert _auto_chunk_seconds(1280, 720) == 60.0
+    assert _auto_chunk_seconds(640, 360) == 90.0
 
 
 def test_shift_priors_moves_region_and_filters_person():

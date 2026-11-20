@@ -111,13 +111,33 @@ def _probe_video(path):
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         cap.release()
-        return 0, 0.0
+        return 0, 0.0, 0, 0
     try:
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     finally:
         cap.release()
-    return total, fps
+    return total, fps, width, height
+
+
+def _auto_chunk_seconds(width, height):
+    """해상도가 높을수록 처리 시간이 길어 구간을 짧게 잡는다.
+
+    4K 3분 영상은 20초 구간 9개, 1080p 3분 영상은 45초 구간 4개가 된다.
+    체크포인트 단위를 처리 시간에 맞춰, preemption 때 잃는 작업량을 줄인다.
+    """
+    short = min(int(width or 0), int(height or 0))
+    if short >= 2160:
+        return 20.0
+    if short >= 1440:
+        return 30.0
+    if short >= 1080:
+        return 45.0
+    if short >= 720:
+        return 60.0
+    return 90.0
 
 
 def _shift_priors(priors, start_frame, end_frame, margin, region):
@@ -240,11 +260,14 @@ def render_resumable(plan, input_path, output_path, *, model_name, imgsz,
                      api_key=None, vlm_model=None, vlm_base_url=None,
                      final_mux_audio=True, cancel_fn=None):
     """긴 영상이면 구간 체크포인트 렌더, 짧으면 기존 단일 렌더."""
+    raw_chunk = os.environ.get("MOSAIC_CHUNK_SEC", "").strip()
     try:
-        chunk_seconds = float(os.environ.get("MOSAIC_CHUNK_SEC", "120"))
+        chunk_seconds = float(raw_chunk) if raw_chunk else -1.0
     except (TypeError, ValueError):
-        chunk_seconds = 120.0
-    total, fps = _probe_video(input_path)
+        chunk_seconds = -1.0
+    total, fps, width, height = _probe_video(input_path)
+    if chunk_seconds < 0:
+        chunk_seconds = _auto_chunk_seconds(width, height)
     if (chunk_seconds <= 0 or total <= 0 or fps <= 0
             or total <= int(round(chunk_seconds * fps) * 1.25)):
         return plan.render(
