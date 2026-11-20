@@ -174,7 +174,7 @@ def queue_keepalive():
         "MOSAIC_SKIP_DOTENV": "1",
         "MOSAIC_WEIGHTS_DIR": "/opt/weights",
         "MOSAIC_VLM_RPM": "90",
-        "MOSAIC_MAX_PARALLEL": "5",
+        "MOSAIC_MAX_PARALLEL": "3",
         # 큐 워커는 web()가 별도 프로세스로 띄운다. Streamlit은 큐에 넣고
         # 상태만 읽는다.
         "MOSAIC_QUEUE_WORKER": "external",

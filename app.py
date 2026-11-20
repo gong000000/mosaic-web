@@ -383,7 +383,7 @@ def _render_history(user, expanded=False):
         if active:
             st.markdown("**대기/진행 중**")
             st.caption("대기 순번은 내 계정의 앞선 작업만 셉니다. "
-                       "서버는 최대 5개 계정 작업을 동시에 처리합니다.")
+                       "서버는 최대 3개 계정 작업을 동시에 처리합니다.")
             for j in active:
                 if j.get("status") == "queued":
                     pos = JQ.position(j['id'], user)

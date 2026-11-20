@@ -554,6 +554,15 @@ def test_queue_five_accounts_and_per_account_order():
     assert nxt["id"] == u6
 
 
+def test_queue_default_parallel_is_three(monkeypatch):
+    from src.jobqueue import RenderQueue
+    monkeypatch.delenv("MOSAIC_MAX_PARALLEL", raising=False)
+    d = tempfile.mkdtemp()
+    q = RenderQueue(db_path=os.path.join(d, "jobs.db"),
+                    input_dir=os.path.join(d, "inputs"))
+    assert q.max_parallel == 3
+
+
 def test_queue_status_snapshot_and_audit():
     from src.jobqueue import RenderQueue
     from src.render_service import MosaicSettings

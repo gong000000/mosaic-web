@@ -93,9 +93,9 @@ class RenderQueue:
         self.input_dir = input_dir or os.path.join(OUTPUT_DIR, "job_inputs")
         if max_parallel is None:
             try:
-                max_parallel = int(os.environ.get("MOSAIC_MAX_PARALLEL", "5"))
+                max_parallel = int(os.environ.get("MOSAIC_MAX_PARALLEL", "3"))
             except (TypeError, ValueError):
-                max_parallel = 5
+                max_parallel = 3
         # 계정별로는 한 작업만, 서버 전체로는 최대 N개 계정 작업을 동시에
         # 처리한다. 다른 아이디의 작업이 내 대기 순번을 막지 않게 하기 위함.
         self.max_parallel = max(1, int(max_parallel))
