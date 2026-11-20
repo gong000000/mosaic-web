@@ -88,6 +88,7 @@ def test_face_audit_detects_and_fixes_unmasked(tmp_path, monkeypatch):
     from src import face_audit
     from src.faces import FaceBox
 
+    monkeypatch.setenv("MOSAIC_FACE_AUDIT_PERSON", "0")
     src = tmp_path / "in.mp4"
     out = tmp_path / "out.mp4"
     writer = cv2.VideoWriter(str(src), cv2.VideoWriter_fourcc(*"mp4v"),
@@ -114,6 +115,42 @@ def test_face_audit_detects_and_fixes_unmasked(tmp_path, monkeypatch):
     after = face_audit.audit_faces(str(src), str(out))
     assert after["checked"] == 10
     assert after["suspicious"] == 0
+
+
+def test_face_audit_person_gate_filters_background(tmp_path, monkeypatch):
+    from src import face_audit
+    from src.faces import FaceBox
+
+    src = tmp_path / "in.mp4"
+    out = tmp_path / "out.mp4"
+    writer = cv2.VideoWriter(str(src), cv2.VideoWriter_fourcc(*"mp4v"),
+                             10, (160, 120))
+    assert writer.isOpened()
+    for _ in range(10):
+        frame = np.zeros((120, 160, 3), np.uint8)
+        frame[30:70, 50:90] = (0, 0, 255)
+        writer.write(frame)
+    writer.release()
+    shutil.copyfile(src, out)
+
+    monkeypatch.setattr(face_audit, "get_model", lambda name: object())
+    monkeypatch.setattr(
+        face_audit, "detect_faces_rotated",
+        lambda frame, **kwargs: [(FaceBox([50, 30, 90, 70]), 0.75)])
+
+    # 사람 박스 밖의 낮은 점수 검출(바퀴/건물 무늬 등)은 감사하지 않는다.
+    monkeypatch.setattr(face_audit, "_person_boxes",
+                        lambda model, frame: [])
+    bg = face_audit.audit_faces(str(src), str(out))
+    assert bg["checked"] == 0
+    assert bg["suspicious"] == 0
+
+    # 실제 사람 박스 안이면 감사 대상이다.
+    monkeypatch.setattr(face_audit, "_person_boxes",
+                        lambda model, frame: [[40, 20, 100, 100]])
+    person = face_audit.audit_faces(str(src), str(out))
+    assert person["checked"] == 10
+    assert person["suspicious"] == 10
 
 
 def test_chunked_render_resumes_completed_chunks(tmp_path, monkeypatch):

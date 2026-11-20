@@ -17,6 +17,7 @@ import numpy as np
 
 from .errors import RenderCancelled
 from .faces import detect_faces, detect_faces_rotated
+from .models import MODEL_LOCK, get_model
 from .render import (FFmpegFrameWriter, cleanup_tmp, mux_audio_h264,
                      render_region)
 
@@ -59,6 +60,38 @@ def _expand_box(box, w, h, side=0.20, top=0.40, bottom=0.20):
             min(h, int(y2 + bh * bottom)))
 
 
+def _person_boxes(model, frame):
+    """감사용 사람 박스. YOLO 사람 검출 실패 시 빈 목록."""
+    if model is None or frame is None or frame.size == 0:
+        return []
+    try:
+        with MODEL_LOCK:
+            pr = list(model.predict(
+                source=frame, conf=0.25, classes=[0], verbose=False,
+                imgsz=640, max_det=30))[0]
+        if pr.boxes is None or len(pr.boxes) == 0:
+            return []
+        return [[float(v) for v in row[:4]]
+                for row in pr.boxes.xyxy.cpu().numpy()]
+    except Exception:
+        return []
+
+
+def _inside_person(box, persons, margin=0.18):
+    if not persons:
+        return False
+    x1, y1, x2, y2 = [float(v) for v in box[:4]]
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    for px1, py1, px2, py2 in persons:
+        if px2 - px1 < 8 or py2 - py1 < 16:
+            continue
+        mw, mh = (px2 - px1) * margin, (py2 - py1) * margin
+        if (px1 - mw <= cx <= px2 + mw
+                and py1 - mh <= cy <= py2 + mh):
+            return True
+    return False
+
+
 def audit_faces(input_path, output_path, cancel_fn=None):
     """입력/출력 얼굴을 비교해 마스크 누락 의심 항목을 돌려준다."""
     total_in, _fps, _w, _h = _probe(input_path)
@@ -71,6 +104,14 @@ def audit_faces(input_path, output_path, cancel_fn=None):
     step = max(1, total // max_samples)
     threshold = max(0.1, _env_float("MOSAIC_FACE_AUDIT_DIFF", 4.0))
     rotate = os.environ.get("MOSAIC_FACE_ROTATE", "1") != "0"
+    person_model = None
+    if os.environ.get("MOSAIC_FACE_AUDIT_PERSON", "1") != "0":
+        try:
+            person_model = get_model(
+                os.environ.get("MOSAIC_AUDIT_PERSON_MODEL",
+                               "yolo11n-seg.pt"))
+        except Exception:
+            person_model = None
 
     cap_i = cv2.VideoCapture(input_path)
     cap_o = cv2.VideoCapture(output_path)
@@ -89,6 +130,8 @@ def audit_faces(input_path, output_path, cancel_fn=None):
             if idx % step == 0:
                 dets = (detect_faces_rotated(fi) if rotate
                         else detect_faces(fi))
+                persons = (_person_boxes(person_model, fi)
+                           if person_model is not None else None)
                 for box, score in dets:
                     try:
                         x1, y1, x2, y2 = [int(round(float(v)))
@@ -101,7 +144,13 @@ def audit_faces(input_path, output_path, cancel_fn=None):
                     y2 = min(oh, y2)
                     if x2 - x1 < 20 or y2 - y1 < 20:
                         continue
-                    if float(score) < 0.70:
+                    score = float(score)
+                    if score < 0.70:
+                        continue
+                    # 바퀴/건물 무늬/포스터를 얼굴로 오검출하는 경우가 있다.
+                    # 0.85 미만은 사람 박스 안에 있어야 감사 대상으로 본다.
+                    if (score < 0.85 and person_model is not None
+                            and not _inside_person(box, persons)):
                         continue
                     a = fi[y1:y2, x1:x2]
                     b = fo[y1:y2, x1:x2]
@@ -115,11 +164,11 @@ def audit_faces(input_path, output_path, cancel_fn=None):
                         continue
                     row = {"frame": int(idx),
                            "box": [int(x1), int(y1), int(x2), int(y2)],
-                           "score": round(float(score), 3),
+                           "score": round(score, 3),
                            "diff": round(float(diff), 2)}
                     suspicious.append(row)
                     side = min(x2 - x1, y2 - y1)
-                    if float(score) >= 0.80 and side >= 32:
+                    if score >= 0.78 and side >= 28:
                         fixable.append(row)
             idx += 1
     finally:
@@ -127,6 +176,8 @@ def audit_faces(input_path, output_path, cancel_fn=None):
         cap_o.release()
     ratio = (checked - len(suspicious)) / float(checked) if checked else 1.0
     return {
+        "version": 2,
+        "person_gate": person_model is not None,
         "checked": int(checked),
         "suspicious": len(suspicious),
         "fixable": len(fixable),
