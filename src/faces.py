@@ -347,6 +347,75 @@ def detect_faces(frame_bgr, score_threshold=MIN_FACE_SCORE,
         frame_bgr, score_threshold, max_area, upscale=upscale)
 
 
+def _map_box_back(box, rotation, width, height):
+    """회전시켜 검출한 얼굴 박스를 원본 좌표로 되돌린다."""
+    x1, y1, x2, y2 = [float(v) for v in box[:4]]
+    if rotation == 90:
+        nx1, ny1 = y1, height - 1 - x2
+        nx2, ny2 = y2, height - 1 - x1
+        angle = getattr(box, "angle", 0.0) - 90.0
+    elif rotation == 180:
+        nx1, ny1 = width - 1 - x2, height - 1 - y2
+        nx2, ny2 = width - 1 - x1, height - 1 - y1
+        angle = getattr(box, "angle", 0.0) + 180.0
+    else:  # 270 (counter-clockwise)
+        nx1, ny1 = width - 1 - y2, x1
+        nx2, ny2 = width - 1 - y1, x2
+        angle = getattr(box, "angle", 0.0) + 90.0
+    return _clip_box([nx1, ny1, nx2, ny2], width, height, angle=angle)
+
+
+def _merge_face_dets(base, extra, iou=0.45):
+    out = list(base or [])
+    for box, score in extra or []:
+        dup = False
+        for i, (old, old_score) in enumerate(out):
+            if _box_iou(box, old) > iou:
+                if score > old_score:
+                    out[i] = (box, score)
+                dup = True
+                break
+        if not dup:
+            out.append((box, score))
+    out.sort(key=lambda item: item[1], reverse=True)
+    return out
+
+
+def detect_faces_rotated(frame_bgr, base=None, rotations=(90, 270),
+                         score_threshold=MIN_FACE_SCORE,
+                         max_area=MAX_FACE_AREA):
+    """정면 검출 + 90/270도 회전 검출을 합친다.
+
+    YuNet은 누워 있거나 옆으로 기울어진 얼굴을 잘 못 찾는다. 프레임을
+    회전시켜 한 번 더 찾고 박스를 원래 좌표로 되돌린다. 호출부에서 매
+    프레임이 아니라 몇 프레임 간격으로 호출해 비용을 제한한다.
+    """
+    if frame_bgr is None or frame_bgr.size == 0:
+        return []
+    if base is None:
+        base = detect_faces(frame_bgr, score_threshold, max_area)
+    rots = tuple(rotations or ())
+    if not base and 180 not in rots:
+        rots = tuple(dict.fromkeys(rots + (180,)))
+    if not rots:
+        return list(base)
+    h, w = frame_bgr.shape[:2]
+    extra = []
+    for rot in rots:
+        if rot == 90:
+            rframe = cv2.rotate(frame_bgr, cv2.ROTATE_90_CLOCKWISE)
+        elif rot == 180:
+            rframe = cv2.rotate(frame_bgr, cv2.ROTATE_180)
+        else:
+            rframe = cv2.rotate(frame_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        for box, score in detect_faces(
+                rframe, score_threshold, max_area):
+            mapped = _map_box_back(box, rot, w, h)
+            if mapped is not None:
+                extra.append((mapped, score))
+    return _merge_face_dets(base, extra)
+
+
 def detect_faces_in_person_crops(frame_bgr, persons, scale=2.0,
                                  max_crops=8,
                                  score_threshold=MIN_FACE_SCORE):
@@ -370,6 +439,28 @@ def detect_faces_in_person_crops(frame_bgr, persons, scale=2.0,
     except (TypeError, ValueError):
         sc = 2.0
     out = []
+
+    def _scan(crop, cx1, cy1, cx2, cy2):
+        if crop.shape[0] < 20 or crop.shape[1] < 20:
+            return []
+        cw = min(720, max(32, int((cx2 - cx1) * sc)))
+        ch = min(720, max(32, int((cy2 - cy1) * sc)))
+        big = cv2.resize(crop, (cw, ch), interpolation=cv2.INTER_LINEAR)
+        fx = (cx2 - cx1) / float(cw)
+        fy = (cy2 - cy1) / float(ch)
+        found = []
+        for box, score in detect_faces_rotated(
+                big, score_threshold=score_threshold):
+            x1 = cx1 + float(box[0]) * fx
+            y1 = cy1 + float(box[1]) * fy
+            x2 = cx1 + float(box[2]) * fx
+            y2 = cy1 + float(box[3]) * fy
+            clipped = _clip_box([x1, y1, x2, y2], w, h,
+                                angle=getattr(box, "angle", 0.0))
+            if clipped is not None:
+                found.append((clipped, score))
+        return found
+
     for pb in boxes[:max(1, int(max_crops))]:
         px1, py1, px2, py2 = pb
         bw, bh = px2 - px1, py2 - py1
@@ -377,27 +468,18 @@ def detect_faces_in_person_crops(frame_bgr, persons, scale=2.0,
             continue
         m = 0.10 * max(bw, bh)
         cx1 = max(0, int(px1 - m))
-        cy1 = max(0, int(py1 - m))
         cx2 = min(w, int(px2 + m))
-        cy2 = min(h, int(py1 + 0.60 * bh + m))
-        crop = frame_bgr[cy1:cy2, cx1:cx2]
-        if crop.shape[0] < 20 or crop.shape[1] < 20:
-            continue
-        cw = min(720, max(32, int((cx2 - cx1) * sc)))
-        ch = min(720, max(32, int((cy2 - cy1) * sc)))
-        big = cv2.resize(crop, (cw, ch), interpolation=cv2.INTER_LINEAR)
-        fx = (cx2 - cx1) / float(cw)
-        fy = (cy2 - cy1) / float(ch)
-        for box, score in detect_faces(big, score_threshold):
-            x1 = cx1 + float(box[0]) * fx
-            y1 = cy1 + float(box[1]) * fy
-            x2 = cx1 + float(box[2]) * fx
-            y2 = cy1 + float(box[3]) * fy
-            clipped = _clip_box([x1, y1, x2, y2], w, h,
-                                angle=getattr(box, "angle", 0.0))
-            if clipped is None:
-                continue
-            out.append((clipped, score))
+        # 기존: 사람 박스 상단 60% 확대.
+        top2 = min(h, int(py1 + 0.60 * bh + m))
+        found = _scan(frame_bgr[max(0, int(py1 - m)):top2, cx1:cx2],
+                      cx1, max(0, int(py1 - m)), cx2, top2)
+        # 누워 있거나 옆으로 긴 사람은 머리가 박스 상단에 없을 수 있다.
+        # 상단에서 못 찾았거나 박스가 가로로 길면 전체 사람 박스를 본다.
+        if not found or bw > 1.3 * bh:
+            full2 = min(h, int(py2 + m))
+            found += _scan(frame_bgr[max(0, int(py1 - m)):full2, cx1:cx2],
+                           cx1, max(0, int(py1 - m)), cx2, full2)
+        out.extend(found)
     out.sort(key=lambda item: item[1], reverse=True)
     merged = []
     for bx, score in out:

@@ -29,6 +29,7 @@ from .config import (CATEGORY_TYPE, ROOT_DIR, VLM_MODEL, canon_category,
 from .models import MODEL_LOCK, get_model, get_thread_model
 from .detect import filter_contained, big_enough, iou, region_has_detail
 from .faces import (FaceBox, FaceTracker, detect_faces,
+                    detect_faces_rotated,
                     detect_faces_in_person_crops, expand_face_box,
                     filter_faces_by_person, persons_without_faces,
                     scene_signature, is_scene_cut, _blend_angle)
@@ -570,6 +571,44 @@ def _clip_head(box, W, H):
     return (x1, y1, x2, y2) if x2 - x1 >= 8 and y2 - y1 >= 8 else None
 
 
+def _face_rotate_enabled():
+    return os.environ.get("MOSAIC_FACE_ROTATE", "1") != "0"
+
+
+def _face_rotate_every():
+    try:
+        return max(1, int(os.environ.get("MOSAIC_FACE_ROTATE_EVERY", "3")))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _padded_head_box(frame_bgr, box, side=0.20, top=0.45, bottom=0.20):
+    return expand_face_box(box, frame_bgr.shape[1], frame_bgr.shape[0],
+                           side=side, top=top, bottom=bottom)
+
+
+def _poly_covers_box(poly, box, min_ratio=0.80):
+    """mesh 폴리곤이 얼굴/머리 박스를 충분히 덮는지 확인한다.
+
+    옆얼굴/누운 얼굴에서 랜드마크 hull이 얼굴 한쪽만 덮으면, 그대로
+    모자이크를 그렸을 때 반대쪽 볼·눈이 노출된다. 이 경우 박스형
+    안전 마스크로 대체한다.
+    """
+    try:
+        x1, y1, x2, y2 = [float(v) for v in box]
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            return False
+        box_poly = np.array(
+            [[x1, y1], [x2, y1], [x2, y2], [x1, y2]], np.float32)
+        inter, _ = cv2.intersectConvexConvex(
+            np.asarray(poly, np.float32).reshape(-1, 1, 2),
+            box_poly.reshape(-1, 1, 2))
+        area = max(1.0, (x2 - x1) * (y2 - y1))
+        return float(inter) / area >= float(min_ratio)
+    except Exception:
+        return False
+
+
 def _render_face_box(frame, box, style, blocks, blur, angle=0.0,
                      mesh=None, motion=0.0, block_size=None):
     """랜드마크 외곽이 있으면 사람마다 다른 모양으로, 없으면 고정 얼굴형으로.
@@ -582,6 +621,10 @@ def _render_face_box(frame, box, style, blocks, blur, angle=0.0,
             poly = mesh.polygon_for_box(frame, box)
         except Exception:
             poly = None
+        if poly is not None:
+            if not _poly_covers_box(
+                    poly, _padded_head_box(frame, box), 0.80):
+                poly = None
         if poly is not None:
             if motion > 0:
                 try:
@@ -597,7 +640,7 @@ def _render_face_box(frame, box, style, blocks, blur, angle=0.0,
                     block_size=block_size):
                 return True
     bx = expand_face_box(box, frame.shape[1], frame.shape[0], angle=angle,
-                        motion=motion)
+                        motion=motion, side=0.20, top=0.40, bottom=0.20)
     if not bx:
         return False
     return bool(render_face_ellipse(
@@ -988,6 +1031,8 @@ class MosaicJob:
         style, blocks, blur = self.style, self.blocks, self.blur
         stride = max(1, int(self.keyframe_stride))
         preset = self.encode_preset
+        rotate_faces = _face_rotate_enabled()
+        rotate_every = _face_rotate_every()
 
         cap = cv2.VideoCapture(input_path)
         if not cap.isOpened():
@@ -1028,8 +1073,8 @@ class MosaicJob:
         # 얼굴로 크게 잡은 박스를 추적 초기값으로 넣으면 거대한 모자이크가
         # 생기므로, 얼굴 위치는 로컬 YuNet/포즈 보완만 사용한다.
         tracker = FaceTracker(
-            max_miss=max(8, int(round(fps * 0.4))),
-            seed_miss=max(6, int(round(fps * 0.2))))
+            max_miss=max(10, int(round(fps * 0.80))),
+            seed_miss=max(6, int(round(fps * 0.30))))
         pose_model = None
         head_model = None
         if os.environ.get("MOSAIC_HEAD_POSE", "1") != "0":
@@ -1049,8 +1094,8 @@ class MosaicJob:
         # 보행자 머리가 50px 이상 움직이므로 짧게 유지하면 매번 새 트랙이
         # 생겨 모자이크가 제자리에 남거나 깜빡인다.
         head_tracker = FaceTracker(
-            max_miss=max(8, int(round(fps * 0.5))),
-            seed_miss=max(4, int(round(fps * 0.25))),
+            max_miss=max(10, int(round(fps * 0.80))),
+            seed_miss=max(4, int(round(fps * 0.30))),
             iou_thresh=0.12)
         try:
             mesh_refiner = FaceMeshRefiner.shared()
@@ -1134,6 +1179,10 @@ class MosaicJob:
                         head_tracker.update([], flow_fn=flow_fn)
 
                     raw_dets = detect_faces(frame)
+                    if rotate_faces and (idx % rotate_every == 0
+                                         or not raw_dets):
+                        raw_dets = detect_faces_rotated(
+                            frame, base=raw_dets)
                     # 개/고양이 얼굴 등 사람이 아닌 큰 검출을 거른다.
                     # 점수가 매우 높으면(사람 얼굴) 그대로 두고, 애매한
                     # 검출만 YOLO 사람 박스 안에 있는지 확인한다.
@@ -1392,7 +1441,9 @@ class MosaicJob:
                                     (box, (0, 255, 0), f"F{tid}"))
                                 continue
                         poly, _fresh = face_cache.polygon(frame, tid, box)
-                        if poly is not None:
+                        if (poly is not None
+                                and _poly_covers_box(
+                                    poly, _padded_head_box(frame, box), 0.80)):
                             if render_face_polygon(
                                     frame, poly, style=style, blocks=blocks,
                                     blur=blur, block_size=bs):
@@ -1424,9 +1475,12 @@ class MosaicJob:
                             tid, hb[2] - hb[0], hb[3] - hb[1])
                         hbs = mosaic_block_size(hside, hside, blocks)
                         hpoly, _fresh = head_cache.polygon(frame, tid, hb)
-                        if hpoly is not None and render_face_polygon(
+                        if (hpoly is not None
+                                and _poly_covers_box(
+                                    hpoly, _padded_head_box(frame, hb), 0.80)
+                                and render_face_polygon(
                                 frame, hpoly, style=style, blocks=blocks,
-                                blur=blur, block_size=hbs):
+                                blur=blur, block_size=hbs)):
                             fallback_heads += 1
                             rendered_cats.add("face")
                         elif _render_face_box(
@@ -1579,7 +1633,8 @@ class MosaicJob:
         rs.progress_base = 0.0 if p.fast_person_only else 0.5
         rs.region_flow = RegionFlow()
         rs.face_trk = FaceTracker(
-            max_miss=max(6, int(round(p.fps * 0.35))), seed_miss=4)
+            max_miss=max(8, int(round(p.fps * 0.80))),
+            seed_miss=max(4, int(round(p.fps * 0.25))))
         try:
             rs.face_mesh = FaceMeshRefiner.shared()
             if not rs.face_mesh.available():
@@ -2301,9 +2356,12 @@ class MosaicJob:
             except Exception:
                 bs = None
             poly, _fresh = cache.polygon(fc.frame, tid, fbox)
-            if poly is not None and render_face_polygon(
+            if (poly is not None
+                    and _poly_covers_box(
+                        poly, _padded_head_box(fc.frame, fbox), 0.80)
+                    and render_face_polygon(
                     fc.frame, poly, style=self.style, blocks=self.blocks,
-                    blur=self.blur, block_size=bs):
+                    blur=self.blur, block_size=bs)):
                 fc.drawn_faces.add(tuple(int(v) for v in fbox))
                 fc.debug_boxes.append(
                     (fbox, (0, 255, 0), f"F{int(fbox[0])}"))
@@ -2331,6 +2389,9 @@ class MosaicJob:
                     shift_box(_p, _c, b))
                    if rs.prev_gray_run is not None else None)
             _dets = detect_faces(r.orig_img)
+            if _face_rotate_enabled() and (
+                    rs.done % _face_rotate_every() == 0 or not _dets):
+                _dets = detect_faces_rotated(r.orig_img, base=_dets)
             try:
                 if r.boxes is not None and len(r.boxes) > 0:
                     _persons = r.boxes.xyxy.cpu().numpy()
@@ -2533,9 +2594,12 @@ class MosaicJob:
                     hp = None
                     if hc is not None:
                         hp, _f = hc.polygon(frame, tid, hb)
-                    if hp is not None and render_face_polygon(
+                    if (hp is not None
+                            and _poly_covers_box(
+                                hp, _padded_head_box(frame, hb), 0.80)
+                            and render_face_polygon(
                             frame, hp, style=style, blocks=blocks,
-                            blur=blur):
+                            blur=blur)):
                         rs.rendered_tids.add(tid)
                         rs.rendered_cats.add("face")
                         continue
@@ -2643,9 +2707,12 @@ class MosaicJob:
                     _hp = None
                     if _hc is not None:
                         _hp, _hf = _hc.polygon(frame, tid, _hb)
-                    if _hp is not None and render_face_polygon(
+                    if (_hp is not None
+                            and _poly_covers_box(
+                                _hp, _padded_head_box(frame, _hb), 0.80)
+                            and render_face_polygon(
                             frame, _hp, style=style, blocks=blocks,
-                            blur=blur):
+                            blur=blur)):
                         rs.rendered_tids.add(tid)
                         rs.rendered_cats.add("face")
                         continue

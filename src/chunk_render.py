@@ -196,7 +196,8 @@ def _shift_manual(regions, start_sec, duration_sec):
 
 def _merge_stats(dst, src):
     for key, value in (src or {}).items():
-        if key.startswith("_") and isinstance(value, (int, float)):
+        if isinstance(key, str) and key.startswith("_") and isinstance(
+                value, (int, float)):
             dst[key] = dst.get(key, 0) + value
         elif key not in dst:
             dst[key] = value

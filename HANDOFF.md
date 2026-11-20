@@ -5,6 +5,8 @@
 - Streamlit 웹 앱: 업로드 → VLM 분석 → 체크리스트 → 모자이크 렌더 → 다운로드
 - live: `https://gong000000--mosaic.us-east.modal.run`
 - 얼굴: YuNet + MediaPipe 478점 외곽, 추적/sticky box, 원거리 사람 크롭 보강
+  - 90/270도 회전 재검출 + 포즈 헤드 fallback, 약 0.8초 트랙 유지
+  - mesh 외곽이 이마·머리를 충분히 덮지 못하면 박스형 안전 마스크로 대체
 - 번호판: 전용 YOLO 검출 + 개별 트래커 + 차량 게이팅
 - 주소·문서: VLM + EAST 글자 정제 + EAST-only 보완
   (`MOSAIC_ADDRESS_EAST=1` 기본)
@@ -20,7 +22,7 @@
 
 ## 검증 결과
 
-- `pytest tests`: **60 passed**
+- `pytest tests`: **63 passed**
 - `scripts/apptest.py`: **APPTEST_PASS**
   - 얼굴, 번호판, 못 찾은 영역, **그룹 전환**, 2작업 등록/두 번째 취소
 - `scripts/qualitytest.py`: **QUALITY_TEST_PASS**
@@ -38,6 +40,11 @@
     건너뛰고 1번부터 렌더, 최종 영상 프레임 수 유지 확인.
   - live 5계정 동시 + 6번째 대기: 5개 running, 6번째 `queued`.
     한 작업이 끝나자 6번째가 자동 시작. 일반 렌더 2개도 동시에 완료.
+- 얼굴 마스크 감사 (입력에서 검출한 얼굴과 출력 픽셀 비교)
+  - 정면 `face.mp4`: 348/348 마스킹 (누락 0)
+  - 90도 회전 `face.mp4`: 349/349 마스킹 (누락 0)
+  - `street.mp4`: 303개 중 6개(2%)가 저차이. 대부분 원거리/오검출이며
+    전경 얼굴 누락은 없음.
 - 카테고리 분리 확인
   - 합성 택배 송장: `address`로 검출, `signboard` 오검출 없음
   - street 프레임: `signboard` 검출, 문서 텍스트와 분리
@@ -96,7 +103,7 @@
 - `src/jobqueue.py`: SQLite 큐, 계정별 스케줄러, 리스/heartbeat, 취소/재시도
 - `src/worker.py`: Streamlit과 분리된 큐 워커 프로세스/감시
 - `src/chunk_render.py`: 긴 영상 구간 렌더/체크포인트/이어 붙이기
-- `src/faces.py`, `src/face_mesh.py`: 얼굴 검출/추적/외곽
+- `src/faces.py`, `src/face_mesh.py`: 얼굴 검출/추적/외곽, 90/270도 회전 검출
 - `src/plates.py`, `src/texts.py`: 번호판, EAST 주소/간판
 - `src/history.py`, `src/retention.py`: 기록/보관 정책
 - `scripts/apptest.py`, `scripts/bench_gpu.py`: E2E/GPU 측정

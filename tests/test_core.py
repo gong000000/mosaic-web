@@ -758,6 +758,41 @@ def test_queue_recovers_stale_running_on_worker_start():
     assert os.path.exists(q.get(job_id)["input_path"])
 
 
+def test_face_rotation_maps_boxes_back():
+    from src.faces import FaceBox, _map_box_back
+    W, H = 640, 480
+    orig = (100, 50, 200, 150)
+    rotated = {
+        90: ([H - 1 - orig[3], orig[0], H - 1 - orig[1], orig[2]], 90),
+        180: ([W - 1 - orig[2], H - 1 - orig[3],
+               W - 1 - orig[0], H - 1 - orig[1]], 180),
+        270: ([orig[1], W - 1 - orig[2],
+               orig[3], W - 1 - orig[0]], 270),
+    }
+    for rot, (box, angle) in rotated.items():
+        mapped = _map_box_back(FaceBox(box, angle=angle), rot, W, H)
+        assert mapped is not None
+        assert [int(round(float(v))) for v in mapped[:4]] == list(orig), rot
+
+
+def test_merge_face_dets_keeps_higher_score():
+    from src.faces import FaceBox, _merge_face_dets
+    a = (FaceBox([0, 0, 40, 40]), 0.6)
+    b = (FaceBox([1, 1, 41, 41]), 0.9)
+    merged = _merge_face_dets([a], [b])
+    assert len(merged) == 1
+    assert merged[0][1] == 0.9
+
+
+def test_poly_covers_box_detects_partial_face_mask():
+    from src.pipeline import _poly_covers_box
+    box = [0, 0, 100, 100]
+    half = np.array([[0, 0], [50, 0], [50, 100], [0, 100]], np.int32)
+    full = np.array([[0, 0], [100, 0], [100, 100], [0, 100]], np.int32)
+    assert not _poly_covers_box(half, box, 0.8)
+    assert _poly_covers_box(full, box, 0.8)
+
+
 def test_face_mesh_falls_back_without_model():
     from src.face_mesh import FaceMeshRefiner
     ref = FaceMeshRefiner(model_path="/nonexistent/model.task")
