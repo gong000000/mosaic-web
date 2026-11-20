@@ -194,6 +194,9 @@ def _build_items(base_items, preset_cats):
     items = []
     seen = set()
     for item in base_items or []:
+        if item.get("category") == "passenger":
+            # UI에서 제거한 항목. 얼굴이 동승자 얼굴을 이미 포함한다.
+            continue
         copy = dict(item)
         copy["samples"] = dict(item.get("samples") or {})
         copy["prompt_match"] = copy.get("category") in preset_cats
