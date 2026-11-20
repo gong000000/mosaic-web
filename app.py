@@ -532,9 +532,10 @@ def _render_admin_status():
         st.caption(f"가장 오래된 대기: {_fmt_age(snap['oldest_queued_age'])}")
     stale = snap.get("stale")
     if stale:
+        stale_age = time.time() - float(stale.get("updated") or 0)
         st.error(
-            f"무응답 의심 #{stale.get('id')} · {_fmt_age(
-                time.time() - float(stale.get('updated') or 0))}째 진행 없음")
+            f"무응답 의심 #{stale.get('id')} · "
+            f"{_fmt_age(stale_age)}째 진행 없음")
     active = snap.get("active") or []
     if active:
         rows = []

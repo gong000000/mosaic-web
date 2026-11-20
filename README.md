@@ -62,6 +62,10 @@
      사람마다 다른 얼굴 실루엣을 그립니다. 단, 랜드마크 외곽이 이마·머리카락을
      충분히 덮지 못하면 **여백을 넓힌 박스형 안전 마스크**로 자동 대체합니다.
      모델이 없거나 실패해도 박스형으로 대체합니다. 끄려면 0으로 하세요(빠름).
+   - 렌더가 끝나면 입력/출력의 같은 프레임을 비교해 **얼굴 마스크 누락을
+     자동 점검**합니다. 작업 카드에 `얼굴 마스크 점검: 348/348`처럼 표시하고,
+     고신뢰 누락 프레임은 강한 사각형 모자이크로 자동 보정합니다
+     (`MOSAIC_FACE_AUDIT`, 기본 켜짐).
    - 상반신/전체 모드는 1패스에서 사람 박스·마스크 윤곽을 기록하고 2패스에서
      재생하므로 트랙 ID가 바뀌지 않습니다. 검출이 끊긴 짧은 구간은
      앞뒤 박스로 보간합니다.
@@ -215,6 +219,13 @@ modal deploy modal_app.py
 - `MOSAIC_FACE_ROTATE`(기본 1)는 옆으로 누운 얼굴을 90/270도 회전해 다시
   검출합니다. `0`이면 끕니다. `MOSAIC_FACE_ROTATE_EVERY`(기본 3)는 회전
   재검출을 수행하는 프레임 간격입니다.
+- `MOSAIC_FACE_AUDIT`(기본 1)는 렌더 후 얼굴 마스크 누락을 자동 점검합니다.
+  `MOSAIC_FACE_AUDIT_SAMPLES`(기본 120)는 점검 프레임 수,
+  `MOSAIC_FACE_AUDIT_DIFF`(기본 4.0)는 입력/출력 차이 임계값,
+  `MOSAIC_FACE_AUDIT_FIX`(기본 1)는 고신뢰 누락 프레임 자동 보정입니다.
+- `MOSAIC_ADMIN_USERS`에 쉼표로 구분한 아이디를 넣으면 사이드바에
+  `서버 상태 (관리자)`가 표시됩니다. 큐/워커 heartbeat/최근 실패/
+  구간 체크포인트/디스크 상태를 볼 수 있습니다.
 - `GEMINI_API_KEY`는 Modal Named Secret `mosaic-gemini`에서 읽습니다.
   `.env`를 들고 있는 PC 말고도 **Modal 로그인만 되어 있으면 배포할 수
   있습니다.** `.env`는 이미지에 포함되지 않고 커밋되지 않습니다.
@@ -381,6 +392,7 @@ src/render_queue.py         (구) 세션 내 렌더 직렬화
 src/jobqueue.py             지속형 렌더 작업 큐(SQLite) + 계정별 스케줄러
 src/worker.py               Streamlit과 분리된 큐 워커 프로세스/감시
 src/chunk_render.py         긴 영상 구간 렌더 + 완료 구간 체크포인트
+src/face_audit.py           렌더 후 얼굴 마스크 누락 점검/자동 보정
 src/history.py              사용자별 결과 기록 (SQLite jobs.db)
 src/retention.py            보관/삭제 정책 (24시간·개수·용량)
 requirements.txt            CPU/headless 의존성

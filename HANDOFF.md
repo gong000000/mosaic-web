@@ -17,12 +17,15 @@
   계정별 대기 순번, 최대 5계정 동시 렌더, 작업별 카드/진행률/취소/재시도
 - 긴 영상: 해상도별 자동 구간(4K 20초, 1080p 45초 등) 렌더 + 완료 구간
   체크포인트. preemption/재시작 시 끝난 구간을 건너뛰고 이어서 렌더
+- 품질: 렌더 후 입력/출력 얼굴 비교로 마스크 누락 점검, 고신뢰 누락
+  프레임은 강한 사각형 모자이크로 자동 보정. 작업 카드에 점검 결과 표시
+- 운영: 관리자 아이디에 큐/워커 heartbeat/최근 실패/체크포인트/디스크 상태
 - 계정/기록: `users.db`, `outputs/jobs.db`(SQLite), 결과 보관 24시간/500개/20GB
 - 배포: Modal, `gpu=["L4", "T4"]` (L4 우선, 용량 없으면 T4)
 
 ## 검증 결과
 
-- `pytest tests`: **63 passed**
+- `pytest tests`: **65 passed**
 - `scripts/apptest.py`: **APPTEST_PASS**
   - 얼굴, 번호판, 못 찾은 영역, **그룹 전환**, 2작업 등록/두 번째 취소
 - `scripts/qualitytest.py`: **QUALITY_TEST_PASS**
@@ -45,6 +48,8 @@
   - 90도 회전 `face.mp4`: 349/349 마스킹 (누락 0)
   - `street.mp4`: 303개 중 6개(2%)가 저차이. 대부분 원거리/오검출이며
     전경 얼굴 누락은 없음.
+  - 마스크를 일부러 안 씌운 출력: 348개 모두 감지 → 자동 보정 후 0개.
+  - 관리자 상태 스냅샷: queued/running/worker/체크포인트 크기 단위 테스트.
 - 카테고리 분리 확인
   - 합성 택배 송장: `address`로 검출, `signboard` 오검출 없음
   - street 프레임: `signboard` 검출, 문서 텍스트와 분리
@@ -87,6 +92,10 @@
 - **단일 컨테이너**: `max_containers=1` 전제. SQLite 큐와 heartbeat 리스는
   이 컨테이너 안에서 동작한다. 여러 컨테이너로 스케일 아웃하려면 외부
   DB/분산 락이 필요하다.
+- **관리자 상태**: `MOSAIC_ADMIN_USERS`(쉼표 구분)에 등록된 아이디만
+  사이드바의 `서버 상태 (관리자)`를 볼 수 있다. 현재는 Modal Secret
+  `mosaic-admin`에 `asd123,12345678`이 들어 있다. 배포 PC를 바꾸면 같은
+  Secret을 만들어야 한다.
 - **테스트 영상**: 실제 얼굴이 있어 저장소에 없다. `samples/` 또는
   `MOSAIC_TEST_FACE`/`MOSAIC_TEST_STREET` 환경변수로 지정한다.
 - **보관**:
@@ -103,6 +112,7 @@
 - `src/jobqueue.py`: SQLite 큐, 계정별 스케줄러, 리스/heartbeat, 취소/재시도
 - `src/worker.py`: Streamlit과 분리된 큐 워커 프로세스/감시
 - `src/chunk_render.py`: 긴 영상 구간 렌더/체크포인트/이어 붙이기
+- `src/face_audit.py`: 렌더 후 얼굴 마스크 점검/자동 보정
 - `src/faces.py`, `src/face_mesh.py`: 얼굴 검출/추적/외곽, 90/270도 회전 검출
 - `src/plates.py`, `src/texts.py`: 번호판, EAST 주소/간판
 - `src/history.py`, `src/retention.py`: 기록/보관 정책
