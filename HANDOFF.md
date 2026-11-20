@@ -25,7 +25,7 @@
 
 ## 검증 결과
 
-- `pytest tests`: **65 passed**
+- `pytest tests`: **66 passed**
 - `scripts/apptest.py`: **APPTEST_PASS**
   - 얼굴, 번호판, 못 찾은 영역, **그룹 전환**, 2작업 등록/두 번째 취소
 - `scripts/qualitytest.py`: **QUALITY_TEST_PASS**
@@ -51,6 +51,12 @@
     전경 얼굴 누락은 없음.
   - 마스크를 일부러 안 씌운 출력: 348개 모두 감지 → 자동 보정 후 0개.
   - 관리자 상태 스냅샷: queued/running/worker/체크포인트 크기 단위 테스트.
+  - live 얼굴-only(90도 회전 영상): 분석 28.7초 / 렌더 79.5초,
+    `audit checked=349, suspicious=0`.
+- 동시 렌더 부하(T4, 1080p 12초, 얼굴-only):
+  - 1개 157초(2.29fps), 2개 244초(합계 2.95fps),
+    3개 355초(합계 3.04fps), 5개 661초(합계 2.71fps).
+  - 5개는 개별 0.54fps로 떨어져 기본값을 3으로 조정.
 - 카테고리 분리 확인
   - 합성 택배 송장: `address`로 검출, `signboard` 오검출 없음
   - street 프레임: `signboard` 검출, 문서 텍스트와 분리
