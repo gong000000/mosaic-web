@@ -355,7 +355,7 @@ def _render_history(user, expanded=False):
         if active:
             st.markdown("**대기/진행 중**")
             st.caption("대기 순번은 내 계정의 앞선 작업만 셉니다. "
-                       "다른 아이디 작업은 순번에 포함되지 않습니다.")
+                       "서버는 최대 5개 계정 작업을 동시에 처리합니다.")
             for j in active:
                 if j.get("status") == "queued":
                     pos = JQ.position(j['id'], user)
@@ -368,6 +368,9 @@ def _render_history(user, expanded=False):
                     "%m-%d %H:%M",
                     time.localtime(float(j.get("created") or 0)))
                 st.caption(f"#{j.get('id')} · {text} · {at}")
+            st.caption("`대기 중`은 서버 처리 순서를 기다리는 상태이고, "
+                       "`내 작업 N번째`는 같은 계정의 앞선 작업을 기다리는 "
+                       "상태입니다.")
             st.caption("완료되면 아래 지난 작업에 표시됩니다.")
         if not rows:
             st.write("저장된 작업이 없습니다.")

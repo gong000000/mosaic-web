@@ -23,6 +23,7 @@ MODEL_LOCK = threading.RLock()
 
 _STORE = None
 _STORE_LOCK = threading.Lock()
+_THREAD_LOCAL = threading.local()
 
 
 class ModelStore:
@@ -65,4 +66,18 @@ def get_model(name="yolo11n-seg.pt"):
         if _STORE is None:
             _STORE = ModelStore()
         store = _STORE
+    return store.get(name)
+
+
+def get_thread_model(name="yolo11n-seg.pt"):
+    """작업 스레드마다 별도 YOLO 모델을 돌려준다.
+
+    Ultralytics의 `track(persist=True)`는 모델 객체 안에 트래커 상태를
+    보관한다. 여러 렌더 스레드가 같은 모델을 동시에 추적하면 트랙 ID가
+    섞이므로, 렌더용 모델은 스레드 로컬 저장소에 따로 둔다.
+    """
+    store = getattr(_THREAD_LOCAL, "store", None)
+    if store is None:
+        store = ModelStore()
+        _THREAD_LOCAL.store = store
     return store.get(name)

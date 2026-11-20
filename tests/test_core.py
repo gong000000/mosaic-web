@@ -2,6 +2,7 @@
 import os
 import sys
 import tempfile
+import threading
 import types
 import json
 import time
@@ -514,6 +515,63 @@ def test_queue_detects_stale_running_job():
                   (time.time() - 120, job_id))
     stale = q.stale_running(60)
     assert stale and stale["id"] == job_id
+
+
+def test_queue_five_accounts_and_per_account_order():
+    from src.jobqueue import RenderQueue
+    from src.render_service import MosaicSettings
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, "in.mp4")
+    with open(src, "wb") as f:
+        f.write(b"video")
+    q = RenderQueue(db_path=os.path.join(d, "jobs.db"),
+                    input_dir=os.path.join(d, "inputs"), max_parallel=5)
+
+    def add(user):
+        return q.enqueue(
+            user=user, input_path=src,
+            output_path=os.path.join(d, f"{user}.mp4"), items=[],
+            selected_cats=["face"], settings=MosaicSettings(),
+            model_name="yolo11n-seg.pt", imgsz=640, stride=15, conf=0.2,
+            preset="veryfast", query_raw="q")
+
+    ids = {u: add(u) for u in ("u1", "u2", "u3", "u4", "u5")}
+    claimed = [q.claim() for _ in range(5)]
+    assert {c["user"] for c in claimed} == {"u1", "u2", "u3", "u4", "u5"}
+    assert q.claim() is None, "5개 계정 상한을 넘어 실행됨"
+
+    u1_second = add("u1")
+    u6 = add("u6")
+    assert q.position(u1_second, "u1") == 2
+    assert q.position(u6, "u6") == 1, "다른 계정 작업이 내 순번에 섞임"
+
+    q.finish(ids["u1"], "done")
+    nxt = q.claim()
+    assert nxt["id"] == u1_second, "같은 계정의 다음 작업이 먼저 시작돼야 함"
+    assert q.claim() is None
+    q.finish(u1_second, "done")
+    nxt = q.claim()
+    assert nxt["id"] == u6
+
+
+def test_thread_local_models_are_isolated(monkeypatch):
+    from src import models
+    seen = {}
+    monkeypatch.setattr(models.ModelStore, "get",
+                        lambda self, name: self)
+
+    def worker(key):
+        seen[key] = (models.get_thread_model("x"),
+                     models.get_thread_model("x"))
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert seen[0][0] is seen[0][1]
+    assert seen[1][0] is seen[1][1]
+    assert seen[0][0] is not seen[1][0], "스레드가 같은 YOLO 모델을 공유함"
 
 
 def test_queue_worker_completes_job_without_model():

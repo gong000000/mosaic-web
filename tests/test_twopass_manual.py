@@ -118,7 +118,9 @@ def test_manual_add_and_exclude():
 def test_run_replay_single_inference_and_manual_applied():
     import src.pipeline as pl
     orig_get = pl.get_model
+    orig_thread = pl.get_thread_model
     pl.get_model = lambda name: _TrackModel()
+    pl.get_thread_model = lambda name: _TrackModel()
     try:
         _TrackModel.calls = 0
         d = tempfile.mkdtemp()
@@ -141,3 +143,4 @@ def test_run_replay_single_inference_and_manual_applied():
         assert n == 16
     finally:
         pl.get_model = orig_get
+        pl.get_thread_model = orig_thread

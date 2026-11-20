@@ -26,7 +26,7 @@ from typing import Any
 
 from .config import (CATEGORY_TYPE, ROOT_DIR, VLM_MODEL, canon_category,
                      category_type, plausible_box)
-from .models import MODEL_LOCK, get_model
+from .models import MODEL_LOCK, get_model, get_thread_model
 from .detect import filter_contained, big_enough, iou, region_has_detail
 from .faces import (FaceBox, FaceTracker, detect_faces,
                     detect_faces_in_person_crops, expand_face_box,
@@ -1647,7 +1647,7 @@ class MosaicJob:
             or any(c not in CATEGORY_TYPE
                    or CATEGORY_TYPE.get(c) == "person" for c in targets))
         if p.needs_person_pass1:
-            p.model = get_model(self.model_name)
+            p.model = get_thread_model(self.model_name)
             _reset_tracker(p.model)
 
         out_dir = os.path.dirname(os.path.abspath(self.output_path))
@@ -1816,14 +1816,21 @@ class MosaicJob:
         cap1 = None
         if needs_person_pass1:
             _reset_tracker(model)
-            results1 = model.track(
+            results1 = iter(model.track(
                 source=input_path, stream=True, persist=True,
                 tracker=_TRACKER_CFG, conf=p.conf, classes=[0],
-                verbose=False, imgsz=p.imgsz, iou=0.5, max_det=30)
+                verbose=False, imgsz=p.imgsz, iou=0.5, max_det=30))
 
             def _iter1():
                 idx = -1
-                for res in results1:
+                while True:
+                    # 스레드마다 모델은 분리했지만 GPU 추론은 한 번에 하나만
+                    # 실행해 VRAM/커널 경합을 막는다.
+                    with MODEL_LOCK:
+                        try:
+                            res = next(results1)
+                        except StopIteration:
+                            break
                     idx += 1
                     yield idx, res
         else:
