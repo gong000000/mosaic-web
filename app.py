@@ -322,14 +322,19 @@ def _render_job_card(job, pos, user):
                 checked = int(audit.get("checked") or 0)
                 suspicious = int(audit.get("suspicious") or 0)
                 fixed = int(audit.get("fixed") or 0)
-                passed = max(0, checked - suspicious)
-                if suspicious:
-                    text = f"얼굴 마스크 점검: {passed}/{checked}"
+                remaining = max(0, suspicious - fixed)
+                passed = max(0, checked - remaining)
+                if remaining:
+                    text = (f"얼굴 마스크 점검: {passed}/{checked} · "
+                            f"확인 필요 {remaining}개")
                     if fixed:
                         text += f" · 자동 보정 {fixed}개"
-                    st.warning(text + " · 확인이 필요합니다.")
+                    st.warning(text)
                 else:
-                    st.caption(f"✅ 얼굴 마스크 점검: {passed}/{checked}")
+                    text = f"✅ 얼굴 마스크 점검: {passed}/{checked}"
+                    if fixed:
+                        text += f" · 자동 보정 {fixed}개"
+                    st.caption(text)
             elif audit.get("error"):
                 st.caption(f"얼굴 마스크 점검 실패: {audit.get('error')}")
             out_name = os.path.basename(out)
