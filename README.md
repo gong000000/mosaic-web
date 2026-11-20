@@ -227,9 +227,10 @@ modal deploy modal_app.py
   `MOSAIC_FACE_AUDIT_SAMPLES`(기본 120)는 점검 프레임 수,
   `MOSAIC_FACE_AUDIT_DIFF`(기본 4.0)는 입력/출력 차이 임계값,
   `MOSAIC_FACE_AUDIT_FIX`(기본 1)는 고신뢰 누락 프레임 자동 보정입니다.
-- `MOSAIC_ADMIN_USERS`에 쉼표로 구분한 아이디를 넣으면 사이드바에
-  `서버 상태 (관리자)`가 표시됩니다. 큐/워커 heartbeat/최근 실패/
-  구간 체크포인트/디스크 상태를 볼 수 있습니다.
+- `MOSAIC_ADMIN_USERS`에 쉼표로 구분한 아이디를 넣으면 관리자 계정 상단에
+  `🛠 관리자 · 전체 작업/강퇴` 패널이 표시됩니다. 모든 계정의 렌더/대기
+  작업 목록과 개별·전체 취소, 계정별 강퇴, 30분 사이트 잠금(비관리자
+  로그인/가입 차단)을 할 수 있습니다. 관리자 본인은 강퇴/잠금에서 제외됩니다.
 - `GEMINI_API_KEY`는 Modal Named Secret `mosaic-gemini`에서 읽습니다.
   `.env`를 들고 있는 PC 말고도 **Modal 로그인만 되어 있으면 배포할 수
   있습니다.** `.env`는 이미지에 포함되지 않고 커밋되지 않습니다.

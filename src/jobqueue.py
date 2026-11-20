@@ -233,8 +233,8 @@ class RenderQueue:
                 "GROUP BY status")}
             active = [dict(r) for r in c.execute(
                 "SELECT id,user,status,progress,created,started,updated,"
-                "output_path,error FROM render_jobs WHERE status IN "
-                "('queued','running') ORDER BY id").fetchall()]
+                "output_path,error,cancel_requested FROM render_jobs "
+                "WHERE status IN ('queued','running') ORDER BY id").fetchall()]
             failures = [dict(r) for r in c.execute(
                 "SELECT id,user,finished,error FROM render_jobs "
                 "WHERE status='failed' ORDER BY id DESC LIMIT 10").fetchall()]
@@ -319,20 +319,35 @@ class RenderQueue:
 
     def cancel(self, job_id, user):
         """queued면 즉시 취소, running이면 취소 요청 플래그를 세운다."""
+        with self._db() as c:
+            row = c.execute(
+                "SELECT id, user, status FROM render_jobs WHERE id=?",
+                (int(job_id),)).fetchone()
+        if row is None or str(row["user"]) != str(user or ""):
+            return False
+        return self._cancel_job(job_id)
+
+    def cancel_admin(self, job_id):
+        """관리자용. 소유자 확인 없이 작업을 취소한다."""
+        return self._cancel_job(job_id)
+
+    def _cancel_job(self, job_id):
         remove_path = ""
         with self._db() as c:
             row = c.execute(
-                "SELECT id, user, status, input_path FROM render_jobs "
-                "WHERE id=?", (int(job_id),)).fetchone()
-            if row is None or str(row["user"]) != str(user or ""):
+                "SELECT id, user, status, input_path, cancel_requested "
+                "FROM render_jobs WHERE id=?", (int(job_id),)).fetchone()
+            if row is None:
                 return False
             if row["status"] == "queued":
                 remove_path = row["input_path"] or ""
                 c.execute(
                     "UPDATE render_jobs SET status='cancelled', finished=?, "
-                    "progress=0, error='사용자 취소', input_path='' WHERE id=?",
-                    (time.time(), int(job_id)))
+                    "progress=0, error='관리자/사용자 취소', input_path='' "
+                    "WHERE id=?", (time.time(), int(job_id)))
             elif row["status"] == "running":
+                if row["cancel_requested"]:
+                    return False
                 c.execute(
                     "UPDATE render_jobs SET cancel_requested=1 WHERE id=?",
                     (int(job_id),))
@@ -344,6 +359,29 @@ class RenderQueue:
             except OSError:
                 pass
         return True
+
+    def cancel_user_jobs(self, user):
+        """해당 아이디의 queued/running 작업을 모두 취소한다."""
+        with self._db() as c:
+            rows = c.execute(
+                "SELECT id FROM render_jobs WHERE user=? AND status IN "
+                "('queued','running')", (str(user or ""),)).fetchall()
+        return sum(1 for row in rows
+                   if self._cancel_job(int(row["id"])))
+
+    def cancel_all_active(self, except_user=None):
+        """모든 활성 작업을 취소한다. except_user는 건너뛴다."""
+        with self._db() as c:
+            rows = c.execute(
+                "SELECT id, user FROM render_jobs WHERE status IN "
+                "('queued','running') ORDER BY id").fetchall()
+        n = 0
+        for row in rows:
+            if except_user is not None and str(row["user"]) == str(except_user):
+                continue
+            if self._cancel_job(int(row["id"])):
+                n += 1
+        return n
 
     def is_cancel_requested(self, job_id):
         with self._db() as c:
@@ -511,6 +549,8 @@ class RenderQueue:
                         pass
             if payload.get("strip_audio"):
                 strip_audio(output_path)
+            if self.is_cancel_requested(job_id):
+                raise RenderCancelled()
             person_selected = any(CATEGORY_TYPE.get(c) == "person"
                                   for c in selected)
             face_count = (payload.get("person_total")
@@ -773,6 +813,18 @@ def active_jobs(user):
 
 def cancel(job_id, user):
     return _QUEUE.cancel(job_id, user)
+
+
+def cancel_admin(job_id):
+    return _QUEUE.cancel_admin(job_id)
+
+
+def cancel_user_jobs(user):
+    return _QUEUE.cancel_user_jobs(user)
+
+
+def cancel_all_active(except_user=None):
+    return _QUEUE.cancel_all_active(except_user)
 
 
 def is_cancel_requested(job_id):

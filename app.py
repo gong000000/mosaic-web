@@ -31,12 +31,9 @@ from src.render_service import MosaicSettings
 from src import history as H
 from src import jobqueue as JQ
 from src import retention as RT
-from src.auth import require_login
-
-ADMIN_USERS = {
-    u.strip() for u in os.environ.get("MOSAIC_ADMIN_USERS", "").split(",")
-    if u.strip()
-}
+from src.auth import (ADMIN_USERS, all_users, kick, kick_remaining,
+                      kicked_users, lock_site, require_login,
+                      site_lock_remaining, unkick, unlock_site)
 
 # blur.me 스튜디오처럼 항상 빠른 고정 설정을 쓴다.
 # GPU(L4)에서는 yolo11m-seg + 960px가 충분히 빠르고, 사람 마스크 경계가
@@ -88,6 +85,22 @@ def _load_css():
 st.markdown(f"<style>{_load_css()}</style>", unsafe_allow_html=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 current_user = require_login()
+
+
+@st.fragment(run_every=3.0)
+def _kick_watch():
+    remain = kick_remaining(current_user)
+    if current_user not in ADMIN_USERS:
+        remain = max(remain, site_lock_remaining())
+    if remain:
+        st.session_state.clear()
+        st.session_state["_kick_notice"] = (
+            "관리자에 의해 로그아웃되었습니다. "
+            f"약 {max(1, remain // 60)}분 후 다시 로그인할 수 있습니다.")
+        st.rerun()
+
+
+_kick_watch()
 
 
 def _friendly_vlm_error(err, api_key=""):
@@ -521,6 +534,9 @@ def _render_admin_status():
     except Exception as e:
         st.error(f"상태 조회 실패: {e}")
         return
+    msg = st.session_state.pop("_admin_msg", "")
+    if msg:
+        st.success(msg)
     counts = snap.get("counts") or {}
     c1, c2, c3 = st.columns(3)
     c1.metric("렌더 중", int(counts.get("running", 0)))
@@ -541,22 +557,96 @@ def _render_admin_status():
         st.error(
             f"무응답 의심 #{stale.get('id')} · "
             f"{_fmt_age(stale_age)}째 진행 없음")
+    site_wait = site_lock_remaining()
+    if site_wait:
+        st.warning(f"사이트 잠금 중 · 비관리자 로그인 제한 "
+                   f"{_fmt_age(site_wait)}")
+        if st.button("사이트 잠금 해제", key="adm_unlock_site"):
+            unlock_site()
+            st.session_state["_admin_msg"] = "사이트 잠금을 해제했습니다."
+            st.rerun()
+    g1, g2 = st.columns(2)
+    if g1.button("다른 사용자 전체 작업 취소", key="adm_cancel_all"):
+        n = JQ.cancel_all_active(except_user=current_user)
+        st.session_state["_admin_msg"] = f"다른 사용자 작업 {n}개를 취소했습니다."
+        st.rerun()
+    if g2.button("다른 사용자 전체 강퇴 (30분)", key="adm_kick_all",
+                 type="primary"):
+        n = JQ.cancel_all_active(except_user=current_user)
+        targets = [u for u in all_users() if u != current_user]
+        for user in targets:
+            kick(user, 30, "관리자 전체 강퇴")
+        lock_site(30, "관리자 전체 강퇴")
+        st.session_state["_admin_msg"] = (
+            f"작업 {n}개 취소 · {len(targets)}명 강퇴 · "
+            "30분 동안 비관리자 로그인을 제한합니다.")
+        st.rerun()
+
     active = snap.get("active") or []
     if active:
-        rows = []
+        by_user = {}
+        for job in active:
+            by_user.setdefault(job.get("user") or "", []).append(job)
+        st.markdown("**계정별 작업**")
+        for user, jobs in sorted(by_user.items()):
+            running = sum(1 for j in jobs if j.get("status") == "running")
+            queued = len(jobs) - running
+            st.caption(f"{user} · 렌더 {running} · 대기 {queued}")
+            u1, u2 = st.columns(2)
+            if u1.button("이 계정 작업 취소", key=f"adm_cancel_user_{user}"):
+                n = JQ.cancel_user_jobs(user)
+                st.session_state["_admin_msg"] = (
+                    f"{user} 작업 {n}개를 취소했습니다.")
+                st.rerun()
+            if (user != current_user
+                    and u2.button("이 계정 강퇴 (30분)",
+                                  key=f"adm_kick_user_{user}")):
+                n = JQ.cancel_user_jobs(user)
+                kick(user, 30, "관리자 강퇴")
+                st.session_state["_admin_msg"] = (
+                    f"{user} 작업 {n}개 취소 · 30분 강퇴했습니다.")
+                st.rerun()
+
+        st.markdown("**작업 목록**")
         now = time.time()
         for job in active:
-            rows.append({
-                "#": job.get("id"),
-                "아이디": job.get("user"),
-                "상태": job.get("status"),
-                "진행률": f"{float(job.get('progress') or 0) * 100:.0f}%",
-                "경과": _fmt_age(
-                    now - float(job.get("created") or now)),
-            })
-        st.dataframe(rows, hide_index=True, width="stretch")
+            cols = st.columns([1, 1.2, 1, 1, 1.2, 1])
+            cols[0].write(f"#{job.get('id')}")
+            cols[1].write(job.get("user"))
+            cols[2].write(job.get("status"))
+            cols[3].write(f"{float(job.get('progress') or 0) * 100:.0f}%")
+            cols[4].write(_fmt_age(now - float(
+                job.get("created") or now)))
+            if job.get("cancel_requested"):
+                cols[5].caption("취소 중")
+            elif cols[5].button("취소", key=f"adm_cancel_job_{job.get('id')}"):
+                JQ.cancel_admin(job.get("id"))
+                st.session_state["_admin_msg"] = (
+                    f"작업 #{job.get('id')}을 취소했습니다.")
+                st.rerun()
     else:
         st.caption("진행 중 작업 없음")
+
+    kicked = kicked_users()
+    if kicked:
+        st.markdown("**강퇴 중**")
+        for row in kicked:
+            k1, k2 = st.columns([4, 1])
+            rem = _fmt_age(row.get("remaining"))
+            k1.caption(
+                f"{row.get('username')} · 남은 {rem} · "
+                f"{row.get('reason') or ''}")
+            if k2.button("해제", key=f"adm_unkick_{row.get('username')}"):
+                unkick(row.get("username"))
+                st.session_state["_admin_msg"] = (
+                    f"{row.get('username')} 강퇴를 해제했습니다.")
+                st.rerun()
+        if st.button("전체 강퇴 해제", key="adm_unkick_all"):
+            for row in kicked:
+                unkick(row.get("username"))
+            unlock_site()
+            st.session_state["_admin_msg"] = "강퇴와 사이트 잠금을 모두 해제했습니다."
+            st.rerun()
     failures = snap.get("failures") or []
     if failures:
         with st.expander(f"최근 실패 {len(failures)}개"):
@@ -589,6 +679,10 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+if current_user in ADMIN_USERS:
+    with st.expander("🛠 관리자 · 전체 작업/강퇴", expanded=True):
+        _render_admin_status()
+
 # 위젯을 누를 때마다 앱이 다시 실행되므로, 디스크 스캔성 정리는 세션당
 # 5분에 한 번만 한다.
 if time.time() - st.session_state.get("_last_purge", 0) > 300:
@@ -604,10 +698,6 @@ with st.sidebar:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         st.session_state.clear()
         st.rerun()
-
-    if current_user in ADMIN_USERS:
-        with st.expander("🛠 서버 상태 (관리자)", expanded=False):
-            _render_admin_status()
 
     st.header("설정")
 

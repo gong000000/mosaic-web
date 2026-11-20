@@ -24,6 +24,8 @@ os.environ["MOSAIC_MODEL"] = "yolo11n-seg.pt"
 os.environ["MOSAIC_IMGSZ"] = "640"
 os.environ["MOSAIC_HEAD_POSE"] = "0"
 os.environ["MOSAIC_FACE_MULTISCALE"] = "0"
+# 관리자 UI/강퇴 버튼을 AppTest에서 검사한다.
+os.environ["MOSAIC_ADMIN_USERS"] = "apptest"
 
 from streamlit.testing.v1 import AppTest
 
@@ -323,6 +325,22 @@ def run_preset_switch():
     print("OK preset-switch")
 
 
+def run_admin():
+    at = _open_app()
+    at.run()
+    labels = [str(b.label) for b in at.button]
+    assert any("전체 작업 취소" in x for x in labels), labels
+    assert any("전체 강퇴" in x for x in labels), labels
+    btn = next(b for b in at.button if "전체 작업 취소" in str(b.label))
+    btn.click()
+    at.run()
+    assert not [e for e in at.exception], [e.value for e in at.exception]
+    from src import auth
+    auth.unlock_site()
+    _cleanup(at)
+    print("OK admin")
+
+
 def main():
     missing = [p for p in (FACE, STREET) if not os.path.exists(p)]
     if missing:
@@ -333,6 +351,7 @@ def main():
     run_plate()
     run_missing_region()
     run_preset_switch()
+    run_admin()
     print("APPTEST_PASS")
     return 0
 

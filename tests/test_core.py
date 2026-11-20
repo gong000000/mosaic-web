@@ -563,6 +563,60 @@ def test_queue_default_parallel_is_three(monkeypatch):
     assert q.max_parallel == 3
 
 
+def test_auth_kick_and_site_lock(tmp_path, monkeypatch):
+    from src import auth
+    monkeypatch.setattr(auth, "DB_PATH", str(tmp_path / "users.db"))
+    ok, _msg = auth.register("alice", "password123")
+    assert ok
+    auth.kick("alice", minutes=5, reason="test kick")
+    assert auth.kick_remaining("alice") > 0
+    assert any(row["username"] == "alice"
+               for row in auth.kicked_users())
+    auth.unkick("alice")
+    assert auth.kick_remaining("alice") == 0
+
+    auth.lock_site(minutes=5, reason="demo")
+    assert auth.site_lock_remaining() > 0
+    ok, msg = auth.register("bob", "password123")
+    assert not ok and "제한" in msg
+    auth.unlock_site()
+    assert auth.site_lock_remaining() == 0
+    assert "alice" in auth.all_users()
+
+
+def test_queue_admin_cancel_all_and_user():
+    from src.jobqueue import RenderQueue
+    from src.render_service import MosaicSettings
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, "in.mp4")
+    with open(src, "wb") as f:
+        f.write(b"video")
+    q = RenderQueue(db_path=os.path.join(d, "jobs.db"),
+                    input_dir=os.path.join(d, "inputs"), max_parallel=5)
+
+    def add(user, suffix):
+        return q.enqueue(
+            user=user, input_path=src,
+            output_path=os.path.join(d, f"{user}{suffix}.mp4"), items=[],
+            selected_cats=["face"], settings=MosaicSettings(),
+            model_name="yolo11n-seg.pt", imgsz=640, stride=15, conf=0.2,
+            preset="veryfast", query_raw="q")
+
+    alice1 = add("alice", "1")
+    bob = add("bob", "1")
+    alice2 = add("alice", "2")
+    carol = add("carol", "1")
+    assert q.claim()["id"] == alice1
+    assert q.claim()["id"] == bob
+    n = q.cancel_user_jobs("alice")
+    assert n == 2
+    assert q.is_cancel_requested(alice1)
+    assert q.get(alice2)["status"] == "cancelled"
+    assert q.cancel_all_active(except_user="bob") == 1
+    assert q.get(carol)["status"] == "cancelled"
+    assert q.get(bob)["status"] == "running"
+
+
 def test_queue_status_snapshot_and_audit():
     from src.jobqueue import RenderQueue
     from src.render_service import MosaicSettings
