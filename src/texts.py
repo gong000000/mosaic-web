@@ -123,7 +123,8 @@ def detect_text_quads(crop_bgr, conf=None):
 
 
 def detect_text_regions(frame_bgr, persons=None, vehicles=None, plates=None,
-                        min_area=800, tiles=3, max_area_ratio=0.02):
+                        min_area=800, tiles=3, max_area_ratio=0.02,
+                        exclude=None):
     """EAST 글자 영역을 주소·간판 후보 박스로 만든다.
 
     연결 컴포넌트로 크게 묶으면 건물 벽 전체가 하나의 박스가 되어 과도하게
@@ -179,6 +180,7 @@ def detect_text_regions(frame_bgr, persons=None, vehicles=None, plates=None,
     persons = list(persons or [])
     vehicles = list(vehicles or [])
     plates = list(plates or [])
+    exclude = list(exclude or [])
     out = []
     for box in merged:
         if box[3] / 2.0 + box[1] / 2.0 > h * 0.88:
@@ -188,6 +190,8 @@ def detect_text_regions(frame_bgr, persons=None, vehicles=None, plates=None,
         if any(_box_overlap(box, v) > 0.50 for v in vehicles):
             continue
         if any(_box_overlap(box, p) > 0.40 for p in plates):
+            continue
+        if any(_box_overlap(box, e) > 0.30 for e in exclude):
             continue
         out.append(box)
     out.sort(key=lambda b: -_box_area(b))

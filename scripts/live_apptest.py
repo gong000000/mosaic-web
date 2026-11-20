@@ -111,12 +111,29 @@ def main():
             print("FAIL 기대 항목 누락:", missing)
             return 1
 
-    # 요청한 프리셋으로 고정한다.
+    # 그룹 체크박스를 요청 값으로 고정한다.
+    group_map = {
+        "얼굴만": ("얼굴",),
+        "번호판만": ("번호판",),
+        "얼굴 + 번호판": ("얼굴", "번호판"),
+        "주소·간판": ("텍스트·문서", "간판"),
+        "얼굴 + 번호판 + 주소": ("얼굴", "번호판", "텍스트·문서"),
+    }
+    want_groups = set(group_map.get(
+        args.preset, tuple(x.strip() for x in args.preset.split(",") if x.strip())))
     try:
-        at.sidebar.selectbox(key="preset_sel").select(args.preset)
+        from src.config import UI_GROUPS
+        for i, label in enumerate(UI_GROUPS):
+            cb = next((c for c in at.checkbox if c.key == f"grp_{i}"), None)
+            if cb is None:
+                continue
+            if label in want_groups:
+                cb.check()
+            else:
+                cb.uncheck()
         at.run(timeout=600)
     except Exception as e:
-        print("FAIL 프리셋 선택 실패:", args.preset, e)
+        print("FAIL 그룹 선택 실패:", args.preset, e)
         return 1
 
     buttons = [b for b in at.button if b.key == "start_mosaic"]

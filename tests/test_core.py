@@ -589,6 +589,18 @@ def test_failed_queue_job_can_retry():
     assert q.get(new_id)["input_path"] == failed["input_path"]
 
 
+def test_ui_groups_and_signboard_aliases():
+    from src.config import CANDS, UI_GROUPS, canon_category
+    assert "passenger" not in CANDS
+    assert "signboard" in CANDS
+    assert canon_category("간판") == "signboard"
+    assert canon_category("store sign") == "signboard"
+    assert canon_category("택배 송장") == "id_card"
+    assert set(UI_GROUPS) == {"얼굴", "번호판", "텍스트·문서", "간판"}
+    assert "signboard" in UI_GROUPS["간판"]
+    assert "name_tag" in UI_GROUPS["텍스트·문서"]
+
+
 def test_face_mesh_falls_back_without_model():
     from src.face_mesh import FaceMeshRefiner
     ref = FaceMeshRefiner(model_path="/nonexistent/model.task")

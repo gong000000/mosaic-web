@@ -160,12 +160,25 @@ def _click_start(at):
     return out
 
 
-def _upload_and_analyze(at, video, preset, stub):
+def _set_groups(at, labels):
+    from src.config import UI_GROUPS
+    labels = set(labels or ())
+    for i, label in enumerate(UI_GROUPS):
+        cb = next((c for c in at.checkbox if c.key == f"grp_{i}"), None)
+        if cb is None:
+            continue
+        if label in labels:
+            cb.check()
+        else:
+            cb.uncheck()
+    at.run()
+
+
+def _upload_and_analyze(at, video, groups, stub):
     _patch(stub)
     at.run()
-    # 프리셋은 분석 후 체크리스트의 기본 선택 항목을 정한다.
-    at.sidebar.selectbox(key="preset_sel").select(preset)
-    at.run()
+    # 그룹 체크박스가 분석 후 체크리스트의 기본 선택을 정한다.
+    _set_groups(at, groups)
     at.sidebar.file_uploader[0].upload(
         os.path.basename(video), open(video, "rb").read(), "video/mp4")
     _run_until_analysis(at)
@@ -178,7 +191,7 @@ def _upload_and_analyze(at, video, preset, stub):
 def run_face():
     _SEEN_QUERIES.clear()
     at = _open_app()
-    _upload_and_analyze(at, FACE, "얼굴만", _face_stub)
+    _upload_and_analyze(at, FACE, ("얼굴",), _face_stub)
 
     assert "분석 실패" not in _warnings(at), _warnings(at)
     items = at.session_state["analysis"]["items"]
@@ -199,7 +212,7 @@ def run_queue_cancel():
     """두 작업을 연속 등록하고 두 번째를 취소한다."""
     _SEEN_QUERIES.clear()
     at = _open_app()
-    _upload_and_analyze(at, FACE, "얼굴만", _face_stub)
+    _upload_and_analyze(at, FACE, ("얼굴",), _face_stub)
     for _ in range(2):
         buttons = [b for b in at.button if b.key == "start_mosaic"]
         assert buttons, "모자이크 시작 버튼 없음: " + str(_keys(at))
@@ -231,7 +244,7 @@ def run_queue_cancel():
 def run_plate():
     _SEEN_QUERIES.clear()
     at = _open_app()
-    _upload_and_analyze(at, STREET, "번호판만", _plate_stub)
+    _upload_and_analyze(at, STREET, ("번호판",), _plate_stub)
 
     assert "분석 실패" not in _warnings(at), _warnings(at)
     items = at.session_state["analysis"]["items"]
@@ -252,7 +265,7 @@ def run_plate():
 def run_missing_region():
     """샘플에서 못 찾은 배경 항목은 선택할 수 없고, 얼굴은 선택된다."""
     at = _open_app()
-    _upload_and_analyze(at, FACE, "얼굴 + 번호판", _face_stub)
+    _upload_and_analyze(at, FACE, ("얼굴", "번호판"), _face_stub)
 
     plate_cb = next((c for c in at.checkbox
                      if "차량번호판" in str(c.label)), None)
@@ -271,7 +284,7 @@ def run_preset_switch():
     """프리셋 변경 시 VLM 재분석 없이 체크리스트가 즉시 갱신되는지."""
     _SEEN_QUERIES.clear()
     at = _open_app()
-    _upload_and_analyze(at, FACE, "얼굴 + 번호판", _face_plate_stub)
+    _upload_and_analyze(at, FACE, ("얼굴", "번호판"), _face_plate_stub)
 
     items = at.session_state["analysis"]["items"]
     cats = {it["category"] for it in items}
@@ -287,10 +300,9 @@ def run_preset_switch():
     assert "차량번호판" in _checkboxes(at), _checkboxes(at)
 
     calls_before = len(_SEEN_QUERIES)
-    # 프리셋을 '얼굴만'으로 바꾼다. 체크박스 키에 프리셋 필터 ID가
+    # 그룹 체크박스를 '얼굴만'으로 바꾼다. 체크박스 키에 프리셋 필터 ID가
     # 포함되므로 번호판 체크는 자동으로 사라지고, VLM은 다시 부르지 않는다.
-    at.sidebar.selectbox(key="preset_sel").select("얼굴만")
-    at.run()
+    _set_groups(at, ("얼굴",))
     second = set()
     for c in at.checkbox:
         lab = str(c.label)

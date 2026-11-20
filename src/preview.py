@@ -405,10 +405,10 @@ def analyze_first_frame_items(frame, model, conf, imgsz,
             person = _match_person(box["xyxy"], cand)
         _add_box(items, cat, box, person, frame_idx)
 
-    # VLM이 놓친 주소·간판을 EAST 글자 영역으로 보완한다. 사람/차량 내부
-    # 텍스트(셔츠·번호판·차량 광고)는 제외해 오검출을 줄인다.
-    if "address" in targets and os.environ.get(
-            "MOSAIC_ADDRESS_EAST", "1") != "0":
+    # VLM이 놓친 텍스트를 EAST로 보완한다. 문서/송장은 address로, 큰 간판은
+    # signboard로 나누고, 사람/차량 내부 텍스트는 제외한다.
+    if (("address" in targets or "signboard" in targets)
+            and os.environ.get("MOSAIC_ADDRESS_EAST", "1") != "0"):
         try:
             from .texts import detect_text_regions
             h0, w0 = frame.shape[:2]
@@ -429,26 +429,52 @@ def analyze_first_frame_items(frame, model, conf, imgsz,
                 plate_boxes = detect_plates(frame) or []
             except Exception:
                 plate_boxes = []
-            existing = [b for b in items.get("address", {}).get("boxes", [])]
-            regions = detect_text_regions(
-                frame, persons=[c["xyxy"] for c in cand],
-                vehicles=veh_boxes, plates=plate_boxes)
-            for r in regions:
-                if any(iou(r, b) > 0.30 for b in existing):
-                    continue
-                if not plausible_box("address", *r, w0, h0):
-                    continue
-                box = {
-                    "category": "address",
-                    "label_ko": label_ko("address"),
-                    "xyxy": r,
-                    "conf": 0.6,
-                    "matches_prompt": "address" in prompt_set,
-                    "region_type": "region",
-                    "source": "east",
-                }
-                _add_box(items, "address", box, None, frame_idx)
-                existing.append(r)
+            persons = [c["xyxy"] for c in cand]
+
+            sign_exclude = [b for b in
+                            items.get("signboard", {}).get("boxes", [])]
+            # 간판 EAST 보완은 VLM이 간판을 하나라도 찾은 프레임에서만 한다.
+            # 문서 클로즈업(택배 송장 등)에서는 큰 글자가 간판으로 오검출될 수
+            # 있으므로, VLM 간판 시드가 없으면 signboard를 추가하지 않는다.
+            if "signboard" in targets and sign_exclude:
+                sign_regions = detect_text_regions(
+                    frame, persons=persons, vehicles=veh_boxes,
+                    plates=plate_boxes, min_area=3000,
+                    max_area_ratio=0.10, exclude=sign_exclude)
+                for r in sign_regions:
+                    if not plausible_box("signboard", *r, w0, h0):
+                        continue
+                    box = {
+                        "category": "signboard",
+                        "label_ko": label_ko("signboard"),
+                        "xyxy": r, "conf": 0.6,
+                        "matches_prompt": "signboard" in prompt_set,
+                        "region_type": "region", "source": "east",
+                    }
+                    _add_box(items, "signboard", box, None, frame_idx)
+                    sign_exclude.append(r)
+
+            if "address" in targets:
+                existing = [b for b in
+                            items.get("address", {}).get("boxes", [])]
+                regions = detect_text_regions(
+                    frame, persons=persons, vehicles=veh_boxes,
+                    plates=plate_boxes, min_area=800,
+                    max_area_ratio=0.02, exclude=sign_exclude)
+                for r in regions:
+                    if any(iou(r, b) > 0.30 for b in existing):
+                        continue
+                    if not plausible_box("address", *r, w0, h0):
+                        continue
+                    box = {
+                        "category": "address",
+                        "label_ko": label_ko("address"),
+                        "xyxy": r, "conf": 0.6,
+                        "matches_prompt": "address" in prompt_set,
+                        "region_type": "region", "source": "east",
+                    }
+                    _add_box(items, "address", box, None, frame_idx)
+                    existing.append(r)
         except Exception:
             pass
 

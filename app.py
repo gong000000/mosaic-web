@@ -21,9 +21,9 @@ import time
 import cv2
 import streamlit as st
 
-from src.config import (CANDS, CATEGORY_TYPE, GEMINI_BASE_URL, OUTPUT_DIR,
-                        PRESET_CATS, ROOT_DIR, VLM_MODEL, env_api_key,
-                        label_ko)
+from src.config import (CANDS, CATEGORY_TYPE, DEFAULT_GROUPS,
+                        GEMINI_BASE_URL, OUTPUT_DIR, ROOT_DIR, UI_GROUPS,
+                        VLM_MODEL, env_api_key, label_ko)
 from src.models import get_model
 from src.preview import analyze_video
 from src.render import normalize_video, trim_video
@@ -451,8 +451,8 @@ if not st.session_state.get("tmp_swept"):
 
 # VLM 분석은 항상 모든 개인정보 후보를 찾는다(프라이버시 우선).
 # 사용자가 고른 프리셋은 '자동으로 체크할 항목'만 정한다.
-ANALYSIS_QUERY = ("얼굴, 차량번호판, 주소·간판, 명찰, 신분증, "
-                  "휴대폰 화면, 차량동승자를 모두 찾아줘")
+ANALYSIS_QUERY = ("얼굴, 차량번호판, 주소·문서 텍스트(택배 송장 포함), "
+                  "간판, 명찰, 신분증, 휴대폰 화면을 모두 찾아줘")
 
 st.markdown(
     """
@@ -488,11 +488,28 @@ with st.sidebar:
         "Google Gemini API로 전송됩니다. 업로드하면 이에 동의한 것으로 봅니다.")
 
     st.subheader("가릴 항목")
-    preset_name = st.selectbox("프리셋", list(PRESET_CATS.keys()),
-                               key="preset_sel")
-    preset_cats = set(PRESET_CATS.get(preset_name, ()))
-    if preset_name == "직접 선택":
-        st.caption("분석 후 아래 체크리스트에서 가릴 항목을 직접 고르세요.")
+    def _set_all_groups(value):
+        for _i in range(len(UI_GROUPS)):
+            st.session_state[f"grp_{_i}"] = bool(value)
+
+    for _i, _label in enumerate(UI_GROUPS):
+        st.session_state.setdefault(f"grp_{_i}", _label in DEFAULT_GROUPS)
+    _c1, _c2 = st.columns(2)
+    with _c1:
+        st.button("전체 선택", key="grp_all", on_click=_set_all_groups,
+                  args=(True,), use_container_width=True)
+    with _c2:
+        st.button("전체 해제", key="grp_none", on_click=_set_all_groups,
+                  args=(False,), use_container_width=True)
+    selected_groups = []
+    for _i, _label in enumerate(UI_GROUPS):
+        if st.checkbox(_label, key=f"grp_{_i}"):
+            selected_groups.append(_label)
+    preset_name = " + ".join(selected_groups) or "직접 선택"
+    preset_cats = set()
+    for _label in selected_groups:
+        preset_cats.update(UI_GROUPS[_label])
+    st.caption("텍스트·문서: 주소·택배 송장·신분증·영수증·휴대폰 화면·명찰")
 
     st.divider()
     strip_audio_opt = st.checkbox(

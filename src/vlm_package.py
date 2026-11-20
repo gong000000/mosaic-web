@@ -27,15 +27,16 @@ JPEG_Q = 90
 TARGET_EN = {
     "face": "human face",
     "license_plate": "vehicle license plate",
-    "address": "address signboard or document text",
+    "address": "address or document text (paper, label, receipt)",
+    "signboard": "store, building, billboard, or street sign",
     "passenger": "passenger inside a vehicle",
     "name_tag": "name tag or employee badge",
-    "id_card": "id card or document",
+    "id_card": "id card, shipping label, or document",
     "phone_screen": "smartphone screen",
 }
 
-PERSON_HINT = ("얼굴, 차량번호판, 주소/간판, 명찰, 신분증/문서, "
-               "휴대폰 화면, 차량동승자")
+PERSON_HINT = ("얼굴, 차량번호판, 주소/문서 텍스트, 간판, 명찰, "
+               "신분증/택배 송장/문서, 휴대폰 화면")
 
 
 class VLMError(RuntimeError):
@@ -398,6 +399,10 @@ def _build_prompt(phrases, query_raw, include_all, focus):
                      "얼굴 전체를 감싸세요. 사람 몸 전체나 목·어깨를 얼굴로 "
                      "표시하지 마세요. 명찰·신분증·간판은 글자가 읽히는 영역 "
                      "전체를 bbox로 표시하세요.")
+        lines.append("address·id_card는 주소·문서·영수증·택배 송장처럼 "
+                     "종이/물체 위의 개인 텍스트이고, signboard는 매장·건물·"
+                     "광고판·도로 표지판처럼 환경에 고정된 간판입니다. "
+                     "택배 송장은 id_card로 찾으세요.")
     lines.append("bbox는 대상의 실제 경계에 최대한 타이트하게 맞추세요. "
                  "배경 여백을 크게 넣지 말고, 대상보다 20% 이상 크게 잡지 "
                  "마세요. 같은 물체를 여러 박스로 중복 표시하지 마세요.")
@@ -409,7 +414,7 @@ def _build_prompt(phrases, query_raw, include_all, focus):
                  "[{\"category\":\"face\",\"label_ko\":\"얼굴\","
                  "\"box_2d\":[200,100,500,400],\"confidence\":0.95,"
                  "\"matches_prompt\":true,\"region_type\":\"person\"}]")
-    lines.append("category는 가능하면 face, license_plate, address, passenger, "
+    lines.append("category는 가능하면 face, license_plate, address, signboard, "
                  "name_tag, id_card, phone_screen 중 하나를 쓰고, 아니면 영문 "
                  "snake_case로 쓰세요.")
     if include_all:

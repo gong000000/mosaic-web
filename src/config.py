@@ -42,8 +42,8 @@ _load_dotenv()
 CANDS = [
     "face",           # 얼굴
     "license_plate",  # 차량번호판
-    "address",        # 주소 (간판, 문서 등)
-    "passenger",      # 차량동승자
+    "address",        # 주소·문서 텍스트
+    "signboard",      # 매장/건물/광고 간판
     "name_tag",       # 명찰
     "id_card",        # 신분증/문서
     "phone_screen",   # 휴대폰 화면
@@ -52,11 +52,12 @@ CANDS = [
 KO = {
     "face": "얼굴",
     "license_plate": "차량번호판",
-    "address": "주소·간판",
-    "passenger": "차량동승자",
+    "address": "주소·문서",
+    "signboard": "간판",
     "name_tag": "명찰",
     "id_card": "신분증·문서",
     "phone_screen": "휴대폰 화면",
+    "passenger": "차량동승자",
 }
 
 # 사람 트랙에 붙는 항목 / 배경 영역으로 처리하는 항목
@@ -66,6 +67,7 @@ CATEGORY_TYPE = {
     "name_tag": "person",
     "license_plate": "region",
     "address": "region",
+    "signboard": "region",
     "id_card": "region",
     "phone_screen": "region",
 }
@@ -86,13 +88,14 @@ CATEGORY_ALIASES = {
     "car plates": "license_plate", "vehicle plate": "license_plate",
     "vehicle plates": "license_plate", "plate": "license_plate",
     "plates": "license_plate", "license tag": "license_plate",
-    "주소": "address", "주소지": "address", "간판": "address",
-    "간판들": "address", "signboard": "address", "signboards": "address",
-    "sign": "address", "signs": "address", "signage": "address",
-    "street sign": "address", "store sign": "address",
-    "building sign": "address", "billboard": "address",
-    "현수막": "address", "안내판": "address", "표지판": "address",
+    "주소": "address", "주소지": "address",
     "address": "address", "addresses": "address",
+    "간판": "signboard", "간판들": "signboard",
+    "signboard": "signboard", "signboards": "signboard",
+    "sign": "signboard", "signs": "signboard", "signage": "signboard",
+    "street sign": "signboard", "store sign": "signboard",
+    "building sign": "signboard", "billboard": "signboard",
+    "현수막": "signboard", "안내판": "signboard", "표지판": "signboard",
     "동승자": "passenger", "탑승자": "passenger", "승객": "passenger",
     "passenger": "passenger", "passengers": "passenger",
     "car passenger": "passenger", "vehicle occupant": "passenger",
@@ -105,6 +108,9 @@ CATEGORY_ALIASES = {
     "서류": "id_card", "id card": "id_card", "id cards": "id_card",
     "identity card": "id_card", "identification": "id_card",
     "id document": "id_card", "identity document": "id_card",
+    "운송장": "id_card", "택배송장": "id_card", "택배 송장": "id_card",
+    "송장": "id_card", "shipping label": "id_card",
+    "parcel label": "id_card", "waybill": "id_card",
     "주민등록증": "id_card", "운전면허증": "id_card", "여권": "id_card",
     "passport": "id_card", "driver license": "id_card",
     "driver's license": "id_card", "document": "id_card",
@@ -166,16 +172,14 @@ def label_ko(cat):
     return KO.get(cat, cat.replace("_", " "))
 
 
-# 실제로 동작하는 프리셋만 노출한다. 값은 '자동으로 체크할 항목'이다.
-# 직접 선택은 아무것도 자동 체크하지 않고, 분석 후 체크리스트에서 고른다.
-PRESET_CATS = {
-    "얼굴 + 번호판": ("face", "license_plate"),
-    "얼굴만": ("face",),
-    "번호판만": ("license_plate",),
-    "얼굴 + 번호판 + 주소": ("face", "license_plate", "address"),
-    "주소·간판": ("address",),
-    "직접 선택": (),
+# UI에서 체크박스로 노출하는 그룹. 내부 카테고리는 추적/렌더를 위해 유지한다.
+UI_GROUPS = {
+    "얼굴": ("face",),
+    "번호판": ("license_plate",),
+    "텍스트·문서": ("address", "id_card", "phone_screen", "name_tag"),
+    "간판": ("signboard",),
 }
+DEFAULT_GROUPS = ("얼굴", "번호판")
 
 # 결과물/DB 저장 위치. Modal 같은 배포 환경에서는 영속 볼륨 경로를
 # MOSAIC_DATA_DIR로 넘겨 컨테이너가 재시작돼도 파일이 남게 한다.
@@ -190,7 +194,8 @@ VLM_MODEL = os.environ.get("VLM_MODEL", "gemini-3-flash-preview")
 # 그리므로, 이미지에는 코드만 쓰고 한국어 이름은 체크리스트/캡션에 쓴다.
 REGION_CODE = {
     "license_plate": "PLATE",
-    "address": "SIGN",
+    "address": "DOC",
+    "signboard": "SIGN",
     "id_card": "ID",
     "phone_screen": "PHONE",
     "name_tag": "NAME",
@@ -219,6 +224,7 @@ _MAX_BOX_AREA = {
     "face": 0.22,
     "license_plate": 0.28,
     "address": 0.30,
+    "signboard": 0.35,
     "passenger": 0.40,
     "name_tag": 0.16,
     "id_card": 0.26,
@@ -228,6 +234,7 @@ _MAX_BOX_ASPECT = {
     "face": 2.2,
     "license_plate": 14.0,
     "address": 16.0,
+    "signboard": 22.0,
     "passenger": 5.0,
     "name_tag": 12.0,
     "id_card": 10.0,
