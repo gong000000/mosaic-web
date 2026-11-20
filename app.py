@@ -67,7 +67,8 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-JQ.start_worker()
+if os.environ.get("MOSAIC_QUEUE_WORKER", "") != "external":
+    JQ.start_worker()
 
 
 def _load_css():
@@ -274,7 +275,9 @@ def _render_job_card(job, pos, user):
                     st.rerun()
         frac = min(1.0, max(0.0, float(job.get("progress") or 0)))
         if status == "queued":
-            st.progress(0.0, text=f"대기 중 · {JQ.position(jid)}번째")
+            pos = JQ.position(jid, user)
+            text = "대기 중" if pos <= 1 else f"대기 중 · 내 작업 {pos}번째"
+            st.progress(0.0, text=text)
         elif status == "running":
             st.progress(frac, text=f"렌더 중 · {int(frac * 100)}%")
         elif status == "cancelled":
@@ -351,9 +354,13 @@ def _render_history(user, expanded=False):
             active = []
         if active:
             st.markdown("**대기/진행 중**")
+            st.caption("대기 순번은 내 계정의 앞선 작업만 셉니다. "
+                       "다른 아이디 작업은 순번에 포함되지 않습니다.")
             for j in active:
                 if j.get("status") == "queued":
-                    text = f"대기 {JQ.position(j['id'])}번째"
+                    pos = JQ.position(j['id'], user)
+                    text = ("대기 중" if pos <= 1
+                            else f"대기 중 · 내 작업 {pos}번째")
                 else:
                     pct = int(float(j.get("progress") or 0) * 100)
                     text = f"렌더 중 {pct}%"

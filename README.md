@@ -71,10 +71,16 @@
      `MOSAIC_PLATE_DET=0`이면 VLM만 씁니다.
    - `veryfast` H.264 MP4로 인코딩하며 원본 오디오와 영상 길이를 유지합니다.
      사이드바의 `오디오 제거`를 켜면 목소리도 제거합니다.
-   - 렌더 작업은 SQLite 큐(`render_jobs`)에 저장되고 백그라운드 워커가
-     하나씩 처리합니다. 창을 닫아도 계속되며, 서버가 재시작되면 queued 작업을
-     이어갑니다. 입력 영상은 볼륨의 `job_inputs/`에 복사한 뒤 완료/실패/취소 시
+   - 렌더 작업은 SQLite 큐(`render_jobs`)에 저장되고, Streamlit과 **별도
+     프로세스**로 실행되는 워커가 처리합니다. 브라우저 창을 닫거나 접속이
+     끊겨도 작업이 계속되고, 워커가 죽으면 자동으로 다시 뜹니다. 서버가
+     재시작되면 남아 있던 running 작업을 queued로 되돌려 이어갑니다.
+     입력 영상은 볼륨의 `job_inputs/`에 복사한 뒤 완료/실패/취소 시
      삭제합니다.
+   - 대기 순번은 **계정별**로 계산합니다. 같은 아이디의 앞선 작업만 순번에
+     포함되므로 다른 아이디의 작업 때문에 내 순번이 밀리지 않습니다.
+     같은 계정 안에서는 작업이 등록 순서대로 하나씩 실행되고, 서버 전체로는
+     최대 2개 계정 작업을 동시에 처리합니다(`MOSAIC_MAX_PARALLEL`).
    - `모자이크 시작`은 작업을 큐에 넣고 즉시 돌아옵니다. 여러 번 누르면
      `작업 진행 · 결과`에 1번째/2번째/3번째 카드가 생기고, 각 카드에서 진행률을
      보거나 **취소**할 수 있습니다. 완료된 카드 아래에 미리보기와 다운로드가
@@ -163,7 +169,8 @@
 ## 운영 · 재배포 (Modal, GPU)
 
 가입 후 매월 $30 크레딧이 제공되고, 접속이 없으면 컨테이너가 자동으로
-내려가 GPU 비용이 계속 나가지 않습니다.
+내려가 GPU 비용이 계속 나가지 않습니다. 단, 렌더 작업이 도는 동안에는
+컨테이너를 유지합니다.
 
 최초 1회(배포 PC에서):
 
@@ -181,6 +188,12 @@ modal deploy modal_app.py
 - 첫 배포는 CUDA용 torch 이미지를 빌드하므로 10분 정도 걸릴 수 있습니다.
 - `users.db`와 `outputs/`는 Modal Volume `mosaic-data`에 저장됩니다.
   컨테이너가 재시작·재배포돼도 계정과 결과가 유지됩니다.
+- 렌더 워커는 Streamlit과 별도 프로세스(`src/worker.py`)로 뜨고, SQLite
+  heartbeat 리스로 중복 실행을 막습니다. 작업 중에는 서버가 스스로 health
+  요청을 보내 컨테이너를 유지하므로, 브라우저를 닫아도 렌더가 끝까지
+  진행됩니다.
+- `MOSAIC_MAX_PARALLEL`(기본 2)은 동시에 렌더할 수 있는 **계정 수**입니다.
+  같은 계정의 작업은 등록 순서대로 하나씩 처리됩니다.
 - `GEMINI_API_KEY`는 Modal Named Secret `mosaic-gemini`에서 읽습니다.
   `.env`를 들고 있는 PC 말고도 **Modal 로그인만 되어 있으면 배포할 수
   있습니다.** `.env`는 이미지에 포함되지 않고 커밋되지 않습니다.
@@ -343,8 +356,9 @@ src/offline.py              2패스 역방향 채움·평활·ID 전환 보간
 src/pipeline.py             YOLO 추적 + 모자이크 렌더 파이프라인
 src/render.py               모자이크/FFmpeg H.264 유틸
 src/render_service.py       체크리스트 → 렌더 요청 변환/서명/캐시
-src/render_queue.py         동시 렌더 직렬화/대기 순번
-src/jobqueue.py             지속형 렌더 작업 큐(SQLite) + 백그라운드 워커
+src/render_queue.py         (구) 세션 내 렌더 직렬화
+src/jobqueue.py             지속형 렌더 작업 큐(SQLite) + 계정별 스케줄러
+src/worker.py               Streamlit과 분리된 큐 워커 프로세스/감시
 src/history.py              사용자별 결과 기록 (SQLite jobs.db)
 src/retention.py            보관/삭제 정책 (24시간·개수·용량)
 requirements.txt            CPU/headless 의존성

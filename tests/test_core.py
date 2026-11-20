@@ -408,7 +408,7 @@ def test_render_queue_persists_and_claims_one_job():
     with open(src, "wb") as f:
         f.write(b"video")
     q = RenderQueue(db_path=os.path.join(d, "jobs.db"),
-                    input_dir=os.path.join(d, "inputs"))
+                    input_dir=os.path.join(d, "inputs"), max_parallel=1)
     items = [{"category": "face", "type": "person",
               "samples": {"0": [[1, 2, 3, 4]]},
               "thumb": np.zeros((2, 2, 3), np.uint8)}]
@@ -425,6 +425,8 @@ def test_render_queue_persists_and_claims_one_job():
         preset="veryfast", query_raw="q", src_name="in.mp4",
         preset_name="얼굴만")
     assert q.position(job2) == 2
+    assert q.position(job1, "alice") == 1
+    assert q.position(job2, "bob") == 1, "다른 사용자의 작업이 순번에 섞임"
     assert len(q.active_jobs("alice")) == 1
     assert q.active_jobs("alice")[0]["status"] == "queued"
     claimed = q.claim()
@@ -436,6 +438,57 @@ def test_render_queue_persists_and_claims_one_job():
     assert q.get(job2)["status"] == "queued"
     q.recover_running()
     assert q.get(job1)["status"] == "done"
+
+
+def test_queue_runs_different_users_in_parallel_but_one_per_user():
+    from src.jobqueue import RenderQueue
+    from src.render_service import MosaicSettings
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, "in.mp4")
+    with open(src, "wb") as f:
+        f.write(b"video")
+    q = RenderQueue(db_path=os.path.join(d, "jobs.db"),
+                    input_dir=os.path.join(d, "inputs"), max_parallel=2)
+
+    def add(user):
+        return q.enqueue(
+            user=user, input_path=src,
+            output_path=os.path.join(d, f"{user}.mp4"), items=[],
+            selected_cats=["face"], settings=MosaicSettings(),
+            model_name="yolo11n-seg.pt", imgsz=640, stride=15, conf=0.2,
+            preset="veryfast", query_raw="q")
+
+    alice1 = add("alice")
+    bob1 = add("bob")
+    alice2 = add("alice")
+
+    assert q.claim()["id"] == alice1
+    # 다른 계정 작업은 같은 계정의 running 작업에 막히지 않는다.
+    assert q.claim()["id"] == bob1
+    # 동시 실행 상한(2)에 도달했고, alice의 두 번째 작업은 자기 차례를 기다린다.
+    assert q.claim() is None
+    assert q.position(alice2, "alice") == 2
+
+    q.finish(alice1, "done")
+    # alice1이 끝나면 alice2가 들어갈 수 있다. bob은 아직 running이다.
+    assert q.claim()["id"] == alice2
+    assert q.position(alice2, "alice") == 1
+
+
+def test_queue_worker_lease_prevents_two_processes():
+    from src.jobqueue import RenderQueue
+    d = tempfile.mkdtemp()
+    q1 = RenderQueue(db_path=os.path.join(d, "jobs.db"),
+                     input_dir=os.path.join(d, "inputs"))
+    q2 = RenderQueue(db_path=os.path.join(d, "jobs.db"),
+                     input_dir=os.path.join(d, "inputs"))
+    assert q1.acquire_worker("one", ttl=60) is True
+    assert q2.acquire_worker("two", ttl=60) is False
+    assert q1.heartbeat_worker("one") is True
+    assert q2.heartbeat_worker("two") is False
+    # heartbeat가 만료되면 다른 프로세스가 이어받을 수 있다.
+    assert q2.acquire_worker("two", ttl=0) is True
+    assert q1.heartbeat_worker("one") is False
 
 
 def test_queue_worker_completes_job_without_model():
@@ -599,6 +652,27 @@ def test_ui_groups_and_signboard_aliases():
     assert set(UI_GROUPS) == {"얼굴", "번호판", "텍스트·문서", "간판"}
     assert "signboard" in UI_GROUPS["간판"]
     assert "name_tag" in UI_GROUPS["텍스트·문서"]
+
+
+def test_queue_recovers_stale_running_on_worker_start():
+    from src.jobqueue import RenderQueue
+    from src.render_service import MosaicSettings
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, "in.mp4")
+    with open(src, "wb") as f:
+        f.write(b"video")
+    q = RenderQueue(db_path=os.path.join(d, "jobs.db"),
+                    input_dir=os.path.join(d, "inputs"))
+    job_id = q.enqueue(
+        user="alice", input_path=src,
+        output_path=os.path.join(d, "out.mp4"), items=[],
+        selected_cats=["face"], settings=MosaicSettings(),
+        model_name="yolo11n-seg.pt", imgsz=640, stride=15, conf=0.2,
+        preset="veryfast", query_raw="q")
+    assert q.claim()["id"] == job_id
+    q.recover_running()
+    assert q.get(job_id)["status"] == "queued"
+    assert os.path.exists(q.get(job_id)["input_path"])
 
 
 def test_face_mesh_falls_back_without_model():

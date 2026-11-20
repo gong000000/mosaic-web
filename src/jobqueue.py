@@ -10,6 +10,7 @@ Streamlit 세션 스레드가 직접 렌더하면 창을 닫거나 컨테이너�
 - 원본 입력 파일은 작업 종료/실패 시 삭제한다.
 """
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -24,6 +25,8 @@ from .errors import RenderCancelled
 from .render import strip_audio
 from .render_service import MosaicSettings, RenderPlan
 from . import history as H
+
+log = logging.getLogger("mosaic.jobqueue")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS render_jobs (
@@ -81,9 +84,17 @@ def _json_items(items):
 
 
 class RenderQueue:
-    def __init__(self, db_path=None, input_dir=None):
+    def __init__(self, db_path=None, input_dir=None, max_parallel=None):
         self.db = db_path or os.path.join(OUTPUT_DIR, "jobs.db")
         self.input_dir = input_dir or os.path.join(OUTPUT_DIR, "job_inputs")
+        if max_parallel is None:
+            try:
+                max_parallel = int(os.environ.get("MOSAIC_MAX_PARALLEL", "2"))
+            except (TypeError, ValueError):
+                max_parallel = 2
+        # 계정별로는 한 작업만, 서버 전체로는 최대 N개 계정 작업을 동시에
+        # 처리한다. 다른 아이디의 작업이 내 대기 순번을 막지 않게 하기 위함.
+        self.max_parallel = max(1, int(max_parallel))
         self._init_db()
 
     def _connect(self):
@@ -115,6 +126,14 @@ class RenderQueue:
                           "cancel_requested INTEGER NOT NULL DEFAULT 0")
             c.execute("CREATE INDEX IF NOT EXISTS idx_render_jobs_status "
                       "ON render_jobs(status, id)")
+            # 워커가 여러 프로세스/컨테이너에서 중복 실행되지 않도록
+            # 짧은 리스를 둔다. heartbeat가 오래된 경우에만 새 워커가
+            # 이어받는다.
+            c.execute(
+                "CREATE TABLE IF NOT EXISTS queue_worker ("
+                " id INTEGER PRIMARY KEY CHECK (id=1),"
+                " owner TEXT NOT NULL DEFAULT '',"
+                " heartbeat REAL NOT NULL DEFAULT 0)")
 
     def enqueue(self, user, input_path, output_path, items, selected_cats,
                 settings, model_name, imgsz, stride, conf, preset,
@@ -164,13 +183,19 @@ class RenderQueue:
                             (int(job_id),)).fetchone()
         return dict(row) if row else None
 
-    def position(self, job_id):
-        """앞에 있는 queued/running 작업 수 + 1."""
+    def position(self, job_id, user=None):
+        """같은 사용자의 앞선 queued/running 작업 수 + 1."""
         with self._db() as c:
-            n = c.execute(
-                "SELECT COUNT(*) FROM render_jobs WHERE id<? AND "
-                "status IN ('queued','running')",
-                (int(job_id),)).fetchone()[0]
+            if user is None:
+                n = c.execute(
+                    "SELECT COUNT(*) FROM render_jobs WHERE id<? AND "
+                    "status IN ('queued','running')",
+                    (int(job_id),)).fetchone()[0]
+            else:
+                n = c.execute(
+                    "SELECT COUNT(*) FROM render_jobs WHERE user=? AND id<? "
+                    "AND status IN ('queued','running')",
+                    (user or "", int(job_id))).fetchone()[0]
         return int(n) + 1
 
     def active_jobs(self, user):
@@ -181,6 +206,46 @@ class RenderQueue:
                 "cancel_requested FROM render_jobs WHERE user=? AND status IN "
                 "('queued','running') ORDER BY id", (user or "",)).fetchall()]
         return rows
+
+    def has_active_jobs(self):
+        with self._db() as c:
+            n = c.execute(
+                "SELECT COUNT(*) FROM render_jobs WHERE status IN "
+                "('queued','running')").fetchone()[0]
+        return int(n) > 0
+
+    def acquire_worker(self, owner, ttl=20.0):
+        """워커 리스를 잡는다. 다른 워커가 살아 있으면 False."""
+        now = time.time()
+        with self._db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            row = c.execute(
+                "SELECT owner, heartbeat FROM queue_worker WHERE id=1"
+            ).fetchone()
+            if (row and row["owner"]
+                    and float(row["heartbeat"] or 0) > now - float(ttl)
+                    and str(row["owner"]) != str(owner)):
+                return False
+            c.execute(
+                "INSERT INTO queue_worker (id, owner, heartbeat) "
+                "VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+                "owner=excluded.owner, heartbeat=excluded.heartbeat",
+                (str(owner), now))
+        return True
+
+    def heartbeat_worker(self, owner, ttl=20.0):
+        """리스 소유자만 heartbeat를 갱신할 수 있다."""
+        now = time.time()
+        with self._db() as c:
+            cur = c.execute(
+                "UPDATE queue_worker SET heartbeat=? "
+                "WHERE id=1 AND owner=?", (now, str(owner)))
+            return cur.rowcount > 0
+
+    def release_worker(self, owner):
+        with self._db() as c:
+            c.execute("UPDATE queue_worker SET heartbeat=0 "
+                      "WHERE id=1 AND owner=?", (str(owner),))
 
     def cancel(self, job_id, user):
         """queued면 즉시 취소, running이면 취소 요청 플래그를 세운다."""
@@ -219,13 +284,24 @@ class RenderQueue:
                              or row["status"] == "cancelled"))
 
     def claim(self):
-        """queued 작업 1개를 원자적으로 running으로 바꾼다."""
+        """queued 작업 1개를 원자적으로 running으로 바꾼다.
+
+        같은 계정의 작업은 한 번에 하나만 실행하고, 서버 전체 동시 실행
+        수는 `max_parallel`로 제한한다. 이렇게 하면 한 계정의 긴 작업이
+        다른 계정의 첫 작업을 막지 않는다.
+        """
         with self._db() as c:
             c.execute("BEGIN IMMEDIATE")
+            running = c.execute(
+                "SELECT COUNT(*) FROM render_jobs WHERE status='running'"
+            ).fetchone()[0]
+            if int(running) >= int(self.max_parallel):
+                return None
             row = c.execute(
-                "SELECT id FROM render_jobs WHERE status='queued' "
-                "AND NOT EXISTS (SELECT 1 FROM render_jobs "
-                "WHERE status='running') ORDER BY id LIMIT 1").fetchone()
+                "SELECT q.id FROM render_jobs q WHERE q.status='queued' "
+                "AND NOT EXISTS (SELECT 1 FROM render_jobs r "
+                "WHERE r.status='running' AND r.user=q.user) "
+                "ORDER BY q.id LIMIT 1").fetchone()
             if row is None:
                 return None
             job_id = int(row["id"])
@@ -425,36 +501,115 @@ class RenderQueue:
             return int(cur.lastrowid)
 
     def worker_loop(self):
-        self.cleanup_finished_inputs()
-        self.cleanup_failed_inputs()
-        self.recover_running()
         last_cleanup = time.time()
-        while True:
-            if time.time() - last_cleanup > 3600:
-                self.cleanup_finished_inputs()
-                self.cleanup_failed_inputs()
-                last_cleanup = time.time()
-            job = self.claim()
-            if job is None:
-                time.sleep(1.5)
-                continue
-            self.run_job(job)
+        while not _STOP.is_set():
+            try:
+                if time.time() - last_cleanup > 3600:
+                    self.cleanup_finished_inputs()
+                    self.cleanup_failed_inputs()
+                    last_cleanup = time.time()
+                job = self.claim()
+                if job is None:
+                    _STOP.wait(1.5)
+                    continue
+                self.run_job(job)
+            except Exception:
+                log.exception("렌더 워커 루프 오류")
+                _STOP.wait(5)
 
 
 _QUEUE = RenderQueue()
-_WORKER = None
+_WORKERS = []
+_SUPERVISOR = None
 _WORKER_LOCK = threading.Lock()
+_STOP = threading.Event()
+_LEASE_OWNER = uuid.uuid4().hex
+_LEASE_TTL = 20.0
+_LAST_LEASE_FAIL = 0.0
 
 
-def start_worker():
-    global _WORKER
+def _worker_main():
+    while not _STOP.is_set():
+        try:
+            _QUEUE.worker_loop()
+        except Exception:
+            log.exception("렌더 워커가 중단됨 - 5초 뒤 재시작")
+            _STOP.wait(5)
+
+
+def _new_worker(index):
+    thread = threading.Thread(target=_worker_main, daemon=True,
+                              name=f"mosaic-render-worker-{index}")
+    thread.start()
+    return thread
+
+
+def _supervisor():
+    """리스 heartbeat를 갱신하고 죽은 워커 스레드를 다시 띄운다."""
+    while not _STOP.wait(5):
+        try:
+            if not _QUEUE.heartbeat_worker(_LEASE_OWNER, _LEASE_TTL):
+                # 다른 프로세스가 리스를 가져갔다. 중복 렌더를 막기 위해
+                # 현재 워커들은 다음 claim 전에 멈춘다.
+                log.warning("렌더 큐 리스를 다른 워커가 가져감")
+                _STOP.set()
+                return
+            with _WORKER_LOCK:
+                for i, thread in enumerate(list(_WORKERS)):
+                    if thread.is_alive():
+                        continue
+                    log.warning("렌더 워커 스레드 재시작: %s", i + 1)
+                    _WORKERS[i] = _new_worker(i + 1)
+        except Exception:
+            log.exception("렌더 큐 감시 오류")
+
+
+def _ensure_supervisor():
+    global _SUPERVISOR
+    if _SUPERVISOR is None or not _SUPERVISOR.is_alive():
+        _SUPERVISOR = threading.Thread(target=_supervisor, daemon=True,
+                                       name="mosaic-render-supervisor")
+        _SUPERVISOR.start()
+    return _SUPERVISOR
+
+
+def start_worker(count=None):
+    """워커 스레드를 시작한다. 다른 프로세스가 이미 실행 중이면 양보한다."""
+    global _WORKERS, _LAST_LEASE_FAIL
     with _WORKER_LOCK:
-        if _WORKER is not None and _WORKER.is_alive():
-            return _WORKER
-        _WORKER = threading.Thread(target=_QUEUE.worker_loop, daemon=True,
-                                   name="mosaic-render-worker")
-        _WORKER.start()
-        return _WORKER
+        alive = [t for t in _WORKERS if t.is_alive()]
+        if alive:
+            # 감시 스레드만 죽은 경우 작업을 건드리지 않고 감시만 복구한다.
+            _ensure_supervisor()
+            return alive
+        if not _QUEUE.acquire_worker(_LEASE_OWNER, _LEASE_TTL):
+            now = time.time()
+            if now - _LAST_LEASE_FAIL > 60:
+                log.info("다른 프로세스가 렌더 큐 워커를 실행 중입니다")
+                _LAST_LEASE_FAIL = now
+            return []
+        try:
+            _QUEUE.cleanup_finished_inputs()
+            _QUEUE.cleanup_failed_inputs()
+        except Exception:
+            log.exception("큐 입력 정리 실패")
+        try:
+            # 이전 프로세스가 남긴 running 작업을 되돌린다. 워커 리스를
+            # 잡은 뒤에만 호출해야 다른 프로세스의 작업을 건드리지 않는다.
+            _QUEUE.recover_running()
+        except Exception:
+            log.exception("시작 시 running 작업 복구 실패")
+        _STOP.clear()
+        n = max(1, int(count or _QUEUE.max_parallel))
+        _WORKERS = [_new_worker(i + 1) for i in range(n)]
+        _ensure_supervisor()
+        log.info("렌더 큐 워커 %d개 시작 (최대 동시 %d개)", n,
+                 _QUEUE.max_parallel)
+        return list(_WORKERS)
+
+
+def has_active_jobs():
+    return _QUEUE.has_active_jobs()
 
 
 def enqueue(**kwargs):
@@ -465,8 +620,8 @@ def get(job_id):
     return _QUEUE.get(job_id)
 
 
-def position(job_id):
-    return _QUEUE.position(job_id)
+def position(job_id, user=None):
+    return _QUEUE.position(job_id, user)
 
 
 def active_jobs(user):

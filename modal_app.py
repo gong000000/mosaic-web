@@ -15,6 +15,7 @@
 """
 import os
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -108,10 +109,11 @@ image = (
     gpu=["L4", "T4"],
     cpu=8.0,
     memory=16384,
-    timeout=3600,
-    scaledown_window=300,
+    timeout=7200,
+    scaledown_window=600,
     # SQLite(users.db)와 앱 내부 MODEL_LOCK 때문에 컨테이너는 하나만 쓴다.
-    # 접속자는 이 한 컨테이너를 공유하고, 렌더는 앱이 순서대로 처리한다.
+    # 접속자는 이 한 컨테이너를 공유하고, 렌더는 계정별로는 순서대로,
+    # 서버 전체로는 최대 MOSAIC_MAX_PARALLEL개 계정 작업을 동시에 처리한다.
     max_containers=1,
     volumes={DATA_DIR: data_volume},
     # GEMINI_API_KEY 는 Modal Named Secret(mosaic-gemini) 에서 읽는다.
@@ -121,6 +123,13 @@ image = (
         "MOSAIC_SKIP_DOTENV": "1",
         "MOSAIC_WEIGHTS_DIR": "/opt/weights",
         "MOSAIC_VLM_RPM": "90",
+        "MOSAIC_MAX_PARALLEL": "2",
+        # 큐 워커는 web()가 별도 프로세스로 띄운다. Streamlit은 큐에 넣고
+        # 상태만 읽는다.
+        "MOSAIC_QUEUE_WORKER": "external",
+        # 작업이 도는 동안 브라우저가 닫혀 있어도 컨테이너가 scale-down
+        # 되지 않도록 스스로 health 요청을 보낸다.
+        "MOSAIC_PUBLIC_URL": "https://gong000000--mosaic.us-east.modal.run",
         "PYTHONUNBUFFERED": "1",
     },
 )
@@ -151,7 +160,35 @@ def web():
         "--server.maxUploadSize",
         "500",
     ]
+    def _start_queue_worker():
+        # Streamlit과 별도 프로세스로 큐 워커를 띄운다. 브라우저 세션이
+        # 없거나 Streamlit 스크립트가 다시 실행되지 않아도 작업을 계속
+        # 처리하고, 워커 프로세스가 죽으면 아래 감시 루프가 재시작한다.
+        return subprocess.Popen(
+            [sys.executable, "-m", "src.worker"],
+            cwd=REMOTE_DIR, env=os.environ.copy())
+
+    worker = _start_queue_worker()
+    print(f"queue worker pid={worker.pid}", flush=True)
     subprocess.Popen(cmd, cwd=REMOTE_DIR)
+
+    def _worker_supervisor():
+        nonlocal worker
+        while True:
+            time.sleep(10)
+            code = worker.poll()
+            if code is None:
+                continue
+            print(f"queue worker 종료 code={code}; 재시작", flush=True)
+            time.sleep(3)
+            try:
+                worker = _start_queue_worker()
+                print(f"queue worker pid={worker.pid}", flush=True)
+            except Exception as e:
+                print(f"queue worker 재시작 실패: {e}", flush=True)
+
+    threading.Thread(target=_worker_supervisor, daemon=True,
+                     name="queue-worker-supervisor").start()
 
     # users.db / 결과 파일이 컨테이너 종료 때 유실되지 않도록 주기적으로
     # 볼륨을 commit 한다.
@@ -164,3 +201,37 @@ def web():
                 print(f"volume commit 실패: {e}", flush=True)
 
     threading.Thread(target=_commit_loop, daemon=True).start()
+
+    def _queue_busy():
+        try:
+            import sqlite3
+            db = os.path.join(DATA_DIR, "outputs", "jobs.db")
+            con = sqlite3.connect(db, timeout=5)
+            try:
+                n = con.execute(
+                    "SELECT COUNT(*) FROM render_jobs "
+                    "WHERE status IN ('queued','running')").fetchone()[0]
+            finally:
+                con.close()
+            return int(n) > 0
+        except Exception:
+            return False
+
+    def _keepalive_loop():
+        """작업이 도는 동안 self health 요청으로 컨테이너를 유지한다."""
+        import urllib.request
+        base = os.environ.get("MOSAIC_PUBLIC_URL", "").rstrip("/")
+        if not base:
+            return
+        while True:
+            try:
+                if _queue_busy():
+                    with urllib.request.urlopen(
+                            base + "/_stcore/health", timeout=20) as resp:
+                        resp.read(64)
+            except Exception as e:
+                print(f"keepalive 실패: {e}", flush=True)
+            time.sleep(30)
+
+    threading.Thread(target=_keepalive_loop, daemon=True,
+                     name="queue-keepalive").start()
