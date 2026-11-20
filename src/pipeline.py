@@ -640,7 +640,7 @@ def _render_face_box(frame, box, style, blocks, blur, angle=0.0,
                     block_size=block_size):
                 return True
     bx = expand_face_box(box, frame.shape[1], frame.shape[0], angle=angle,
-                        motion=motion, side=0.20, top=0.40, bottom=0.20)
+                        motion=motion, side=0.14, top=0.25, bottom=0.15)
     if not bx:
         return False
     return bool(render_face_ellipse(
@@ -700,6 +700,30 @@ def _region_on_person(box, persons, side=0.25, top=0.10, bottom=0.60):
                 and py1 - ph * top <= cy <= py2 + ph * bottom):
             return True
     return False
+
+
+def _face_person_size_ok(box, persons, max_w=0.75, max_h=0.55):
+    """얼굴 박스가 사람 박스 대비 지나치게 크면 오검출로 본다.
+
+    검은 패딩/옷 전체를 얼굴로 잡으면 모자이크가 상체 전체를 덮는다.
+    사람 안에 중심이 있는 얼굴은 사람 폭/높이의 일정 비율 이하여야 한다.
+    """
+    if not persons:
+        return True
+    try:
+        x1, y1, x2, y2 = [float(v) for v in box[:4]]
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        fw, fh = x2 - x1, y2 - y1
+    except (TypeError, ValueError):
+        return False
+    for p in persons:
+        px1, py1, px2, py2 = [float(v) for v in p[:4]]
+        pw, ph = px2 - px1, py2 - py1
+        if pw < 8 or ph < 16:
+            continue
+        if (px1 <= cx <= px2 and py1 <= cy <= py2):
+            return fw <= pw * float(max_w) and fh <= ph * float(max_h)
+    return True
 
 
 def _detect_person_boxes(model, frame, conf=0.20, imgsz=640):
@@ -1196,17 +1220,6 @@ class MosaicJob:
                         if pose_model is not None:
                             heads, persons = _detect_heads_pose(
                                 pose_model, frame, return_persons=True)
-                            # 포즈 키포인트가 약한 사람(옆모습/가림)은
-                            # 사람 박스 상단을 머리 영역으로 보완한다.
-                            for pb in persons:
-                                if any(_faces_in_person(
-                                        [FaceBox(h)], pb, margin=0.05)
-                                       for h in heads):
-                                    continue
-                                ha = _head_area(*pb, ratio=0.24,
-                                                inset=0.10)
-                                if ha:
-                                    heads.append(ha)
                         elif head_model is not None:
                             persons = _detect_person_boxes(head_model, frame)
                             heads = [h for h in (
@@ -1242,6 +1255,9 @@ class MosaicJob:
                         raw_dets = filter_faces_by_person(
                             raw_dets, last_persons, min_score=0.95,
                             frame_area=float(w_f * h_f))
+                        raw_dets = [
+                            (b, s) for b, s in raw_dets
+                            if _face_person_size_ok(b, last_persons)]
                     # VLM 얼굴 후보는 YuNet이 놓친 큰/측면 얼굴을 보완한다.
                     # 옷 무늬/바퀴 오검출을 막기 위해 크기·종횡비를 검증한다.
                     if face_priors:
@@ -1254,9 +1270,12 @@ class MosaicJob:
                             if bw_ < 20 or bh_ < 20:
                                 continue
                             ar = (bw_ * bh_) / float(max(1, w_f * h_f))
-                            if ar < 0.0005 or ar > 0.20:
+                            if ar < 0.0005 or ar > 0.05:
                                 continue
-                            if not (0.30 <= bw_ / float(max(1, bh_)) <= 3.0):
+                            if not (0.50 <= bw_ / float(max(1, bh_)) <= 2.0):
+                                continue
+                            if last_persons and not _face_person_size_ok(
+                                    bx, last_persons):
                                 continue
                             if any(_overlap_ratio(bx, b) > 0.35
                                    for b, _s in raw_dets):

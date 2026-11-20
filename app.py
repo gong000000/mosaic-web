@@ -355,7 +355,12 @@ def _render_job_card(job, pos, user):
                             text += f" · 자동 보정 {fixed}개"
                         st.caption(text)
             elif audit.get("error"):
-                st.caption(f"얼굴 마스크 점검 실패: {audit.get('error')}")
+                if int(audit.get("version", 1) or 1) < 2:
+                    st.caption("얼굴 마스크 점검(이전 오류) · "
+                               "새로 렌더하면 다시 점검합니다.")
+                else:
+                    st.caption(
+                        f"얼굴 마스크 점검 실패: {audit.get('error')}")
             out_name = os.path.basename(out)
 
             def _after_download(jid=jid, name=out_name, path=out):

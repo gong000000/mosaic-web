@@ -528,7 +528,7 @@ class RenderQueue:
                             and os.environ.get(
                                 "MOSAIC_FACE_AUDIT_FIX", "1") != "0"):
                         fixed = face_audit.fix_audited_faces(
-                            output_path, audit.get("fixable") or [],
+                            output_path, audit.get("fixes") or [],
                             style=plan.settings.style,
                             blocks=plan.settings.blocks,
                             blur=plan.settings.blur,
@@ -543,6 +543,7 @@ class RenderQueue:
                     log.exception("얼굴 마스크 자동 점검 실패")
                     try:
                         self.set_audit(job_id, {
+                            "version": 2,
                             "checked": 0, "suspicious": 0, "fixable": 0,
                             "error": f"{type(e).__name__}: {e}"})
                     except Exception:
