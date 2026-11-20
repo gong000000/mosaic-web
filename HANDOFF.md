@@ -33,7 +33,7 @@
 
 ## 검증 결과
 
-- `pytest tests`: **70 passed**
+- `pytest tests`: **71 passed**
 - `scripts/apptest.py`: **APPTEST_PASS**
   - 얼굴, 번호판, 못 찾은 영역, **그룹 전환**, 2작업 등록/두 번째 취소
 - `scripts/qualitytest.py`: **QUALITY_TEST_PASS**

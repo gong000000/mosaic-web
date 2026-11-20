@@ -92,6 +92,25 @@ def _inside_person(box, persons, margin=0.18):
     return False
 
 
+def _person_size_ok(box, persons, max_w=0.75, max_h=0.55):
+    """사람 박스 대비 얼굴이 지나치게 크면 옷/몸통 오검출로 본다."""
+    if not persons:
+        return True
+    try:
+        x1, y1, x2, y2 = [float(v) for v in box[:4]]
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        fw, fh = x2 - x1, y2 - y1
+    except (TypeError, ValueError):
+        return False
+    for px1, py1, px2, py2 in persons:
+        pw, ph = px2 - px1, py2 - py1
+        if pw < 8 or ph < 16:
+            continue
+        if px1 <= cx <= px2 and py1 <= cy <= py2:
+            return fw <= pw * max_w and fh <= ph * max_h
+    return True
+
+
 def audit_faces(input_path, output_path, cancel_fn=None):
     """입력/출력 얼굴을 비교해 마스크 누락 의심 항목을 돌려준다."""
     total_in, _fps, _w, _h = _probe(input_path)
@@ -147,11 +166,20 @@ def audit_faces(input_path, output_path, cancel_fn=None):
                     score = float(score)
                     if score < 0.70:
                         continue
+                    area_ratio = ((x2 - x1) * (y2 - y1)
+                                  / float(max(1, ow * oh)))
                     # 바퀴/건물 무늬/포스터를 얼굴로 오검출하는 경우가 있다.
-                    # 0.85 미만은 사람 박스 안에 있어야 감사 대상으로 본다.
-                    if (score < 0.85 and person_model is not None
-                            and not _inside_person(box, persons)):
-                        continue
+                    # 사람 박스 밖의 작은 얼굴은 고신뢰가 아니면 무시하고,
+                    # 사람 안이라도 몸통 전체 크기면 얼굴로 보지 않는다.
+                    if person_model is not None:
+                        inside = _inside_person(box, persons)
+                        if score < 0.85 and not inside:
+                            continue
+                        if (not inside and score < 0.95
+                                and area_ratio < 0.05):
+                            continue
+                        if not _person_size_ok(box, persons):
+                            continue
                     a = fi[y1:y2, x1:x2]
                     b = fo[y1:y2, x1:x2]
                     if a.size == 0 or b.size == 0:

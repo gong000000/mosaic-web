@@ -661,6 +661,49 @@ def test_thread_local_models_are_isolated(monkeypatch):
     assert seen[0][0] is not seen[1][0], "스레드가 같은 YOLO 모델을 공유함"
 
 
+def test_jobqueue_audit_fix_receives_fix_list(tmp_path, monkeypatch):
+    from src.jobqueue import RenderQueue
+    from src.render_service import MosaicSettings
+    d = str(tmp_path)
+    src = os.path.join(d, "in.mp4")
+    with open(src, "wb") as f:
+        f.write(b"video")
+    out = os.path.join(d, "out.mp4")
+    q = RenderQueue(db_path=os.path.join(d, "jobs.db"),
+                    input_dir=os.path.join(d, "inputs"))
+    job_id = q.enqueue(
+        user="alice", input_path=src, output_path=out, items=[],
+        selected_cats=["face"], settings=MosaicSettings(),
+        model_name="yolo11n-seg.pt", imgsz=640, stride=15, conf=0.2,
+        preset="veryfast", query_raw="q")
+    job = q.claim()
+
+    def fake_render(*args, **kwargs):
+        with open(out, "wb") as f:
+            f.write(b"x" * 2048)
+        return {}
+
+    fixes = [{"frame": 0, "box": [10, 20, 30, 40], "score": 0.9}]
+    calls = []
+
+    def fake_fix(_path, items, **kwargs):
+        calls.append(items)
+        return 1
+
+    monkeypatch.setattr(
+        "src.jobqueue.chunk_render.render_resumable", fake_render)
+    monkeypatch.setattr(
+        "src.jobqueue.face_audit.audit_faces",
+        lambda *a, **k: {"version": 2, "checked": 1, "suspicious": 1,
+                         "fixable": 1, "fixes": fixes, "frames": fixes})
+    monkeypatch.setattr(
+        "src.jobqueue.face_audit.fix_audited_faces", fake_fix)
+    monkeypatch.setattr("src.jobqueue.H.add", lambda **k: None)
+    q.run_job(job)
+    assert calls and calls[0] == fixes, calls
+    assert q.get(job_id)["status"] == "done"
+
+
 def test_queue_worker_completes_job_without_model():
     from unittest.mock import patch
     from src.jobqueue import RenderQueue
