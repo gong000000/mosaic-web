@@ -13,12 +13,14 @@
   전체 선택/해제. 차량동승자는 UI에서 제거(얼굴이 동승자 얼굴 포함)
 - 렌더: SQLite 지속형 큐 + Streamlit과 분리된 워커 프로세스,
   계정별 대기 순번, 최대 2계정 동시 렌더, 작업별 카드/진행률/취소/재시도
+- 긴 영상: `MOSAIC_CHUNK_SEC`(기본 120초) 단위 구간 렌더 + 완료 구간
+  체크포인트. preemption/재시작 시 끝난 구간을 건너뛰고 이어서 렌더
 - 계정/기록: `users.db`, `outputs/jobs.db`(SQLite), 결과 보관 24시간/500개/20GB
 - 배포: Modal, `gpu=["L4", "T4"]` (L4 우선, 용량 없으면 T4)
 
 ## 검증 결과
 
-- `pytest tests`: **54 passed**
+- `pytest tests`: **57 passed**
 - `scripts/apptest.py`: **APPTEST_PASS**
   - 얼굴, 번호판, 못 찾은 영역, **그룹 전환**, 2작업 등록/두 번째 취소
 - `scripts/qualitytest.py`: **QUALITY_TEST_PASS**
@@ -32,6 +34,8 @@
     진행률 증가 확인. `asd123`의 다음 작업은 계정 순번 2로 대기.
   - 같은 날 GPU preemption으로 컨테이너가 재시작된 뒤, 새 컨테이너에서
     running 작업을 queued로 복구하고 다시 처리하는 것을 확인.
+  - 구간 체크포인트: 1번 구간 완료 후 인위적 실패 → 재실행 시 0번 구간을
+    건너뛰고 1번부터 렌더, 최종 영상 프레임 수 유지 확인.
 - 카테고리 분리 확인
   - 합성 택배 송장: `address`로 검출, `signboard` 오검출 없음
   - street 프레임: `signboard` 검출, 문서 텍스트와 분리
@@ -61,6 +65,9 @@
   유지/재기동한다.
 - 15분 이상 진행률이 멈춘 작업은 워커 프로세스를 재시작해 고착을 푼다
   (`MOSAIC_JOB_STALE_SEC`).
+- 긴 영상은 키프레임 단위 구간으로 나눠 렌더하고, 완료 구간을
+  `.chunks/<token>/state.json`에 기록한다. preemption/재시작 시 완료
+  구간을 건너뛰고 남은 구간부터 이어서 렌더한다(`MOSAIC_CHUNK_SEC`).
 - 순번은 계정별로 계산하고, 계정당 1개·서버 전체 최대 2개를 동시에
   처리한다.
 
@@ -86,6 +93,7 @@
 - `src/pipeline.py`: 2패스 렌더, 얼굴/번호판/영역 처리
 - `src/jobqueue.py`: SQLite 큐, 계정별 스케줄러, 리스/heartbeat, 취소/재시도
 - `src/worker.py`: Streamlit과 분리된 큐 워커 프로세스/감시
+- `src/chunk_render.py`: 긴 영상 구간 렌더/체크포인트/이어 붙이기
 - `src/faces.py`, `src/face_mesh.py`: 얼굴 검출/추적/외곽
 - `src/plates.py`, `src/texts.py`: 번호판, EAST 주소/간판
 - `src/history.py`, `src/retention.py`: 기록/보관 정책

@@ -86,6 +86,10 @@
      최대 2개 계정 작업을 동시에 처리합니다(`MOSAIC_MAX_PARALLEL`).
      진행률이 15분 이상 갱신되지 않는 작업은 워커를 재시작해 고착을
      풉니다(`MOSAIC_JOB_STALE_SEC`).
+   - 2분이 넘는 긴 영상은 키프레임 단위 구간으로 나눠 렌더링하고, 끝난
+     구간은 체크포인트에 저장합니다. preemption/재시작 시 완료 구간을
+     건너뛰고 남은 구간부터 이어서 렌더합니다(`MOSAIC_CHUNK_SEC`, 기본
+     120초).
    - `모자이크 시작`은 작업을 큐에 넣고 즉시 돌아옵니다. 여러 번 누르면
      `작업 진행 · 결과`에 1번째/2번째/3번째 카드가 생기고, 각 카드에서 진행률을
      보거나 **취소**할 수 있습니다. 완료된 카드 아래에 미리보기와 다운로드가
@@ -201,6 +205,9 @@ modal deploy modal_app.py
   같은 계정의 작업은 등록 순서대로 하나씩 처리됩니다.
 - `MOSAIC_JOB_STALE_SEC`(기본 900초) 동안 진행률이 갱신되지 않으면 워커
   프로세스를 재시작해 멈춘 작업을 정리합니다.
+- `MOSAIC_CHUNK_SEC`(기본 120초)는 긴 영상을 나눠 렌더링하는 구간 길이입니다.
+  `0`이면 구간 분할/체크포인트를 끕니다. 끝난 구간은 결과 옆
+  `.chunks/`에 저장되며, 성공 시 자동 삭제됩니다.
 - `GEMINI_API_KEY`는 Modal Named Secret `mosaic-gemini`에서 읽습니다.
   `.env`를 들고 있는 PC 말고도 **Modal 로그인만 되어 있으면 배포할 수
   있습니다.** `.env`는 이미지에 포함되지 않고 커밋되지 않습니다.
@@ -366,6 +373,7 @@ src/render_service.py       체크리스트 → 렌더 요청 변환/서명/캐�
 src/render_queue.py         (구) 세션 내 렌더 직렬화
 src/jobqueue.py             지속형 렌더 작업 큐(SQLite) + 계정별 스케줄러
 src/worker.py               Streamlit과 분리된 큐 워커 프로세스/감시
+src/chunk_render.py         긴 영상 구간 렌더 + 완료 구간 체크포인트
 src/history.py              사용자별 결과 기록 (SQLite jobs.db)
 src/retention.py            보관/삭제 정책 (24시간·개수·용량)
 requirements.txt            CPU/headless 의존성

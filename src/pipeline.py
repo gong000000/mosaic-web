@@ -912,7 +912,8 @@ class MosaicJob:
                  region_priors=None, person_priors=None,
                  cache_path=None, use_cache=False,
                  vlm_call_limit=None, mask_all_persons=False,
-                 manual_regions=None, debug_path=None, cancel_fn=None):
+                 manual_regions=None, debug_path=None, cancel_fn=None,
+                 mux_audio=True):
         self.input_path = input_path
         self.output_path = output_path
         self.targets = ([targets] if isinstance(targets, str)
@@ -942,6 +943,7 @@ class MosaicJob:
         self.manual_regions = normalize_regions(manual_regions)
         self.debug_path = debug_path or None
         self.cancel_fn = cancel_fn
+        self.mux_audio = bool(mux_audio)
 
     def _open_debug_writer(self, width, height, fps, audio_src=None):
         """디버그 영상은 최종 결과와 분리해 별도 파일로 저장한다."""
@@ -1229,7 +1231,8 @@ class MosaicJob:
 
             try:
                 writer = FFmpegFrameWriter(
-                    output_path, W, H, fps, audio_src=input_path,
+                    output_path, W, H, fps,
+                    audio_src=input_path if self.mux_audio else None,
                     preset=preset)
             except Exception:
                 writer = None
@@ -1510,8 +1513,12 @@ class MosaicJob:
         else:
             out.release()
             try:
-                mux_audio_h264(tmp_noaudio, input_path, output_path,
-                               preset=preset)
+                if self.mux_audio:
+                    mux_audio_h264(tmp_noaudio, input_path, output_path,
+                                   preset=preset)
+                else:
+                    cleanup_tmp(output_path)
+                    shutil.copy(tmp_noaudio, output_path)
             except Exception:
                 cleanup_tmp(output_path)
                 shutil.copy(tmp_noaudio, output_path)
@@ -2114,7 +2121,8 @@ class MosaicJob:
         out = None
         try:
             writer = FFmpegFrameWriter(
-                self.output_path, p.W, p.H, p.fps, audio_src=self.input_path,
+                self.output_path, p.W, p.H, p.fps,
+                audio_src=self.input_path if self.mux_audio else None,
                 preset=self.encode_preset)
         except Exception:
             writer = None
@@ -2131,8 +2139,13 @@ class MosaicJob:
         else:
             out.release()
             try:
-                mux_audio_h264(tmp_noaudio, self.input_path, self.output_path,
-                               preset=self.encode_preset)
+                if self.mux_audio:
+                    mux_audio_h264(tmp_noaudio, self.input_path,
+                                   self.output_path,
+                                   preset=self.encode_preset)
+                else:
+                    cleanup_tmp(self.output_path)
+                    shutil.copy(tmp_noaudio, self.output_path)
             except Exception:
                 cleanup_tmp(self.output_path)
                 shutil.copy(tmp_noaudio, self.output_path)
@@ -2783,7 +2796,8 @@ def mosaic_video(input_path, output_path, targets=None, invert=False,
                  vlm_base_url=None, region_priors=None, person_priors=None,
                  cache_path=None, use_cache=False,
                  vlm_call_limit=None, mask_all_persons=False,
-                 manual_regions=None, debug_path=None, cancel_fn=None):
+                 manual_regions=None, debug_path=None, cancel_fn=None,
+                 mux_audio=True):
     """호환 래퍼."""
     job = MosaicJob(input_path, output_path, targets=targets, invert=invert,
                     conf=conf, model_name=model_name, imgsz=imgsz,
@@ -2798,5 +2812,6 @@ def mosaic_video(input_path, output_path, targets=None, invert=False,
                     vlm_call_limit=vlm_call_limit,
                     mask_all_persons=mask_all_persons,
                     manual_regions=manual_regions,
-                    debug_path=debug_path, cancel_fn=cancel_fn)
+                    debug_path=debug_path, cancel_fn=cancel_fn,
+                    mux_audio=mux_audio)
     return job.run(progress_fn)

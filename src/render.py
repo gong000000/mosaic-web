@@ -272,16 +272,25 @@ def refine_mask_alpha(mask_prob, width, height, erode=1):
     return np.minimum(soft, core)
 
 
-def mux_audio_h264(video_noaudio, audio_src, output_path, preset="veryfast"):
+def mux_audio_h264(video_noaudio, audio_src, output_path, preset="veryfast",
+                   copy_video=False):
     """무음 영상에 원본 오디오를 입혀 H.264 MP4로 저장한다.
-    실패하면 RuntimeError를 내서 호출부가 원본(무음)으로 대체하게 한다."""
+
+    copy_video=True면 이미 H.264인 영상 스트림을 재인코딩하지 않고 복사한다.
+    실패하면 RuntimeError를 내서 호출부가 원본(무음)으로 대체하게 한다.
+    """
     ff = imageio_ffmpeg.get_ffmpeg_exe()
     cleanup_tmp(output_path)
     cmd = [ff, "-y", "-i", video_noaudio, "-i", audio_src,
-           "-c:v", "libx264", "-preset", preset, "-crf", "20",
-           "-pix_fmt", "yuv420p", "-profile:v", "main", "-bf", "0",
-           "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-           "-c:a", "aac", "-shortest", "-movflags", "+faststart", output_path]
+           "-map", "0:v:0", "-map", "1:a?", "-c:a", "aac",
+           "-shortest", "-movflags", "+faststart"]
+    if copy_video:
+        cmd += ["-c:v", "copy"]
+    else:
+        cmd += ["-c:v", "libx264", "-preset", preset, "-crf", "20",
+                "-pix_fmt", "yuv420p", "-profile:v", "main", "-bf", "0",
+                "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]
+    cmd.append(output_path)
     r = _run_ffmpeg(cmd, "오디오 믹싱")
     if (r.returncode != 0 or not os.path.exists(output_path)
             or os.path.getsize(output_path) == 0):
@@ -368,6 +377,95 @@ def trim_video(input_path, output_path, start_sec=0.0, end_sec=None):
             or os.path.getsize(output_path) == 0):
         cleanup_tmp(output_path)
         raise RuntimeError("ffmpeg 구간 자르기 실패")
+    return output_path
+
+
+def segment_video(input_path, out_dir, seconds, pattern="part%04d.mp4"):
+    """영상을 키프레임 단위 구간 파일로 나눈다(스트림 복사, 재인코딩 없음).
+
+    returns: [(구간 파일 경로, 시작 초, 끝 초), ...]
+    """
+    import csv
+    import glob
+
+    seconds = max(1.0, float(seconds))
+    os.makedirs(out_dir, exist_ok=True)
+    for old in glob.glob(os.path.join(out_dir, "part*.mp4")):
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    list_path = os.path.join(out_dir, "segments.csv")
+    try:
+        os.remove(list_path)
+    except OSError:
+        pass
+    ff = imageio_ffmpeg.get_ffmpeg_exe()
+    cmd = [ff, "-y", "-i", input_path, "-map", "0:v:0", "-c", "copy",
+           "-f", "segment", "-segment_time", f"{seconds:.3f}",
+           "-reset_timestamps", "1",
+           "-segment_list", list_path, "-segment_list_type", "csv",
+           os.path.join(out_dir, pattern)]
+    r = _run_ffmpeg(cmd, "영상 분할")
+    if r.returncode != 0 or not os.path.exists(list_path):
+        raise RuntimeError("ffmpeg 영상 분할 실패")
+    rows = []
+    with open(list_path, "r", encoding="utf-8") as f:
+        for row in csv.reader(f):
+            if len(row) < 3:
+                continue
+            path = row[0]
+            if not os.path.isabs(path):
+                path = os.path.join(out_dir, path)
+            if not os.path.exists(path) or os.path.getsize(path) == 0:
+                continue
+            try:
+                rows.append((path, float(row[1]), float(row[2])))
+            except (TypeError, ValueError):
+                continue
+    if not rows:
+        raise RuntimeError("분할된 영상 구간이 없습니다.")
+    return rows
+
+
+def concat_videos(paths, output_path, preset="veryfast"):
+    """같은 인코딩의 구간 영상을 이어 붙인다. 실패하면 재인코딩한다."""
+    paths = [p for p in (paths or []) if p and os.path.exists(p)]
+    if not paths:
+        raise RuntimeError("이어 붙일 영상 구간이 없습니다.")
+    list_path = output_path + ".concat.txt"
+    with open(list_path, "w", encoding="utf-8") as f:
+        for p in paths:
+            # ffmpeg concat demuxer는 작은따옴표를 \'로 이스케이프한다.
+            safe = os.path.abspath(p).replace("\\", "/").replace("'", "'\\''")
+            f.write(f"file '{safe}'\n")
+    ff = imageio_ffmpeg.get_ffmpeg_exe()
+    cleanup_tmp(output_path)
+    cmd = [ff, "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+           "-c", "copy", "-movflags", "+faststart", output_path]
+    r = _run_ffmpeg(cmd, "영상 이어 붙이기")
+    if (r.returncode == 0 and os.path.exists(output_path)
+            and os.path.getsize(output_path) > 0):
+        try:
+            os.remove(list_path)
+        except OSError:
+            pass
+        return output_path
+    # 구간 인코딩 파라미터가 미세하게 다르면 copy concat이 실패할 수 있다.
+    cleanup_tmp(output_path)
+    cmd = [ff, "-y", "-f", "concat", "-safe", "0", "-i", list_path,
+           "-c:v", "libx264", "-preset", preset, "-crf", "20",
+           "-pix_fmt", "yuv420p", "-profile:v", "main", "-bf", "0",
+           "-an", "-movflags", "+faststart", output_path]
+    r = _run_ffmpeg(cmd, "영상 이어 붙이기(재인코딩)")
+    try:
+        os.remove(list_path)
+    except OSError:
+        pass
+    if (r.returncode != 0 or not os.path.exists(output_path)
+            or os.path.getsize(output_path) == 0):
+        cleanup_tmp(output_path)
+        raise RuntimeError("ffmpeg 영상 이어 붙이기 실패")
     return output_path
 
 

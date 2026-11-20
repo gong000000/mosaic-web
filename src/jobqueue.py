@@ -25,6 +25,7 @@ from .errors import RenderCancelled
 from .render import strip_audio
 from .render_service import MosaicSettings, RenderPlan
 from . import history as H
+from . import chunk_render
 
 log = logging.getLogger("mosaic.jobqueue")
 
@@ -387,8 +388,8 @@ class RenderQueue:
 
             if self.is_cancel_requested(job_id):
                 raise RenderCancelled()
-            stats = plan.render(
-                job["input_path"], output_path,
+            stats = chunk_render.render_resumable(
+                plan, job["input_path"], output_path,
                 model_name=payload.get("model_name") or "yolo11m-seg.pt",
                 imgsz=int(payload.get("imgsz") or 960),
                 stride=int(payload.get("stride") or 15),
@@ -399,7 +400,7 @@ class RenderQueue:
                 api_key=env_api_key(),
                 vlm_model=payload.get("vlm_model") or VLM_MODEL,
                 vlm_base_url=payload.get("vlm_base_url") or GEMINI_BASE_URL,
-                use_cache=False, vlm_call_limit=0,
+                final_mux_audio=not bool(payload.get("strip_audio")),
                 cancel_fn=lambda: self.is_cancel_requested(job_id))
             if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
                 raise RuntimeError("결과 영상이 만들어지지 않았습니다.")
@@ -524,6 +525,7 @@ class RenderQueue:
                 if time.time() - last_cleanup > 3600:
                     self.cleanup_finished_inputs()
                     self.cleanup_failed_inputs()
+                    chunk_render.cleanup_stale_chunks()
                     last_cleanup = time.time()
                 job = self.claim()
                 if job is None:
