@@ -24,11 +24,10 @@
 - `scripts/robustness.py`: **ROBUSTNESS_PASS**
 - live E2E (실제 Gemini)
   - face · 얼굴만: 분석 32.6초 / 렌더 19.2초
-  - street · 텍스트·문서+간판: 분석 40.8초 / 렌더 23.9초
-  - street · 얼굴+번호판+텍스트·문서: 분석 27.2초 / 렌더 47.5초
   - NY · 얼굴+번호판: 분석 21.4초 / 렌더 195.0초
-  - live T4 AppTest: face-flow, queue-cancel, plate-flow,
-    missing-region, preset-switch 모두 PASS
+  - live T4 얼굴/queue-cancel: PASS (그룹 UI 적용 전)
+  - 새 그룹 UI는 local AppTest로 검증. live 재검증은 실제 사용자 큐가
+    비었을 때 다시 실행한다.
 - 카테고리 분리 확인
   - 합성 택배 송장: `address`로 검출, `signboard` 오검출 없음
   - street 프레임: `signboard` 검출, 문서 텍스트와 분리
