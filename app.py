@@ -33,6 +33,11 @@ from src import jobqueue as JQ
 from src import retention as RT
 from src.auth import require_login
 
+ADMIN_USERS = {
+    u.strip() for u in os.environ.get("MOSAIC_ADMIN_USERS", "").split(",")
+    if u.strip()
+}
+
 # blur.me 스튜디오처럼 항상 빠른 고정 설정을 쓴다.
 # GPU(L4)에서는 yolo11m-seg + 960px가 충분히 빠르고, 사람 마스크 경계가
 # n/640보다 훨씬 정밀하다. 테스트/저사양 환경은 환경변수로 낮출 수 있다.
@@ -239,6 +244,14 @@ def _fmt_size(path):
     return f"{size / 1024:.0f} KB"
 
 
+def _job_audit(job):
+    try:
+        data = json.loads(job.get("audit") or "{}")
+        return data if isinstance(data, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
 def _job_status_label(job):
     status = job.get("status")
     if status == "queued":
@@ -304,6 +317,21 @@ def _render_job_card(job, pos, user):
                 job.get("summary") or "", _fmt_size(out)) if part)
             if detail:
                 st.caption(detail)
+            audit = _job_audit(job)
+            if audit.get("checked"):
+                checked = int(audit.get("checked") or 0)
+                suspicious = int(audit.get("suspicious") or 0)
+                fixed = int(audit.get("fixed") or 0)
+                passed = max(0, checked - suspicious)
+                if suspicious:
+                    text = f"얼굴 마스크 점검: {passed}/{checked}"
+                    if fixed:
+                        text += f" · 자동 보정 {fixed}개"
+                    st.warning(text + " · 확인이 필요합니다.")
+                else:
+                    st.caption(f"✅ 얼굴 마스크 점검: {passed}/{checked}")
+            elif audit.get("error"):
+                st.caption(f"얼굴 마스크 점검 실패: {audit.get('error')}")
             out_name = os.path.basename(out)
 
             def _after_download(jid=jid, name=out_name, path=out):
@@ -457,6 +485,85 @@ def _render_checklist(items, analysis_id, preset_cats):
     return selected
 
 
+def _fmt_age(sec):
+    try:
+        sec = max(0, int(float(sec)))
+    except (TypeError, ValueError):
+        return "-"
+    if sec < 60:
+        return f"{sec}초"
+    if sec < 3600:
+        return f"{sec // 60}분"
+    return f"{sec // 3600}시간 {(sec % 3600) // 60}분"
+
+
+def _fmt_bytes(value):
+    try:
+        value = max(0, int(value))
+    except (TypeError, ValueError):
+        return "-"
+    if value >= 1024 ** 3:
+        return f"{value / (1024 ** 3):.2f} GB"
+    if value >= 1024 ** 2:
+        return f"{value / (1024 ** 2):.1f} MB"
+    return f"{value / 1024:.0f} KB"
+
+
+@st.fragment(run_every=5.0)
+def _render_admin_status():
+    try:
+        snap = JQ.status_snapshot()
+    except Exception as e:
+        st.error(f"상태 조회 실패: {e}")
+        return
+    counts = snap.get("counts") or {}
+    c1, c2, c3 = st.columns(3)
+    c1.metric("렌더 중", int(counts.get("running", 0)))
+    c2.metric("대기", int(counts.get("queued", 0)))
+    c3.metric("동시 한도", int(snap.get("max_parallel") or 0))
+    age = snap.get("worker_age")
+    if age is None:
+        st.error("워커 heartbeat 없음")
+    elif float(age) > 30:
+        st.warning(f"워커 heartbeat 지연 · {_fmt_age(age)}")
+    else:
+        st.caption(f"워커 정상 · heartbeat {_fmt_age(age)} 전")
+    if snap.get("oldest_queued_age") is not None:
+        st.caption(f"가장 오래된 대기: {_fmt_age(snap['oldest_queued_age'])}")
+    stale = snap.get("stale")
+    if stale:
+        st.error(
+            f"무응답 의심 #{stale.get('id')} · {_fmt_age(
+                time.time() - float(stale.get('updated') or 0))}째 진행 없음")
+    active = snap.get("active") or []
+    if active:
+        rows = []
+        now = time.time()
+        for job in active:
+            rows.append({
+                "#": job.get("id"),
+                "아이디": job.get("user"),
+                "상태": job.get("status"),
+                "진행률": f"{float(job.get('progress') or 0) * 100:.0f}%",
+                "경과": _fmt_age(
+                    now - float(job.get("created") or now)),
+            })
+        st.dataframe(rows, hide_index=True, width="stretch")
+    else:
+        st.caption("진행 중 작업 없음")
+    failures = snap.get("failures") or []
+    if failures:
+        with st.expander(f"최근 실패 {len(failures)}개"):
+            for job in failures:
+                st.caption(
+                    f"#{job.get('id')} · {job.get('user')} · "
+                    f"{(job.get('error') or '')[:160]}")
+    st.caption(
+        f"구간 체크포인트 {int(snap.get('chunk_dirs') or 0)}개 · "
+        f"{_fmt_bytes(snap.get('chunk_bytes'))} · "
+        f"디스크 여유 {_fmt_bytes(snap.get('disk_free'))}")
+
+
 if not st.session_state.get("tmp_swept"):
     _sweep_old_temp_dirs(RT.RETENTION_HOURS)
     st.session_state["tmp_swept"] = True
@@ -491,6 +598,10 @@ with st.sidebar:
             shutil.rmtree(tmp_dir, ignore_errors=True)
         st.session_state.clear()
         st.rerun()
+
+    if current_user in ADMIN_USERS:
+        with st.expander("🛠 서버 상태 (관리자)", expanded=False):
+            _render_admin_status()
 
     st.header("설정")
 

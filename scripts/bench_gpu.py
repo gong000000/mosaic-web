@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -32,6 +33,7 @@ def main():
     ap.add_argument("--stride", type=int, default=15)
     ap.add_argument("--conf", type=float, default=0.20)
     ap.add_argument("--area-mode", default="face_only")
+    ap.add_argument("--concurrency", type=int, default=1)
     ap.add_argument("--keep", action="store_true")
     args = ap.parse_args()
 
@@ -56,22 +58,47 @@ def main():
 
     th = threading.Thread(target=sample, daemon=True)
     th.start()
-    t0 = time.time()
-    try:
+    targets = [x.strip() for x in args.targets.split(",") if x.strip()]
+    n = max(1, int(args.concurrency))
+
+    def run_one(index):
+        out = (args.output if n == 1
+               else f"{args.output}.{index}.mp4")
+        started = time.time()
         stats = MosaicJob(
-            args.input, args.output,
-            targets=[x.strip() for x in args.targets.split(",") if x.strip()],
+            args.input, out, targets=targets,
             model_name=args.model, imgsz=args.imgsz,
             keyframe_stride=args.stride,
             conf=args.conf, area_mode=args.area_mode,
-            mask_all_persons=True).run()
+            mask_all_persons=True, vlm_call_limit=0,
+            api_key="bench").run()
+        elapsed = time.time() - started
+        cap = cv2.VideoCapture(out)
+        frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        cap.release()
+        if not args.keep:
+            try:
+                os.remove(out)
+            except OSError:
+                pass
+        return {
+            "index": index,
+            "elapsed_sec": round(elapsed, 2),
+            "frames": frames,
+            "fps": round(frames / max(0.01, elapsed), 2),
+            "regions": stats.get("_regions"),
+            "faces": stats.get("_faces"),
+        }
+
+    t0 = time.time()
+    try:
+        with ThreadPoolExecutor(max_workers=n) as pool:
+            jobs = list(pool.map(run_one, range(n)))
     finally:
         stop.set()
         th.join(timeout=2)
-    elapsed = time.time() - t0
-    cap = cv2.VideoCapture(args.output)
-    frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    cap.release()
+    wall = time.time() - t0
+    total_frames = sum(j["frames"] for j in jobs)
     try:
         torch.cuda.synchronize()
         alloc = torch.cuda.max_memory_allocated() / (1024 ** 3)
@@ -80,20 +107,17 @@ def main():
         alloc, gpu = 0.0, "cpu"
     result = {
         "gpu": gpu,
-        "elapsed_sec": round(elapsed, 2),
-        "frames": frames,
-        "fps": round(frames / max(0.01, elapsed), 2),
+        "concurrency": n,
+        "wall_sec": round(wall, 2),
+        "total_frames": total_frames,
+        "aggregate_fps": round(total_frames / max(0.01, wall), 2),
+        "per_job_fps_avg": round(
+            sum(j["fps"] for j in jobs) / max(1, len(jobs)), 2),
         "peak_vram_mb_nvidia_smi": int(peak[0]),
         "peak_torch_alloc_gb": round(alloc, 2),
-        "regions": stats.get("_regions"),
-        "faces": stats.get("_faces"),
+        "jobs": jobs,
     }
     print(json.dumps(result, ensure_ascii=False))
-    if not args.keep:
-        try:
-            os.remove(args.output)
-        except OSError:
-            pass
     return 0
 
 

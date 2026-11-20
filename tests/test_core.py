@@ -554,6 +554,30 @@ def test_queue_five_accounts_and_per_account_order():
     assert nxt["id"] == u6
 
 
+def test_queue_status_snapshot_and_audit():
+    from src.jobqueue import RenderQueue
+    from src.render_service import MosaicSettings
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, "in.mp4")
+    with open(src, "wb") as f:
+        f.write(b"video")
+    q = RenderQueue(db_path=os.path.join(d, "jobs.db"),
+                    input_dir=os.path.join(d, "inputs"), max_parallel=3)
+    job_id = q.enqueue(
+        user="alice", input_path=src,
+        output_path=os.path.join(d, "out.mp4"), items=[],
+        selected_cats=["face"], settings=MosaicSettings(),
+        model_name="yolo11n-seg.pt", imgsz=640, stride=15, conf=0.2,
+        preset="veryfast", query_raw="q")
+    snap = q.status_snapshot()
+    assert snap["counts"]["queued"] == 1
+    assert snap["max_parallel"] == 3
+    assert snap["active"][0]["id"] == job_id
+    q.set_audit(job_id, {"checked": 10, "suspicious": 0, "fixable": 0})
+    import json
+    assert json.loads(q.get(job_id)["audit"])["checked"] == 10
+
+
 def test_thread_local_models_are_isolated(monkeypatch):
     from src import models
     seen = {}

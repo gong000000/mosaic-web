@@ -26,6 +26,7 @@ from .render import strip_audio
 from .render_service import MosaicSettings, RenderPlan
 from . import history as H
 from . import chunk_render
+from . import face_audit
 
 log = logging.getLogger("mosaic.jobqueue")
 
@@ -44,7 +45,8 @@ CREATE TABLE IF NOT EXISTS render_jobs (
     summary TEXT NOT NULL DEFAULT '',
     error TEXT NOT NULL DEFAULT '',
     cancel_requested INTEGER NOT NULL DEFAULT 0,
-    updated REAL NOT NULL DEFAULT 0
+    updated REAL NOT NULL DEFAULT 0,
+    audit TEXT NOT NULL DEFAULT ''
 )
 """
 
@@ -129,6 +131,9 @@ class RenderQueue:
             if "updated" not in cols:
                 c.execute("ALTER TABLE render_jobs ADD COLUMN "
                           "updated REAL NOT NULL DEFAULT 0")
+            if "audit" not in cols:
+                c.execute("ALTER TABLE render_jobs ADD COLUMN "
+                          "audit TEXT NOT NULL DEFAULT ''")
             c.execute("CREATE INDEX IF NOT EXISTS idx_render_jobs_status "
                       "ON render_jobs(status, id)")
             # 워커가 여러 프로세스/컨테이너에서 중복 실행되지 않도록
@@ -218,6 +223,66 @@ class RenderQueue:
                 "SELECT COUNT(*) FROM render_jobs WHERE status IN "
                 "('queued','running')").fetchone()[0]
         return int(n) > 0
+
+    def status_snapshot(self):
+        """관리자 상태 페이지용 큐/워커/보관 현황."""
+        now = time.time()
+        with self._db() as c:
+            counts = {str(r["status"]): int(r["n"]) for r in c.execute(
+                "SELECT status, COUNT(*) AS n FROM render_jobs "
+                "GROUP BY status")}
+            active = [dict(r) for r in c.execute(
+                "SELECT id,user,status,progress,created,started,updated,"
+                "output_path,error FROM render_jobs WHERE status IN "
+                "('queued','running') ORDER BY id").fetchall()]
+            failures = [dict(r) for r in c.execute(
+                "SELECT id,user,finished,error FROM render_jobs "
+                "WHERE status='failed' ORDER BY id DESC LIMIT 10").fetchall()]
+            worker = c.execute(
+                "SELECT owner,heartbeat FROM queue_worker WHERE id=1"
+            ).fetchone()
+            oldest = c.execute(
+                "SELECT MIN(created) FROM render_jobs WHERE status='queued'"
+            ).fetchone()[0]
+            stale = c.execute(
+                "SELECT id,user,progress,updated FROM render_jobs "
+                "WHERE status='running' AND updated>0 AND updated<? "
+                "ORDER BY id LIMIT 1", (now - 900.0,)).fetchone()
+        chunk_base = os.path.join(OUTPUT_DIR, ".chunks")
+        chunk_bytes = 0
+        chunk_dirs = 0
+        if os.path.isdir(chunk_base):
+            for name in os.listdir(chunk_base):
+                path = os.path.join(chunk_base, name)
+                if not os.path.isdir(path):
+                    continue
+                chunk_dirs += 1
+                for root, _dirs, files in os.walk(path):
+                    for fname in files:
+                        try:
+                            chunk_bytes += os.path.getsize(
+                                os.path.join(root, fname))
+                        except OSError:
+                            pass
+        try:
+            disk = shutil.disk_usage(OUTPUT_DIR)
+            disk_free = int(disk.free)
+        except OSError:
+            disk_free = 0
+        heartbeat = float(worker["heartbeat"] or 0) if worker else 0.0
+        return {
+            "counts": counts,
+            "active": active,
+            "failures": failures,
+            "max_parallel": int(self.max_parallel),
+            "worker_owner": (worker["owner"] if worker else ""),
+            "worker_age": (now - heartbeat if heartbeat else None),
+            "oldest_queued_age": (now - float(oldest)) if oldest else None,
+            "stale": dict(stale) if stale else None,
+            "chunk_dirs": int(chunk_dirs),
+            "chunk_bytes": int(chunk_bytes),
+            "disk_free": int(disk_free),
+        }
 
     def acquire_worker(self, owner, ttl=20.0):
         """워커 리스를 잡는다. 다른 워커가 살아 있으면 False."""
@@ -339,6 +404,15 @@ class RenderQueue:
                 "ORDER BY id LIMIT 1", (cutoff,)).fetchone()
         return dict(row) if row else None
 
+    def set_audit(self, job_id, audit):
+        try:
+            raw = json.dumps(audit or {}, ensure_ascii=False)
+        except (TypeError, ValueError):
+            raw = "{}"
+        with self._db() as c:
+            c.execute("UPDATE render_jobs SET audit=? WHERE id=?",
+                      (raw, int(job_id)))
+
     def finish(self, job_id, status, summary="", error=""):
         with self._db() as c:
             c.execute(
@@ -404,9 +478,39 @@ class RenderQueue:
                 cancel_fn=lambda: self.is_cancel_requested(job_id))
             if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
                 raise RuntimeError("결과 영상이 만들어지지 않았습니다.")
+            selected = payload.get("selected_cats") or []
+            if ("face" in selected
+                    and os.environ.get("MOSAIC_FACE_AUDIT", "1") != "0"):
+                self.update_progress(job_id, 0.99)
+                try:
+                    audit = face_audit.audit_faces(
+                        job["input_path"], output_path,
+                        cancel_fn=lambda: self.is_cancel_requested(job_id))
+                    if (audit.get("fixable")
+                            and os.environ.get(
+                                "MOSAIC_FACE_AUDIT_FIX", "1") != "0"):
+                        fixed = face_audit.fix_audited_faces(
+                            output_path, audit.get("fixable") or [],
+                            style=plan.settings.style,
+                            blocks=plan.settings.blocks,
+                            blur=plan.settings.blur,
+                            preset=payload.get("preset") or "veryfast",
+                            strip_audio=bool(payload.get("strip_audio")))
+                        audit["fixed"] = int(fixed)
+                    if audit.get("checked") or audit.get("error"):
+                        self.set_audit(job_id, audit)
+                except RenderCancelled:
+                    raise
+                except Exception as e:
+                    log.exception("얼굴 마스크 자동 점검 실패")
+                    try:
+                        self.set_audit(job_id, {
+                            "checked": 0, "suspicious": 0, "fixable": 0,
+                            "error": f"{type(e).__name__}: {e}"})
+                    except Exception:
+                        pass
             if payload.get("strip_audio"):
                 strip_audio(output_path)
-            selected = payload.get("selected_cats") or []
             person_selected = any(CATEGORY_TYPE.get(c) == "person"
                                   for c in selected)
             face_count = (payload.get("person_total")
@@ -645,6 +749,10 @@ def start_worker(count=None):
 
 def has_active_jobs():
     return _QUEUE.has_active_jobs()
+
+
+def status_snapshot():
+    return _QUEUE.status_snapshot()
 
 
 def enqueue(**kwargs):

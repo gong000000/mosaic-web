@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 import cv2
 import imageio_ffmpeg
+import numpy as np
 import pytest
 
 from src.chunk_render import (_auto_chunk_seconds, _shift_manual,
@@ -81,6 +82,38 @@ def test_shift_manual_region_times():
     assert local and local[0]["t0"] == 0.0
     assert local[0]["t1"] == 10.0
     assert _shift_manual(rows, start_sec=30.0, duration_sec=10.0) == []
+
+
+def test_face_audit_detects_and_fixes_unmasked(tmp_path, monkeypatch):
+    from src import face_audit
+    from src.faces import FaceBox
+
+    src = tmp_path / "in.mp4"
+    out = tmp_path / "out.mp4"
+    writer = cv2.VideoWriter(str(src), cv2.VideoWriter_fourcc(*"mp4v"),
+                             10, (160, 120))
+    assert writer.isOpened()
+    for _ in range(10):
+        frame = np.zeros((120, 160, 3), np.uint8)
+        frame[30:70, 50:90] = (0, 0, 255)
+        writer.write(frame)
+    writer.release()
+    shutil.copyfile(src, out)
+
+    monkeypatch.setattr(
+        face_audit, "detect_faces_rotated",
+        lambda frame, **kwargs: [(FaceBox([50, 30, 90, 70]), 0.95)])
+    before = face_audit.audit_faces(str(src), str(out))
+    assert before["checked"] == 10
+    assert before["suspicious"] == 10
+    assert before["fixable"] == 10
+
+    fixed = face_audit.fix_audited_faces(
+        str(out), before["fixes"], style="pixel", blocks=30, blur=61)
+    assert fixed == 10
+    after = face_audit.audit_faces(str(src), str(out))
+    assert after["checked"] == 10
+    assert after["suspicious"] == 0
 
 
 def test_chunked_render_resumes_completed_chunks(tmp_path, monkeypatch):

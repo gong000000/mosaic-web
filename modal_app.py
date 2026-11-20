@@ -167,7 +167,8 @@ def queue_keepalive():
     max_containers=1,
     volumes={DATA_DIR: data_volume},
     # GEMINI_API_KEY 는 Modal Named Secret(mosaic-gemini) 에서 읽는다.
-    secrets=[modal.Secret.from_name("mosaic-gemini")],
+    secrets=[modal.Secret.from_name("mosaic-gemini"),
+             modal.Secret.from_name("mosaic-admin")],
     env={
         "MOSAIC_DATA_DIR": DATA_DIR,
         "MOSAIC_SKIP_DOTENV": "1",
