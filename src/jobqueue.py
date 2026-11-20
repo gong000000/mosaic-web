@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS render_jobs (
     payload TEXT NOT NULL DEFAULT '{}',
     summary TEXT NOT NULL DEFAULT '',
     error TEXT NOT NULL DEFAULT '',
-    cancel_requested INTEGER NOT NULL DEFAULT 0
+    cancel_requested INTEGER NOT NULL DEFAULT 0,
+    updated REAL NOT NULL DEFAULT 0
 )
 """
 
@@ -124,6 +125,9 @@ class RenderQueue:
             if "cancel_requested" not in cols:
                 c.execute("ALTER TABLE render_jobs ADD COLUMN "
                           "cancel_requested INTEGER NOT NULL DEFAULT 0")
+            if "updated" not in cols:
+                c.execute("ALTER TABLE render_jobs ADD COLUMN "
+                          "updated REAL NOT NULL DEFAULT 0")
             c.execute("CREATE INDEX IF NOT EXISTS idx_render_jobs_status "
                       "ON render_jobs(status, id)")
             # 워커가 여러 프로세스/컨테이너에서 중복 실행되지 않도록
@@ -305,9 +309,10 @@ class RenderQueue:
             if row is None:
                 return None
             job_id = int(row["id"])
+            now = time.time()
             c.execute("UPDATE render_jobs SET status='running', started=?, "
-                      "progress=0, error='' WHERE id=?",
-                      (time.time(), job_id))
+                      "updated=?, progress=0, error='' WHERE id=?",
+                      (now, now, job_id))
             c.commit()
             job = c.execute("SELECT * FROM render_jobs WHERE id=?",
                             (job_id,)).fetchone()
@@ -316,18 +321,30 @@ class RenderQueue:
     def update_progress(self, job_id, frac):
         try:
             with self._db() as c:
-                c.execute("UPDATE render_jobs SET progress=? WHERE id=?",
-                          (min(1.0, max(0.0, float(frac))), int(job_id)))
+                c.execute("UPDATE render_jobs SET progress=?, updated=? "
+                          "WHERE id=?",
+                          (min(1.0, max(0.0, float(frac))), time.time(),
+                           int(job_id)))
         except Exception:
             pass
+
+    def stale_running(self, max_silence=900.0):
+        """진행률이 오랫동안 갱신되지 않은 running 작업을 돌려준다."""
+        cutoff = time.time() - max(1.0, float(max_silence))
+        with self._db() as c:
+            row = c.execute(
+                "SELECT id, user, progress, updated, started FROM render_jobs "
+                "WHERE status='running' AND updated>0 AND updated<? "
+                "ORDER BY id LIMIT 1", (cutoff,)).fetchone()
+        return dict(row) if row else None
 
     def finish(self, job_id, status, summary="", error=""):
         with self._db() as c:
             c.execute(
                 "UPDATE render_jobs SET status=?, finished=?, progress=?, "
-                "summary=?, error=? WHERE id=?",
+                "summary=?, error=?, updated=? WHERE id=?",
                 (status, time.time(), 1.0 if status == "done" else 0.0,
-                 summary, error[:2000], int(job_id)))
+                 summary, error[:2000], time.time(), int(job_id)))
 
     def recover_running(self):
         """이전 프로세스가 남긴 running 작업을 다시 queued로 되돌린다."""
@@ -526,6 +543,10 @@ _STOP = threading.Event()
 _LEASE_OWNER = uuid.uuid4().hex
 _LEASE_TTL = 20.0
 _LAST_LEASE_FAIL = 0.0
+try:
+    _STALE_SEC = float(os.environ.get("MOSAIC_JOB_STALE_SEC", "900"))
+except (TypeError, ValueError):
+    _STALE_SEC = 900.0
 
 
 def _worker_main():
@@ -554,6 +575,18 @@ def _supervisor():
                 log.warning("렌더 큐 리스를 다른 워커가 가져감")
                 _STOP.set()
                 return
+            if (_STALE_SEC > 0
+                    and os.environ.get("MOSAIC_QUEUE_WORKER") == "external"):
+                stale = _QUEUE.stale_running(_STALE_SEC)
+                if stale:
+                    # 스레드는 강제 종료할 수 없으므로 워커 프로세스를
+                    # 재시작한다. 새 프로세스가 running 작업을 queued로
+                    # 복구하고 다시 처리한다.
+                    log.error(
+                        "렌더 작업 #%s(%s)이 %.0f초 동안 진행되지 않아 "
+                        "워커를 재시작합니다",
+                        stale.get("id"), stale.get("user"), _STALE_SEC)
+                    os._exit(1)
             with _WORKER_LOCK:
                 for i, thread in enumerate(list(_WORKERS)):
                     if thread.is_alive():

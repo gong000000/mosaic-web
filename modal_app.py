@@ -28,6 +28,8 @@ DATA_DIR = "/data"
 PORT = 8501
 
 ROOT = Path(__file__).parent
+PUBLIC_URL = os.environ.get(
+    "MOSAIC_PUBLIC_URL", "https://gong000000--mosaic.us-east.modal.run")
 
 app = modal.App(APP_NAME)
 
@@ -103,6 +105,54 @@ image = (
 
 
 @app.function(
+    # DB만 읽고 health 요청만 보내므로 GPU/무거운 이미지가 필요 없다.
+    image=modal.Image.debian_slim(),
+    schedule=modal.Period(minutes=5),
+    timeout=120,
+    scaledown_window=10,
+    max_containers=1,
+    volumes={DATA_DIR: data_volume},
+    env={"MOSAIC_PUBLIC_URL": PUBLIC_URL},
+)
+def queue_keepalive():
+    """큐에 작업이 남아 있으면 웹 컨테이너를 깨운다.
+
+    GPU 컨테이너는 preemption될 수 있고, 브라우저가 닫혀 있으면 새 요청이
+    없다. 5분마다 큐를 확인해 health 요청을 보내므로 preemption 이후에도
+    작업이 영원히 멈춰 있지 않는다.
+    """
+    import sqlite3
+    import urllib.request
+
+    try:
+        data_volume.reload()
+    except Exception as e:
+        print(f"keepalive volume reload 실패: {e}", flush=True)
+    db = os.path.join(DATA_DIR, "outputs", "jobs.db")
+    try:
+        con = sqlite3.connect(db, timeout=5)
+        try:
+            active = con.execute(
+                "SELECT COUNT(*) FROM render_jobs "
+                "WHERE status IN ('queued','running')").fetchone()[0]
+        finally:
+            con.close()
+    except Exception as e:
+        print(f"keepalive queue read 실패: {e}", flush=True)
+        return
+    if not active:
+        return
+    try:
+        with urllib.request.urlopen(
+                PUBLIC_URL.rstrip("/") + "/_stcore/health",
+                timeout=30) as resp:
+            resp.read(64)
+        print(f"keepalive ping: active={active}", flush=True)
+    except Exception as e:
+        print(f"keepalive ping 실패: {e}", flush=True)
+
+
+@app.function(
     image=image,
     # L4를 우선 쓰되, 용량이 없으면 T4로 자동 대체한다.
     # (L4만 고정하면 Modal 용량이 없을 때 앱이 계속 로딩 상태로 남는다.)
@@ -129,7 +179,7 @@ image = (
         "MOSAIC_QUEUE_WORKER": "external",
         # 작업이 도는 동안 브라우저가 닫혀 있어도 컨테이너가 scale-down
         # 되지 않도록 스스로 health 요청을 보낸다.
-        "MOSAIC_PUBLIC_URL": "https://gong000000--mosaic.us-east.modal.run",
+        "MOSAIC_PUBLIC_URL": PUBLIC_URL,
         "PYTHONUNBUFFERED": "1",
     },
 )

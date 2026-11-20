@@ -491,6 +491,31 @@ def test_queue_worker_lease_prevents_two_processes():
     assert q1.heartbeat_worker("one") is False
 
 
+def test_queue_detects_stale_running_job():
+    from src.jobqueue import RenderQueue
+    from src.render_service import MosaicSettings
+    d = tempfile.mkdtemp()
+    src = os.path.join(d, "in.mp4")
+    with open(src, "wb") as f:
+        f.write(b"video")
+    q = RenderQueue(db_path=os.path.join(d, "jobs.db"),
+                    input_dir=os.path.join(d, "inputs"))
+    job_id = q.enqueue(
+        user="alice", input_path=src,
+        output_path=os.path.join(d, "out.mp4"), items=[],
+        selected_cats=["face"], settings=MosaicSettings(),
+        model_name="yolo11n-seg.pt", imgsz=640, stride=15, conf=0.2,
+        preset="veryfast", query_raw="q")
+    job = q.claim()
+    assert job["id"] == job_id
+    assert q.stale_running(60) is None
+    with q._db() as c:
+        c.execute("UPDATE render_jobs SET updated=? WHERE id=?",
+                  (time.time() - 120, job_id))
+    stale = q.stale_running(60)
+    assert stale and stale["id"] == job_id
+
+
 def test_queue_worker_completes_job_without_model():
     from unittest.mock import patch
     from src.jobqueue import RenderQueue

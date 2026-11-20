@@ -18,7 +18,7 @@
 
 ## 검증 결과
 
-- `pytest tests`: **53 passed**
+- `pytest tests`: **54 passed**
 - `scripts/apptest.py`: **APPTEST_PASS**
   - 얼굴, 번호판, 못 찾은 영역, **그룹 전환**, 2작업 등록/두 번째 취소
 - `scripts/qualitytest.py`: **QUALITY_TEST_PASS**
@@ -30,6 +30,8 @@
   - 새 그룹 UI: local AppTest + 실제 Gemini 프레임 검사로 확인
   - 2026-11-20 live 큐 복구: `12345678`과 `asd123` 작업이 동시에 running,
     진행률 증가 확인. `asd123`의 다음 작업은 계정 순번 2로 대기.
+  - 같은 날 GPU preemption으로 컨테이너가 재시작된 뒤, 새 컨테이너에서
+    running 작업을 queued로 복구하고 다시 처리하는 것을 확인.
 - 카테고리 분리 확인
   - 합성 택배 송장: `address`로 검출, `signboard` 오검출 없음
   - street 프레임: `signboard` 검출, 문서 텍스트와 분리
@@ -46,6 +48,8 @@
 - DB에 running 작업이 남으면 `claim()`이 전역으로 새 작업을 막아, 뒤 작업이
   계속 "대기 2번째/3번째"로 보였다.
 - 브라우저 세션이 없거나 컨테이너가 scale-down되면 워커 자체가 없었다.
+- Modal GPU 컨테이너는 preemption될 수 있다. preemption 후 브라우저 요청이
+  없으면 워커가 다시 뜨지 않아 running 작업이 그대로 남았다.
 - 대기 순번이 전 사용자 합계라 다른 아이디 작업이 내 순번에 섞였다.
 
 수정:
@@ -53,7 +57,10 @@
   죽은 워커를 재시작한다.
 - `queue_worker` heartbeat 리스로 중복 워커를 막고, 시작 시 running 작업을
   queued로 복구한다.
-- 작업 중 self health 요청으로 컨테이너 scale-down을 막는다.
+- 작업 중 self health 요청 + 5분 주기 `queue_keepalive` 함수로 컨테이너를
+  유지/재기동한다.
+- 15분 이상 진행률이 멈춘 작업은 워커 프로세스를 재시작해 고착을 푼다
+  (`MOSAIC_JOB_STALE_SEC`).
 - 순번은 계정별로 계산하고, 계정당 1개·서버 전체 최대 2개를 동시에
   처리한다.
 
