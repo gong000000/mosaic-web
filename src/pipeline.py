@@ -673,6 +673,35 @@ def _overlap_ratio(a, b):
     return inter / float(max(1, min(aa, ba)))
 
 
+def _region_area_ok(box, w, h, max_ratio=0.08):
+    try:
+        x1, y1, x2, y2 = [float(v) for v in box[:4]]
+        area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+        return area <= max(0.001, float(max_ratio)) * float(w * h)
+    except (TypeError, ValueError):
+        return False
+
+
+def _region_on_person(box, persons, side=0.25, top=0.10, bottom=0.60):
+    """영역 박스 중심이 사람(옷/가방/다리 포함) 근처인지."""
+    if not persons:
+        return False
+    try:
+        x1, y1, x2, y2 = [float(v) for v in box[:4]]
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    except (TypeError, ValueError):
+        return False
+    for p in persons:
+        px1, py1, px2, py2 = [float(v) for v in p[:4]]
+        pw, ph = px2 - px1, py2 - py1
+        if pw < 8 or ph < 16:
+            continue
+        if (px1 - pw * side <= cx <= px2 + pw * side
+                and py1 - ph * top <= cy <= py2 + ph * bottom):
+            return True
+    return False
+
+
 def _detect_person_boxes(model, frame, conf=0.20, imgsz=640):
     """사람 박스만 찾는다. 머리 영역 fallback 에만 쓴다."""
     if model is None or frame is None:
@@ -1033,6 +1062,12 @@ class MosaicJob:
         preset = self.encode_preset
         rotate_faces = _face_rotate_enabled()
         rotate_every = _face_rotate_every()
+        face_priors = self.person_priors.get("face") or {}
+        try:
+            region_max_area = float(
+                os.environ.get("MOSAIC_REGION_MAX_AREA", "0.08"))
+        except (TypeError, ValueError):
+            region_max_area = 0.08
 
         cap = cv2.VideoCapture(input_path)
         if not cap.isOpened():
@@ -1120,6 +1155,7 @@ class MosaicJob:
         try:
             # ---------- 1패스: 프레임별 검출/추적 결과만 모은다 ----------
             face_frames, raw_face_frames, head_frames, cuts = [], [], [], set()
+            person_frames = {}
             face_angles = defaultdict(dict)
             last_fresh = {}
             prev_gray_f1 = None
@@ -1160,6 +1196,17 @@ class MosaicJob:
                         if pose_model is not None:
                             heads, persons = _detect_heads_pose(
                                 pose_model, frame, return_persons=True)
+                            # 포즈 키포인트가 약한 사람(옆모습/가림)은
+                            # 사람 박스 상단을 머리 영역으로 보완한다.
+                            for pb in persons:
+                                if any(_faces_in_person(
+                                        [FaceBox(h)], pb, margin=0.05)
+                                       for h in heads):
+                                    continue
+                                ha = _head_area(*pb, ratio=0.24,
+                                                inset=0.10)
+                                if ha:
+                                    heads.append(ha)
                         elif head_model is not None:
                             persons = _detect_person_boxes(head_model, frame)
                             heads = [h for h in (
@@ -1177,6 +1224,10 @@ class MosaicJob:
                         head_tracker.update(dets, flow_fn=flow_fn)
                     else:
                         head_tracker.update([], flow_fn=flow_fn)
+                    person_frames[idx] = (
+                        list(last_persons)
+                        if last_persons and idx - last_persons_idx <= 8
+                        else [])
 
                     raw_dets = detect_faces(frame)
                     if rotate_faces and (idx % rotate_every == 0
@@ -1189,8 +1240,36 @@ class MosaicJob:
                     if last_persons and idx - last_persons_idx <= 8:
                         h_f, w_f = frame.shape[:2]
                         raw_dets = filter_faces_by_person(
-                            raw_dets, last_persons,
+                            raw_dets, last_persons, min_score=0.95,
                             frame_area=float(w_f * h_f))
+                    # VLM 얼굴 후보는 YuNet이 놓친 큰/측면 얼굴을 보완한다.
+                    # 옷 무늬/바퀴 오검출을 막기 위해 크기·종횡비를 검증한다.
+                    if face_priors:
+                        prior_boxes = (face_priors.get(str(idx))
+                                       or face_priors.get(idx) or [])
+                        h_f, w_f = frame.shape[:2]
+                        for coords in _prior_coords(prior_boxes):
+                            bx = [int(round(float(v))) for v in coords[:4]]
+                            bw_, bh_ = bx[2] - bx[0], bx[3] - bx[1]
+                            if bw_ < 20 or bh_ < 20:
+                                continue
+                            ar = (bw_ * bh_) / float(max(1, w_f * h_f))
+                            if ar < 0.0005 or ar > 0.20:
+                                continue
+                            if not (0.30 <= bw_ / float(max(1, bh_)) <= 3.0):
+                                continue
+                            if any(_overlap_ratio(bx, b) > 0.35
+                                   for b, _s in raw_dets):
+                                continue
+                            if (last_persons and ar < 0.02
+                                    and not any(
+                                        _faces_in_person(
+                                            [FaceBox(bx)], p, margin=0.10)
+                                        for p in last_persons)):
+                                continue
+                            raw_dets.append((FaceBox(bx), 0.82))
+                        raw_dets.sort(
+                            key=lambda item: item[1], reverse=True)
                     # 얼굴이 아직 없는 사람(원거리 군중)은 사람 상단 크롭을
                     # 확대해 찾는다. 전경 얼굴이 1개라도 있으면 예전에는
                     # 이 보완이 아예 안 돌아 뒤쪽 군중이 계속 빠졌다.
@@ -1491,6 +1570,7 @@ class MosaicJob:
                         debug_marks.append((head, (255, 0, 255), f"H{tid}"))
 
                     sidx = done // stride
+                    persons_now = person_frames.get(done) or []
                     for cat in targets:
                         if cat == "face" or _cat_type(cat) != "region":
                             continue
@@ -1511,6 +1591,16 @@ class MosaicJob:
                         for b in _dedupe_boxes(boxes):
                             x1, y1, x2, y2 = b["xyxy"]
                             if not plausible_box(cat, x1, y1, x2, y2, W, H):
+                                continue
+                            if not _region_area_ok(
+                                    (x1, y1, x2, y2), W, H,
+                                    region_max_area):
+                                continue
+                            # 옷/가방 위 텍스트가 주소·간판으로 잡히면
+                            # 사람 몸통을 크게 덮는다. 사람 박스 안 영역은
+                            # 배경 간판/문서로 보지 않는다.
+                            if persons_now and _region_on_person(
+                                    (x1, y1, x2, y2), persons_now):
                                 continue
                             if not region_has_detail(frame, (x1, y1, x2, y2),
                                                      cat):

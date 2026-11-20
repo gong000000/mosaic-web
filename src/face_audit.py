@@ -102,7 +102,7 @@ def audit_faces(input_path, output_path, cancel_fn=None):
                 "frames": [], "error": "영상 프레임을 읽을 수 없습니다."}
     max_samples = max(10, _env_int("MOSAIC_FACE_AUDIT_SAMPLES", 120))
     step = max(1, total // max_samples)
-    threshold = max(0.1, _env_float("MOSAIC_FACE_AUDIT_DIFF", 4.0))
+    threshold = max(0.1, _env_float("MOSAIC_FACE_AUDIT_DIFF", 3.0))
     rotate = os.environ.get("MOSAIC_FACE_ROTATE", "1") != "0"
     person_model = None
     if os.environ.get("MOSAIC_FACE_AUDIT_PERSON", "1") != "0":

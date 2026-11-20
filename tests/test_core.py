@@ -880,6 +880,15 @@ def test_poly_covers_box_detects_partial_face_mask():
     assert _poly_covers_box(full, box, 0.8)
 
 
+def test_region_helpers_limit_area_and_person():
+    from src.pipeline import _region_area_ok, _region_on_person
+    assert _region_area_ok((0, 0, 100, 100), 1920, 1080, 0.08)
+    assert not _region_area_ok((0, 0, 1000, 1000), 1920, 1080, 0.08)
+    persons = [[100, 100, 300, 600]]
+    assert _region_on_person((150, 250, 250, 350), persons)
+    assert not _region_on_person((800, 200, 900, 300), persons)
+
+
 def test_face_mesh_falls_back_without_model():
     from src.face_mesh import FaceMeshRefiner
     ref = FaceMeshRefiner(model_path="/nonexistent/model.task")
