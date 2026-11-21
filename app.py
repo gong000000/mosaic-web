@@ -714,6 +714,10 @@ with st.sidebar:
 
     st.subheader("영상")
     uploaded = st.file_uploader("mp4, mov, avi", type=["mp4", "mov", "avi"])
+    if uploaded is not None and uploaded.name.startswith(f"{current_user}--"):
+        st.warning(
+            "이미 모자이크된 결과 영상으로 보입니다. 원본 영상을 올려주세요. "
+            "결과물을 다시 올리면 얼굴/옷 위에 모자이크가 중복으로 생깁니다.")
     st.caption(
         "분석을 위해 영상에서 뽑은 일부 프레임(모자이크 전 원본)이 "
         "Google Gemini API로 전송됩니다. 업로드하면 이에 동의한 것으로 봅니다.")

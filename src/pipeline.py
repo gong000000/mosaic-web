@@ -2402,7 +2402,10 @@ class MosaicJob:
         region_cats |= {c for c in region_samples
                         if c in targets and c not in person_cats}
         direct_cats = {c for c in person_cats if person_box_samples.get(c)}
-        mask_cats = {c for c in person_cats if c != "name_tag"}
+        # 얼굴은 전용 얼굴 트래커가 그린다. 사람 박스 상단 30%를 얼굴로
+        # 칠하면 몸을 숙인 사람/부분 검출에서 배·가슴이 가려지므로 뺀다.
+        mask_cats = {c for c in person_cats
+                     if c not in ("name_tag", "face")}
 
         cat_on = {}
         for tid, by_cat in votes.items():
@@ -2443,10 +2446,10 @@ class MosaicJob:
                                              cat_on.get(tid, {}).items() if v},
                                   "sample": samp}
 
-        # 얼굴만 모든 사람에게 일괄 적용한다. 동승자·명찰까지 blanket으로
-        # 넓히면 얼굴만 모드에서도 사람 몸 전체가 가려지는 오작동이 생긴다.
-        blanket_cats = ({"face"} & person_cats
-                        if (self.mask_all_persons and not invert) else set())
+        # 얼굴은 전용 얼굴 트래커가 모든 사람 트랙에 적용한다. 사람 박스
+        # 상단을 일괄로 가리는 blanket은 배/가슴/몸 전체 오마스크를 만들어
+        # 사용하지 않는다.
+        blanket_cats = set()
 
         plan.person_cats = person_cats
         plan.region_cats = region_cats
@@ -3099,9 +3102,20 @@ class MosaicJob:
                          for b in rs.plate_dets])
                 except Exception:
                     pass
+            persons_now = []
+            for _it in getattr(fc, "items", []) or []:
+                try:
+                    persons_now.append(_it[7])
+                except (TypeError, IndexError):
+                    pass
             for b in _dedupe_boxes(boxes):
                 x1, y1, x2, y2 = b["xyxy"]
                 if not plausible_box(cat, x1, y1, x2, y2, W, H):
+                    continue
+                # 옷/가방/몸통 위 간판·휴대폰 박스가 사람을 크게 덮으면
+                # 배경 영역으로 보지 않는다. (얼굴만 모드와 같은 기준)
+                if persons_now and _region_on_person(
+                        (x1, y1, x2, y2), persons_now):
                     continue
                 if not region_has_detail(frame, (x1, y1, x2, y2),
                                          cat):
