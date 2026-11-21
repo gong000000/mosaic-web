@@ -18,3 +18,4 @@ outputs/job_inputs/
 !.env.example
 *.log
 users.db
+!weights/yolov11n-face.pt

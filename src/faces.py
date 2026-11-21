@@ -416,6 +416,56 @@ def _merge_face_dets(base, extra, iou=0.45):
     return out
 
 
+_YOLO_FACE = None
+_YOLO_FACE_LOCK = threading.Lock()
+YOLO_FACE_MODEL = os.path.join(ROOT_DIR, "weights", "yolov11n-face.pt")
+
+
+def detect_faces_yolo(frame_bgr, conf=0.25, imgsz=960):
+    """YOLO 얼굴 검출기. 마스크 쓴 얼굴/누운 얼굴을 YuNet보다 잘 잡는다."""
+    global _YOLO_FACE
+    if frame_bgr is None or frame_bgr.size == 0:
+        return []
+    try:
+        with _YOLO_FACE_LOCK:
+            if _YOLO_FACE is None:
+                from ultralytics import YOLO
+                _YOLO_FACE = YOLO(YOLO_FACE_MODEL)
+            model = _YOLO_FACE
+            results = list(model.predict(
+                source=frame_bgr, conf=float(conf), verbose=False,
+                imgsz=int(imgsz), max_det=200))
+        if not results:
+            return []
+        res = results[0]
+        if res.boxes is None or len(res.boxes) == 0:
+            return []
+        boxes = res.boxes.xyxy.cpu().numpy()
+        scores = res.boxes.conf.cpu().numpy()
+    except Exception:
+        return []
+    h, w = frame_bgr.shape[:2]
+    out = []
+    for box, score in zip(boxes, scores):
+        try:
+            x1, y1, x2, y2 = [float(v) for v in box[:4]]
+        except (TypeError, ValueError, IndexError):
+            continue
+        bw, bh = x2 - x1, y2 - y1
+        if bw < 8 or bh < 8:
+            continue
+        if not (0.35 <= bw / bh <= 2.2):
+            continue
+        area = bw * bh / float(max(1, w * h))
+        if area > MAX_FACE_AREA:
+            continue
+        clipped = _clip_box([x1, y1, x2, y2], w, h, angle=0.0)
+        if clipped is not None:
+            out.append((clipped, float(score)))
+    out.sort(key=lambda item: item[1], reverse=True)
+    return out
+
+
 def detect_faces_rotated(frame_bgr, base=None, rotations=(90, 270),
                          score_threshold=MIN_FACE_SCORE,
                          max_area=MAX_FACE_AREA):
@@ -704,7 +754,7 @@ class FaceTracker:
 
     @staticmethod
     def _smooth_size(old, new, max_ratio=0.15, min_delta=8.0,
-                     max_aspect=2.2):
+                     max_aspect=1.7):
         """검출 박스 크기가 한 프레임에 급변하지 않게 제한한다.
 
         얼굴을 옷/가방으로 잘못 잡은 큰 박스가 한 프레임만 들어와도
@@ -835,7 +885,7 @@ class FaceTracker:
             bh = abs(float(box[3]) - float(box[1]))
         except (TypeError, ValueError, IndexError):
             return None
-        if bw < 8 or bh < 8 or not (0.45 <= bw / bh <= 2.2):
+        if bw < 8 or bh < 8 or not (0.45 <= bw / bh <= 1.55):
             return None
         ang = float(angle or getattr(box, "angle", 0.0))
         best, best_score = None, 0.0
@@ -879,7 +929,7 @@ class FaceTracker:
                 bh = abs(float(box[3]) - float(box[1]))
             except (TypeError, ValueError, IndexError):
                 continue
-            if bw < 8 or bh < 8 or not (0.45 <= bw / bh <= 2.2):
+            if bw < 8 or bh < 8 or not (0.45 <= bw / bh <= 1.55):
                 continue
             angle = (float(det[2]) if len(det) > 2
                      else float(getattr(box, "angle", 0.0)))

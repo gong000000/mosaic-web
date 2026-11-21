@@ -30,6 +30,7 @@ from .models import MODEL_LOCK, get_model, get_thread_model
 from .detect import filter_contained, big_enough, iou, region_has_detail
 from .faces import (FaceBox, FaceTracker, detect_faces,
                     detect_faces_rotated,
+                    detect_faces_yolo,
                     detect_faces_in_person_crops, expand_face_box,
                     filter_faces_by_person, persons_without_faces,
                     scene_signature, is_scene_cut, _blend_angle)
@@ -52,8 +53,8 @@ log = logging.getLogger("mosaic.pipeline")
 # MOSAIC_DEBUG=1 이면 결과 영상에 박스/ID/출처를 색으로 그린다.
 # 초록=YuNet 얼굴 트랙, 자홍=머리 보완, 노랑=YOLO 사람 트랙, 청록=VLM 박스
 DEBUG_OVERLAY = os.environ.get("MOSAIC_DEBUG", "") == "1"
-# 얼굴이 검출되지 않은 사람의 머리 위치를 추정해 가리는 fallback.
-# 기본은 끈다. 팔/어깨/가슴을 머리로 오인하는 과마스크가 더 크기 때문.
+# 머리 보완 마스크는 기본 OFF. YOLO 얼굴 검출기가 마스크/누운 얼굴을
+# 잡으므로, 포즈 머리로 목/어깨를 덮는 과마스크를 막는다.
 DRAW_HEAD_FALLBACK = os.environ.get("MOSAIC_DRAW_HEAD_FALLBACK", "0") == "1"
 
 
@@ -507,7 +508,7 @@ def _detect_heads_pose(model, frame, conf=0.18, imgsz=640, kconf=0.35,
 
         fw = 2.05 * d
         head = (cx - fw / 2.0, cy - 1.00 * d,
-                cx + fw / 2.0, cy + 1.55 * d)
+                cx + fw / 2.0, cy + 2.10 * d)
         # 세로로 지나치게 긴 박스는 목/가슴까지 덮는 오검출로 본다.
         if (head[3] - head[1]) > 1.9 * (head[2] - head[0]):
             continue
@@ -693,13 +694,14 @@ def _face_upper_ok(box, persons, max_frac=0.42, frame_h=None,
             continue
         if px1 <= cx <= px2 and py1 <= cy <= py2:
             inside_any = True
-            # 가로로 넓은 사람 박스(누운 사람/90도 회전 영상)는 위쪽이
-            # 머리 방향이 아니므로 세로 위치로 판단하지 않는다.
             if (py2 - py1) <= 1.05 * max(1.0, px2 - px1):
-                continue
-            rel = (cy - py1) / max(1.0, py2 - py1)
-            if rel <= max_frac:
-                continue
+                rel = (cy - py1) / max(1.0, py2 - py1)
+                if rel <= 0.38:
+                    continue
+            else:
+                rel = (cy - py1) / max(1.0, py2 - py1)
+                if rel <= max_frac:
+                    continue
             if any(_overlap_ratio(box, h) > 0.20 for h in heads):
                 continue
             return False
@@ -1253,8 +1255,8 @@ class MosaicJob:
         # 얼굴로 크게 잡은 박스를 추적 초기값으로 넣으면 거대한 모자이크가
         # 생기므로, 얼굴 위치는 로컬 YuNet/포즈 보완만 사용한다.
         tracker = FaceTracker(
-            max_miss=max(10, int(round(fps * 0.80))),
-            seed_miss=max(6, int(round(fps * 0.30))))
+            max_miss=max(10, int(round(fps * 6.5))),
+            seed_miss=max(6, int(round(fps * 1.0))))
         pose_model = None
         head_model = None
         if os.environ.get("MOSAIC_HEAD_POSE", "1") != "0":
@@ -1475,6 +1477,58 @@ class MosaicJob:
                                 raw_dets.append((FaceBox(bx), 0.72))
                         raw_dets.sort(
                             key=lambda item: item[1], reverse=True)
+                    # YOLO 얼굴 검출기: YuNet이 놓친 마스크/누운 얼굴 보완.
+                    # 위쪽(이마)만 잡힌 얼굴은 마스크까지 아래로 확장한다.
+                    yolo_force_boxes = []
+                    try:
+                        for _b, _s in detect_faces_yolo(frame):
+                            if any(_overlap_ratio(_b, _rb) > 0.45
+                                   for _rb, _rs in raw_dets):
+                                continue
+                            if last_persons and not _face_person_size_ok(
+                                    _b, last_persons):
+                                continue
+                            if last_persons and not _face_upper_ok(
+                                    _b, last_persons,
+                                    frame_h=frame.shape[0]):
+                                continue
+                            _bw = max(1.0, float(_b[2]) - float(_b[0]))
+                            _bh = max(1.0, float(_b[3]) - float(_b[1]))
+                            _h, _w = frame.shape[:2]
+                            _bcx = (float(_b[0]) + float(_b[2])) / 2.0
+                            _bcy = (float(_b[1]) + float(_b[3])) / 2.0
+                            _upper = False
+                            for _p in last_persons or []:
+                                try:
+                                    _px1, _py1, _px2, _py2 = [
+                                        float(v) for v in _p[:4]]
+                                except (TypeError, ValueError, IndexError):
+                                    continue
+                                if (_px1 <= _bcx <= _px2
+                                        and _py1 <= _bcy <= _py2
+                                        and _bh <= 0.11 * max(
+                                            1.0, _py2 - _py1)
+                                        and (_bcy - _py1) <= 0.15 * max(
+                                            1.0, _py2 - _py1)):
+                                    _upper = True
+                                break
+                            if _upper:
+                                _sx, _sy, _by = 0.30, 0.10, 1.80
+                            else:
+                                _sx, _sy, _by = 0.15, 0.05, 0.10
+                            _exp = FaceBox([
+                                max(0.0, float(_b[0]) - _sx * _bw),
+                                max(0.0, float(_b[1]) - _sy * _bh),
+                                min(float(_w), float(_b[2]) + _sx * _bw),
+                                min(float(_h), float(_b[3]) + _by * _bh)],
+                                angle=0.0)
+                            raw_dets.append((_exp, _s))
+                            if _upper:
+                                yolo_force_boxes.append(_exp)
+                        raw_dets.sort(
+                            key=lambda item: item[1], reverse=True)
+                    except Exception:
+                        log.exception("YOLO 얼굴 보완 실패")
                     tracker.update(raw_dets, flow_fn=flow_fn)
                     prev_gray_f1 = gray
                     active = tracker.active()
@@ -1488,17 +1542,20 @@ class MosaicJob:
                     # 짧게 놓친 얼굴은 유지하되, 그보다 오래된 트랙은 현재
                     # 포즈 머리와 겹칠 때만 그린다. 바닥 반사/허리/옷자락에
                     # 남은 고스트 마스크가 오래 깜빡이는 것을 막는다.
-                    hold = max(8, int(round(fps * 0.45)))
+                    hold = max(8, int(round(fps * 6.0)))
                     fresh_heads = [t.box for t in head_active if t.misses == 0]
                     persons_now = person_frames.get(idx) or []
-                    face_frames.append({
+                    _fdict = {
                         t.tid: list(t.box) for t in active
                         if _face_upper_ok(t.box, persons_now,
                                           frame_h=frame.shape[0],
                                           heads=fresh_heads)
                         and (t.misses <= hold
                              or any(_overlap_ratio(t.box, h) > 0.25
-                                    for h in fresh_heads))})
+                                    for h in fresh_heads))}
+                    for _k, _fb in enumerate(yolo_force_boxes):
+                        _fdict[10 ** 9 + _k] = list(_fb)
+                    face_frames.append(_fdict)
                     for t in active:
                         face_angles[idx][t.tid] = float(
                             getattr(t, "angle", 0.0))
@@ -1692,9 +1749,11 @@ class MosaicJob:
                         # 위쪽(얼굴) 박스를 먼저 그린다. 몸통/가슴으로
                         # 내려간 중복 트랙이 얼굴 마스크를 밀어내지 않게 한다.
                         # 겹침이 85%를 넘는 완전 중복만 건너뛴다.
-                        if any(_overlap_ratio(box, d) > 0.85
-                               for d in drawn_faces_frame):
-                            continue
+                        if not (isinstance(tid, int)
+                                and tid >= 10 ** 9):
+                            if any(_overlap_ratio(box, d) > 0.85
+                                   for d in drawn_faces_frame):
+                                continue
                         ang = angle_s[done].get(tid, 0.0)
                         side = face_cache.stable_side(
                             tid, box[2] - box[0], box[3] - box[1])
@@ -1752,7 +1811,7 @@ class MosaicJob:
                         for tid, head in head_s[done].items():
                             # YuNet 얼굴이 이미 잡힌 사람에게 머리 보완 트랙이
                             # 겹치면 같은 얼굴을 두 번 가려 원/사각형이 겹친다.
-                            if any(_overlap_ratio(head, fbox) > 0.85
+                            if any(_overlap_ratio(head, fbox) > 0.15
                                    for fbox in drawn_faces_frame):
                                 continue
                             hb = _clip_head(head, W, H)
