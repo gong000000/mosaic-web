@@ -52,6 +52,9 @@ log = logging.getLogger("mosaic.pipeline")
 # MOSAIC_DEBUG=1 이면 결과 영상에 박스/ID/출처를 색으로 그린다.
 # 초록=YuNet 얼굴 트랙, 자홍=머리 보완, 노랑=YOLO 사람 트랙, 청록=VLM 박스
 DEBUG_OVERLAY = os.environ.get("MOSAIC_DEBUG", "") == "1"
+# 얼굴이 검출되지 않은 사람의 머리 위치를 추정해 가리는 fallback.
+# 기본은 끈다. 팔/어깨/가슴을 머리로 오인하는 과마스크가 더 크기 때문.
+DRAW_HEAD_FALLBACK = os.environ.get("MOSAIC_DRAW_HEAD_FALLBACK", "0") == "1"
 
 
 def _dbg_box(frame, box, color, label="", force=False):
@@ -667,18 +670,21 @@ def _poly_size_ok(poly, box, max_scale=1.6, max_area=2.2):
         return False
 
 
-def _face_upper_ok(box, persons, max_frac=0.66, frame_h=None):
+def _face_upper_ok(box, persons, max_frac=0.42, frame_h=None,
+                   heads=None):
     """사람 박스 안의 얼굴이 상단에 있는지 확인한다.
 
-    바닥 반사/신발/다리 조각을 얼굴로 잡으면 사람 박스 안이더라도
-    하단에 위치한다. 실제 얼굴은 (몸을 숙여도) 사람 박스 위쪽에 있다.
-    사람 박스가 없으면, 화면 하단 25%의 박스는 반사/오검출로 본다.
+    바닥 반사/신발/팔/다리 조각을 얼굴로 잡으면 사람 박스 안이더라도
+    하단에 위치한다. 실제 얼굴은 (몸을 숙여도) 사람 박스 위쪽에 있거나,
+    아래쪽이면 포즈 머리와 겹친다. 팔/손 오검출은 포즈 머리와 겹치지
+    않아 여기서 걸러진다.
     """
     try:
         cx = (float(box[0]) + float(box[2])) / 2.0
         cy = (float(box[1]) + float(box[3])) / 2.0
     except (TypeError, ValueError, IndexError):
         return True
+    heads = list(heads or [])
     inside_any = False
     for p in persons or []:
         try:
@@ -691,8 +697,12 @@ def _face_upper_ok(box, persons, max_frac=0.66, frame_h=None):
             # 머리 방향이 아니므로 세로 위치로 판단하지 않는다.
             if (py2 - py1) <= 1.05 * max(1.0, px2 - px1):
                 continue
-            if cy > py1 + max_frac * (py2 - py1):
-                return False
+            rel = (cy - py1) / max(1.0, py2 - py1)
+            if rel <= max_frac:
+                continue
+            if any(_overlap_ratio(box, h) > 0.20 for h in heads):
+                continue
+            return False
     if not inside_any and frame_h:
         return cy <= 0.75 * float(frame_h)
     return True
@@ -1484,7 +1494,8 @@ class MosaicJob:
                     face_frames.append({
                         t.tid: list(t.box) for t in active
                         if _face_upper_ok(t.box, persons_now,
-                                          frame_h=frame.shape[0])
+                                          frame_h=frame.shape[0],
+                                          heads=fresh_heads)
                         and (t.misses <= hold
                              or any(_overlap_ratio(t.box, h) > 0.25
                                     for h in fresh_heads))})
@@ -1737,34 +1748,35 @@ class MosaicJob:
                             rendered_cats.add("face")
                             drawn_faces_frame.append(box)
                         debug_marks.append((box, (0, 255, 0), f"F{tid}"))
-                    for tid, head in head_s[done].items():
-                        # YuNet 얼굴이 이미 잡힌 사람에게 머리 보완 트랙이
-                        # 겹치면 같은 얼굴을 두 번 가려 원/사각형이 겹친다.
-                        if any(_overlap_ratio(head, fbox) > 0.85
-                               for fbox in drawn_faces_frame):
-                            continue
-                        hb = _clip_head(head, W, H)
-                        if hb is None:
-                            continue
-                        hside = head_cache.stable_side(
-                            tid, hb[2] - hb[0], hb[3] - hb[1])
-                        hbs = mosaic_block_size(hside, hside, blocks)
-                        hpoly, _fresh = head_cache.polygon(frame, tid, hb)
-                        if (hpoly is not None
-                                and _poly_covers_box(
-                                    hpoly, _padded_head_box(frame, hb), 0.80)
-                                and _poly_size_ok(hpoly, hb)
-                                and render_face_polygon(
-                                frame, hpoly, style=style, blocks=blocks,
-                                blur=blur, block_size=hbs)):
-                            fallback_heads += 1
-                            rendered_cats.add("face")
-                        elif _render_face_box(
-                                frame, hb, style, blocks, blur, mesh=None,
-                                block_size=hbs):
-                            fallback_heads += 1
-                            rendered_cats.add("face")
-                        debug_marks.append((head, (255, 0, 255), f"H{tid}"))
+                    if DRAW_HEAD_FALLBACK:
+                        for tid, head in head_s[done].items():
+                            # YuNet 얼굴이 이미 잡힌 사람에게 머리 보완 트랙이
+                            # 겹치면 같은 얼굴을 두 번 가려 원/사각형이 겹친다.
+                            if any(_overlap_ratio(head, fbox) > 0.85
+                                   for fbox in drawn_faces_frame):
+                                continue
+                            hb = _clip_head(head, W, H)
+                            if hb is None:
+                                continue
+                            hside = head_cache.stable_side(
+                                tid, hb[2] - hb[0], hb[3] - hb[1])
+                            hbs = mosaic_block_size(hside, hside, blocks)
+                            hpoly, _fresh = head_cache.polygon(frame, tid, hb)
+                            if (hpoly is not None
+                                    and _poly_covers_box(
+                                        hpoly, _padded_head_box(frame, hb), 0.80)
+                                    and _poly_size_ok(hpoly, hb)
+                                    and render_face_polygon(
+                                    frame, hpoly, style=style, blocks=blocks,
+                                    blur=blur, block_size=hbs)):
+                                fallback_heads += 1
+                                rendered_cats.add("face")
+                            elif _render_face_box(
+                                    frame, hb, style, blocks, blur, mesh=None,
+                                    block_size=hbs):
+                                fallback_heads += 1
+                                rendered_cats.add("face")
+                            debug_marks.append((head, (255, 0, 255), f"H{tid}"))
 
                     sidx = done // stride
                     persons_now = person_frames.get(done) or []

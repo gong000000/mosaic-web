@@ -1006,6 +1006,9 @@ def test_face_upper_person_gate():
     persons = [[0, 0, 100, 500]]
     assert _face_upper_ok([10, 10, 50, 60], persons)
     assert not _face_upper_ok([10, 400, 50, 450], persons)
+    # 아래쪽 얼굴이라도 포즈 머리와 겹치면 실제 얼굴(몸을 숙인 경우)로 본다.
+    assert _face_upper_ok([10, 400, 50, 450], persons,
+                          heads=[[10, 390, 50, 440]])
     # 가로로 넓은(누운/회전) 사람 박스는 세로 위치로 거부하지 않는다.
     assert _face_upper_ok([10, 80, 50, 100], [[0, 0, 500, 100]])
     # 사람 박스가 없어도 화면 하단 25%는 반사/오검출로 본다.
