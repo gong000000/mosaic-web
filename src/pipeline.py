@@ -609,6 +609,25 @@ def _poly_covers_box(poly, box, min_ratio=0.80):
         return False
 
 
+def _face_mask_margins(box):
+    """얼굴 크기에 따른 마스크 여백.
+
+    원거리 얼굴은 검출/추적 박스가 몇 px만 어긋나도 눈·이마가 노출된다.
+    작을수록 여백을 키워 얼굴 전체를 확실히 덮고, 근접 얼굴은 옷/배경으로
+    번지지 않게 기존의 작은 여백을 유지한다.
+    """
+    w = max(1.0, abs(float(box[2]) - float(box[0])))
+    h = max(1.0, abs(float(box[3]) - float(box[1])))
+    m = min(w, h)
+    if m < 40:
+        return 0.38, 0.75, 0.35
+    if m < 72:
+        return 0.26, 0.48, 0.24
+    if m < 120:
+        return 0.18, 0.32, 0.18
+    return 0.14, 0.25, 0.15
+
+
 def _render_face_box(frame, box, style, blocks, blur, angle=0.0,
                      mesh=None, motion=0.0, block_size=None):
     """랜드마크 외곽이 있으면 사람마다 다른 모양으로, 없으면 고정 얼굴형으로.
@@ -639,8 +658,9 @@ def _render_face_box(frame, box, style, blocks, blur, angle=0.0,
                     frame, poly, style=style, blocks=blocks, blur=blur,
                     block_size=block_size):
                 return True
+    side, top, bottom = _face_mask_margins(box)
     bx = expand_face_box(box, frame.shape[1], frame.shape[0], angle=angle,
-                        motion=motion, side=0.14, top=0.25, bottom=0.15)
+                        motion=motion, side=side, top=top, bottom=bottom)
     if not bx:
         return False
     return bool(render_face_ellipse(
@@ -1305,6 +1325,42 @@ class MosaicJob:
                                         key=lambda it: it[1], reverse=True)
                         except Exception:
                             log.exception("원거리 얼굴 크롭 보완 실패")
+                    # 크롭 보완까지 실패한 사람만, 사람 박스 폭의 약 32%
+                    # 크기로 머리 위치만 보수적으로 가린다. (사람 박스 전체를
+                    # 덮던 예전 fallback보다 훨씬 작아 옷/가방 과마스크가 없다.)
+                    if last_persons and idx - last_persons_idx <= 8:
+                        active_heads = [t.box for t in head_tracker.active()]
+                        h_f, w_f = frame.shape[:2]
+                        for pb in last_persons:
+                            if any(_faces_in_person(
+                                    [FaceBox(b)], pb, margin=0.05)
+                                   for b, _s in raw_dets):
+                                continue
+                            if any(_faces_in_person(
+                                    [FaceBox(h)], pb, margin=0.05)
+                                   for h in active_heads):
+                                continue
+                            px1, py1, px2, py2 = [int(v) for v in pb[:4]]
+                            pw, ph = px2 - px1, py2 - py1
+                            if pw < 18 or ph < 30:
+                                continue
+                            fw = max(24, int(round(pw * 0.32)))
+                            fh = min(int(round(ph * 0.38)),
+                                     int(round(fw * 1.25)))
+                            cx = (px1 + px2) // 2
+                            y1 = py1 + int(ph * 0.03)
+                            bx = [max(0, cx - fw // 2),
+                                  max(0, y1),
+                                  min(w_f, cx + fw // 2),
+                                  min(h_f, y1 + fh)]
+                            if (bx[2] - bx[0] >= 20
+                                    and bx[3] - bx[1] >= 20
+                                    and (bx[2] - bx[0])
+                                    / float(max(1, bx[3] - bx[1]))
+                                    <= 2.0):
+                                raw_dets.append((FaceBox(bx), 0.72))
+                        raw_dets.sort(
+                            key=lambda item: item[1], reverse=True)
                     tracker.update(raw_dets, flow_fn=flow_fn)
                     prev_gray_f1 = gray
                     active = tracker.active()

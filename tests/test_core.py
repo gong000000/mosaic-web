@@ -42,11 +42,15 @@ def test_tracker_follows_fast_motion_with_small_lag():
 def test_tracker_holds_big_jump_until_confirmed():
     t = FaceTracker()
     t.update([([100, 100, 160, 170], 0.9)])
-    # 한 프레임만 30px 아래로 튄 검출: 바로 확정하지 않고 합집합으로 가린다.
+    # 한 프레임만 30px 아래로 튄 검출: 바로 확정하지 않고 새 위치를
+    # 따라가되, 예전 위치와의 합집합으로 크게 번지지 않게 한다.
     t.update([([100, 130, 160, 200], 0.9)])
     tr = t.active()[0]
     assert list(tr.committed_box) == [100, 100, 160, 170]
-    assert list(tr.box) == [100, 100, 160, 200]
+    # 기존/새 위치의 중간을 덮되 높이는 20%만 키운다.
+    assert abs(tr.box[1] - 108) < 1.5
+    assert abs(tr.box[3] - 192) < 1.5
+    assert (tr.box[3] - tr.box[1]) <= 84.1
     assert tr.pending_box is not None
     # 다음 프레임에 같은 위치가 다시 오면 그때 확정한다.
     t.update([([100, 131, 160, 201], 0.9)])
@@ -54,6 +58,16 @@ def test_tracker_holds_big_jump_until_confirmed():
     assert list(tr.committed_box) == [100, 131, 160, 201]
     assert tr.pending_box is None
     assert list(tr.box) == [100, 131, 160, 201]
+
+
+def test_tracker_limits_pending_size_growth():
+    t = FaceTracker()
+    t.update([([100, 100, 160, 170], 0.9)])
+    # 높이가 2배로 튄 검출은 확인 전까지 20%만 키워 그린다.
+    t.update([([100, 100, 160, 240], 0.9)])
+    tr = t.active()[0]
+    assert tr.pending_box is not None
+    assert (tr.box[3] - tr.box[1]) <= 84.1
 
 
 def test_tracker_discards_single_frame_false_jump():
@@ -933,6 +947,36 @@ def test_region_helpers_limit_area_and_person():
     assert not _region_on_person((800, 200, 900, 300), persons)
     assert _face_person_size_ok((150, 150, 250, 250), persons)
     assert not _face_person_size_ok((100, 100, 300, 500), persons)
+
+
+def test_face_tracker_smooths_sudden_size_jump():
+    from src.faces import FaceTracker
+    old = [0, 0, 100, 100]
+    new = [0, 0, 400, 400]
+    box = FaceTracker._smooth_size(old, new, max_ratio=0.15)
+    assert box[2] - box[0] <= 115.1
+    assert box[3] - box[1] <= 115.1
+    # 중심은 새 검출을 따른다.
+    assert abs(((box[0] + box[2]) / 2) - 200) < 2
+
+
+def test_face_tracker_update_limits_size_jump():
+    from src.faces import FaceTracker
+    tr = FaceTracker()
+    tr.update([([0, 0, 100, 100], 0.95)])
+    tr.update([([0, 0, 140, 140], 0.95)])
+    box = tr.active()[0].box
+    assert box[2] - box[0] <= 120.1
+    assert box[3] - box[1] <= 120.1
+
+
+def test_small_face_mask_gets_larger_margins():
+    from src.pipeline import _face_mask_margins
+    small = _face_mask_margins([0, 0, 24, 30])
+    large = _face_mask_margins([0, 0, 240, 300])
+    assert small[0] > large[0]
+    assert small[1] > large[1]
+    assert large == (0.14, 0.25, 0.15)
 
 
 def test_face_mesh_falls_back_without_model():

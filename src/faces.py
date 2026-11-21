@@ -645,6 +645,30 @@ class FaceTracker:
     def _pred_box(box, vel):
         return [float(box[i]) + float(vel[i]) for i in range(4)]
 
+    @staticmethod
+    def _smooth_size(old, new, max_ratio=0.15, min_delta=8.0):
+        """검출 박스 크기가 한 프레임에 급변하지 않게 제한한다.
+
+        얼굴을 옷/가방으로 잘못 잡은 큰 박스가 한 프레임만 들어와도
+        모자이크가 갑자기 커지는 것을 막는다. 중심은 새 검출을 따르고
+        폭/높이만 최대 ±15%씩 변한다. 작은 원거리 얼굴은 15%가 몇 px에
+        불과해 금방 뒤처지므로 최소 ±8px은 허용한다.
+        """
+        if old is None:
+            return [float(v) for v in new]
+        ow = max(1.0, float(old[2]) - float(old[0]))
+        oh = max(1.0, float(old[3]) - float(old[1]))
+        nw = max(1.0, float(new[2]) - float(new[0]))
+        nh = max(1.0, float(new[3]) - float(new[1]))
+        r = max(0.01, float(max_ratio))
+        dw = max(ow * r, float(min_delta))
+        dh = max(oh * r, float(min_delta))
+        w = min(ow + dw, max(ow - dw, nw))
+        h = min(oh + dh, max(oh - dh, nh))
+        cx = (float(new[0]) + float(new[2])) / 2.0
+        cy = (float(new[1]) + float(new[3])) / 2.0
+        return [cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0]
+
     def _change(self, box, ref):
         bw = max(1.0, float(ref[2]) - float(ref[0]))
         bh = max(1.0, float(ref[3]) - float(ref[1]))
@@ -687,12 +711,18 @@ class FaceTracker:
                              for i in range(4)]
         track.pending_hits = 1
         track.pending_age = 0
-        track.box = track.union_box(track.committed_box, track.pending_box)
+        # 확인 전 프레임은 기존 위치와 새 검출의 중간을 덮되, 박스 크기는
+        # 한 프레임에 20%까지만 키운다. 큰 오검출이 들어와도 모자이크가
+        # 갑자기 옷/가방 크기로 커졌다가 풀리는 현상을 막는다.
+        union = track.union_box(track.committed_box, track.pending_box)
+        track.box = self._smooth_size(track.committed_box, union,
+                                      max_ratio=0.20)
         track.misses = 0
         track.hits += 1
         track.score = float(score)
 
     def _commit(self, track, box, angle, score):
+        box = self._smooth_size(track.committed_box, box)
         raw_vel = [float(box[i]) - float(track.committed_box[i])
                    for i in range(4)]
         track.vel = [0.6 * raw_vel[i] + 0.4 * track.vel[i]
@@ -745,7 +775,8 @@ class FaceTracker:
                 best, best_score = track, score_match
         if best is not None:
             ang = float(ang or best.angle)
-            best.committed_box = [float(v) for v in box]
+            seeded = self._smooth_size(best.committed_box, box)
+            best.committed_box = [float(v) for v in seeded]
             best.box = FaceBox(best.committed_box, angle=ang)
             best.score = max(best.score, float(score))
             best.misses = 0
@@ -762,7 +793,9 @@ class FaceTracker:
     def update(self, detections, alpha=1.0, flow_fn=None):
         """검출 결과를 트랙에 반영한다. detections=[(xyxy, score[, angle])].
 
-        검출이 있으면 평활 없이 그 위치를 그대로 쓴다(지연 0). 박스 안정화는
+        검출이 있으면 중심은 그 위치를 따른다(지연 0). 박스 크기만 한
+        프레임에 ±15% 넘게 변하지 않도록 제한해, 옷/가방을 얼굴로 잘못
+        잡은 큰 박스가 갑자기 모자이크를 키우는 것을 막는다. 박스 안정화는
         1패스 후처리(앞뒤 프레임 합집합)가 담당하고, 여기서는 검출이 끊긴
         프레임만 속도/광학 흐름으로 이어 붙인다.
         """
@@ -844,8 +877,10 @@ class FaceTracker:
                 if track.pending_age > 2:
                     track.clear_pending()
             if track.pending_box is not None:
-                track.box = track.union_box(track.committed_box,
-                                            track.pending_box)
+                union = track.union_box(track.committed_box,
+                                        track.pending_box)
+                track.box = self._smooth_size(track.committed_box, union,
+                                              max_ratio=0.20)
             else:
                 track.box = list(track.committed_box)
             if track.misses > track.max_miss(self.max_miss,
