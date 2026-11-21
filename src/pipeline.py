@@ -504,7 +504,10 @@ def _detect_heads_pose(model, frame, conf=0.18, imgsz=640, kconf=0.35,
 
         fw = 2.05 * d
         head = (cx - fw / 2.0, cy - 1.00 * d,
-                cx + fw / 2.0, cy + 1.95 * d)
+                cx + fw / 2.0, cy + 1.55 * d)
+        # 세로로 지나치게 긴 박스는 목/가슴까지 덮는 오검출로 본다.
+        if (head[3] - head[1]) > 1.9 * (head[2] - head[0]):
+            continue
         # 사람 박스보다 지나치게 큰 '머리'는 키포인트 오검출로 본다.
         pbw = float(pb[2] - pb[0])
         pbh = float(pb[3] - pb[1])
@@ -532,6 +535,38 @@ def _faces_in_person(faces, box, margin=0.12):
         if x1 - mw <= cx <= x2 + mw and y1 - mh <= cy <= y2 + mh:
             out.append(f)
     return out
+
+
+def _small_head_fallback_box(raw_box, W, H):
+    """포즈 모델이 없을 때만 쓰는 보수적인 머리 위치 추정.
+
+    몸을 숙인 사람/바닥 반사/다리 조각처럼 사람 박스 상단이 머리가 아닌
+    경우를 걸러내고, 사람 박스 높이의 13~20%만 머리로 본다.
+    """
+    try:
+        px1, py1, px2, py2 = [int(v) for v in raw_box[:4]]
+    except (TypeError, ValueError):
+        return None
+    pw, ph = px2 - px1, py2 - py1
+    if pw < 18 or ph < 30:
+        return None
+    ar = ph / float(max(1, pw))
+    # 사람 박스 상단이 화면 아래쪽이면 바닥 반사/하체 조각일 가능성이 크다.
+    if py1 > 0.58 * float(H):
+        return None
+    if ar < 1.25:
+        return None
+    hh = int(round(ph * (0.13 if ar >= 1.8 else 0.20)))
+    hw = int(round(min(pw * 0.32, hh * 0.80)))
+    hh = max(20, hh)
+    hw = max(16, hw)
+    cx = (px1 + px2) // 2
+    y1 = max(0, py1 + int(ph * 0.02))
+    box = [max(0, cx - hw // 2), y1,
+           min(int(W), cx + hw // 2), min(int(H), y1 + hh)]
+    if box[2] - box[0] < 16 or box[3] - box[1] < 20:
+        return None
+    return box
 
 
 def _head_fallback_box(raw_box, mf=None, band=None):
@@ -609,6 +644,60 @@ def _poly_covers_box(poly, box, min_ratio=0.80):
         return False
 
 
+def _poly_size_ok(poly, box, max_scale=1.6, max_area=2.2):
+    """mesh 폴리곤이 얼굴 박스보다 지나치게 크게 번지지 않았는지 확인한다.
+
+    뒤통수/머리카락에서 랜드마크가 크게 튀면 폴리곤이 몸 전체를 덮는
+    거대한 모자이크가 될 수 있다. 얼굴 박스의 2배를 넘으면 버린다.
+    """
+    try:
+        x1, y1, x2, y2 = [float(v) for v in box]
+        bw = max(1.0, x2 - x1)
+        bh = max(1.0, y2 - y1)
+        pts = np.asarray(poly, np.float32).reshape(-1, 2)
+        px1, py1 = float(pts[:, 0].min()), float(pts[:, 1].min())
+        px2, py2 = float(pts[:, 0].max()), float(pts[:, 1].max())
+        if (px2 - px1) > max_scale * bw:
+            return False
+        if (py2 - py1) > max_scale * bh:
+            return False
+        area = float(cv2.contourArea(pts.reshape(-1, 1, 2)))
+        return area <= max_area * bw * bh
+    except Exception:
+        return False
+
+
+def _face_upper_ok(box, persons, max_frac=0.66, frame_h=None):
+    """사람 박스 안의 얼굴이 상단에 있는지 확인한다.
+
+    바닥 반사/신발/다리 조각을 얼굴로 잡으면 사람 박스 안이더라도
+    하단에 위치한다. 실제 얼굴은 (몸을 숙여도) 사람 박스 위쪽에 있다.
+    사람 박스가 없으면, 화면 하단 25%의 박스는 반사/오검출로 본다.
+    """
+    try:
+        cx = (float(box[0]) + float(box[2])) / 2.0
+        cy = (float(box[1]) + float(box[3])) / 2.0
+    except (TypeError, ValueError, IndexError):
+        return True
+    inside_any = False
+    for p in persons or []:
+        try:
+            px1, py1, px2, py2 = [float(v) for v in p[:4]]
+        except (TypeError, ValueError, IndexError):
+            continue
+        if px1 <= cx <= px2 and py1 <= cy <= py2:
+            inside_any = True
+            # 가로로 넓은 사람 박스(누운 사람/90도 회전 영상)는 위쪽이
+            # 머리 방향이 아니므로 세로 위치로 판단하지 않는다.
+            if (py2 - py1) <= 1.05 * max(1.0, px2 - px1):
+                continue
+            if cy > py1 + max_frac * (py2 - py1):
+                return False
+    if not inside_any and frame_h:
+        return cy <= 0.75 * float(frame_h)
+    return True
+
+
 def _face_mask_margins(box):
     """얼굴 크기에 따른 마스크 여백.
 
@@ -622,9 +711,9 @@ def _face_mask_margins(box):
     if m < 40:
         return 0.38, 0.75, 0.35
     if m < 72:
-        return 0.26, 0.48, 0.24
+        return 0.20, 0.35, 0.20
     if m < 120:
-        return 0.18, 0.32, 0.18
+        return 0.16, 0.28, 0.16
     return 0.14, 0.25, 0.15
 
 
@@ -644,6 +733,8 @@ def _render_face_box(frame, box, style, blocks, blur, angle=0.0,
             if not _poly_covers_box(
                     poly, _padded_head_box(frame, box), 0.80):
                 poly = None
+        if poly is not None and not _poly_size_ok(poly, box):
+            poly = None
         if poly is not None:
             if motion > 0:
                 try:
@@ -1204,6 +1295,7 @@ class MosaicJob:
             last_fresh = {}
             prev_gray_f1 = None
             prev_face_active = []
+            heads = []
             last_persons, last_persons_idx = [], -10 ** 9
             cap = cv2.VideoCapture(input_path)
             if not cap.isOpened():
@@ -1297,6 +1389,13 @@ class MosaicJob:
                             if last_persons and not _face_person_size_ok(
                                     bx, last_persons):
                                 continue
+                            # 큰 VLM 얼굴 후보는 포즈 머리와 겹쳐야 한다.
+                            # 사슴/포스터/옷을 얼굴로 잡은 큰 박스를 거른다.
+                            if (min(bw_, bh_) >= 0.08 * min(w_f, h_f)
+                                    and not any(
+                                        _overlap_ratio(bx, h) > 0.20
+                                        for h in heads)):
+                                continue
                             if any(_overlap_ratio(bx, b) > 0.35
                                    for b, _s in raw_dets):
                                 continue
@@ -1316,6 +1415,19 @@ class MosaicJob:
                         try:
                             missing = persons_without_faces(
                                 last_persons, raw_dets)
+                            # 가로로 넓은 사람 박스는 여러 명이 겹쳐 있거나
+                            # 누운 사람일 수 있다. 이미 얼굴이 하나 있어도
+                            # 크롭 재검출을 한 번 더 해 누운 얼굴을 찾는다.
+                            for p in last_persons:
+                                try:
+                                    pw = float(p[2]) - float(p[0])
+                                    ph = float(p[3]) - float(p[1])
+                                except (TypeError, ValueError, IndexError):
+                                    continue
+                                if pw > 1.3 * max(1.0, ph) and not any(
+                                        _overlap_ratio(p, q) > 0.80
+                                        for q in missing):
+                                    missing.append(p)
                             if missing:
                                 extra = detect_faces_in_person_crops(
                                     frame, missing, max_crops=10)
@@ -1325,10 +1437,16 @@ class MosaicJob:
                                         key=lambda it: it[1], reverse=True)
                         except Exception:
                             log.exception("원거리 얼굴 크롭 보완 실패")
-                    # 크롭 보완까지 실패한 사람만, 사람 박스 폭의 약 32%
-                    # 크기로 머리 위치만 보수적으로 가린다. (사람 박스 전체를
-                    # 덮던 예전 fallback보다 훨씬 작아 옷/가방 과마스크가 없다.)
-                    if last_persons and idx - last_persons_idx <= 8:
+                    # 포즈 모델이 있으면 머리 키포인트가 없는 사람은
+                    # 뒤통수/가려진 얼굴이므로 억지로 상단을 머리로 가정하지
+                    # 않는다. (몸을 숙인 사람의 허리/발이 머리로 잡히는 것 방지)
+                    # 포즈 모델이 없을 때만, 그것도 작은 원거리 사람에 한해
+                    # 보수적으로 머리 위치를 보완한다.
+                    allow_fallback = (
+                        pose_model is None
+                        and os.environ.get("MOSAIC_HEAD_FALLBACK", "1") != "0")
+                    if (allow_fallback and last_persons
+                            and idx - last_persons_idx <= 8):
                         active_heads = [t.box for t in head_tracker.active()]
                         h_f, w_f = frame.shape[:2]
                         for pb in last_persons:
@@ -1340,42 +1458,42 @@ class MosaicJob:
                                     [FaceBox(h)], pb, margin=0.05)
                                    for h in active_heads):
                                 continue
-                            px1, py1, px2, py2 = [int(v) for v in pb[:4]]
-                            pw, ph = px2 - px1, py2 - py1
-                            if pw < 18 or ph < 30:
+                            bx = _small_head_fallback_box(pb, w_f, h_f)
+                            if bx is None:
                                 continue
-                            fw = max(24, int(round(pw * 0.32)))
-                            fh = min(int(round(ph * 0.38)),
-                                     int(round(fw * 1.25)))
-                            cx = (px1 + px2) // 2
-                            y1 = py1 + int(ph * 0.03)
-                            bx = [max(0, cx - fw // 2),
-                                  max(0, y1),
-                                  min(w_f, cx + fw // 2),
-                                  min(h_f, y1 + fh)]
-                            if (bx[2] - bx[0] >= 20
-                                    and bx[3] - bx[1] >= 20
-                                    and (bx[2] - bx[0])
-                                    / float(max(1, bx[3] - bx[1]))
-                                    <= 2.0):
+                            if (bx[2] - bx[0]) / float(max(1, bx[3] - bx[1])) <= 2.0:
                                 raw_dets.append((FaceBox(bx), 0.72))
                         raw_dets.sort(
                             key=lambda item: item[1], reverse=True)
                     tracker.update(raw_dets, flow_fn=flow_fn)
                     prev_gray_f1 = gray
                     active = tracker.active()
+                    head_active = head_tracker.active()
                     prev_face_active = active
                     for t in active:
                         if t.misses == 0:
                             last_fresh[t.tid] = [idx, list(t.box)]
                     raw_face_frames.append(
                         {t.tid: list(t.box) for t in active if t.misses == 0})
-                    face_frames.append({t.tid: list(t.box) for t in active})
+                    # 짧게 놓친 얼굴은 유지하되, 그보다 오래된 트랙은 현재
+                    # 포즈 머리와 겹칠 때만 그린다. 바닥 반사/허리/옷자락에
+                    # 남은 고스트 마스크가 오래 깜빡이는 것을 막는다.
+                    hold = max(8, int(round(fps * 0.45)))
+                    fresh_heads = [t.box for t in head_active if t.misses == 0]
+                    persons_now = person_frames.get(idx) or []
+                    face_frames.append({
+                        t.tid: list(t.box) for t in active
+                        if _face_upper_ok(t.box, persons_now,
+                                          frame_h=frame.shape[0])
+                        and (t.misses <= hold
+                             or any(_overlap_ratio(t.box, h) > 0.25
+                                    for h in fresh_heads))})
                     for t in active:
                         face_angles[idx][t.tid] = float(
                             getattr(t, "angle", 0.0))
-                    head_frames.append({t.tid: list(t.box)
-                                        for t in head_tracker.active()})
+                    head_frames.append({
+                        t.tid: list(t.box) for t in head_active
+                        if t.misses <= hold})
                     if progress_fn and total > 0 and idx % 5 == 0:
                         try:
                             progress_fn(min(0.5, 0.5 * idx / max(1, total)),
@@ -1555,13 +1673,15 @@ class MosaicJob:
                     drawn_faces_frame = []
                     ordered_faces = sorted(
                         faces_now.items(),
-                        key=lambda kv: (kv[1][2] - kv[1][0])
-                        * (kv[1][3] - kv[1][1]), reverse=True)
+                        key=lambda kv: (
+                            (kv[1][1] + kv[1][3]) / 2.0,
+                            -((kv[1][2] - kv[1][0])
+                              * (kv[1][3] - kv[1][1]))))
                     for tid, box in ordered_faces:
-                        # 큰 얼굴을 먼저 그린다. 그 안에 들어오는 작은
-                        # 중복 검출은 건너뛰고, 크기가 비슷한 별개 얼굴은
-                        # 둘 다 그려 누락을 막는다.
-                        if any(_overlap_ratio(box, d) > 0.65
+                        # 위쪽(얼굴) 박스를 먼저 그린다. 몸통/가슴으로
+                        # 내려간 중복 트랙이 얼굴 마스크를 밀어내지 않게 한다.
+                        # 겹침이 85%를 넘는 완전 중복만 건너뛴다.
+                        if any(_overlap_ratio(box, d) > 0.85
                                for d in drawn_faces_frame):
                             continue
                         ang = angle_s[done].get(tid, 0.0)
@@ -1597,7 +1717,8 @@ class MosaicJob:
                         poly, _fresh = face_cache.polygon(frame, tid, box)
                         if (poly is not None
                                 and _poly_covers_box(
-                                    poly, _padded_head_box(frame, box), 0.80)):
+                                    poly, _padded_head_box(frame, box), 0.80)
+                                and _poly_size_ok(poly, box)):
                             if render_face_polygon(
                                     frame, poly, style=style, blocks=blocks,
                                     blur=blur, block_size=bs):
@@ -1632,6 +1753,7 @@ class MosaicJob:
                         if (hpoly is not None
                                 and _poly_covers_box(
                                     hpoly, _padded_head_box(frame, hb), 0.80)
+                                and _poly_size_ok(hpoly, hb)
                                 and render_face_polygon(
                                 frame, hpoly, style=style, blocks=blocks,
                                 blur=blur, block_size=hbs)):
@@ -2524,6 +2646,7 @@ class MosaicJob:
             if (poly is not None
                     and _poly_covers_box(
                         poly, _padded_head_box(fc.frame, fbox), 0.80)
+                    and _poly_size_ok(poly, fbox)
                     and render_face_polygon(
                     fc.frame, poly, style=self.style, blocks=self.blocks,
                     blur=self.blur, block_size=bs)):
@@ -2762,6 +2885,7 @@ class MosaicJob:
                     if (hp is not None
                             and _poly_covers_box(
                                 hp, _padded_head_box(frame, hb), 0.80)
+                            and _poly_size_ok(hp, hb)
                             and render_face_polygon(
                             frame, hp, style=style, blocks=blocks,
                             blur=blur)):
@@ -2875,6 +2999,7 @@ class MosaicJob:
                     if (_hp is not None
                             and _poly_covers_box(
                                 _hp, _padded_head_box(frame, _hb), 0.80)
+                            and _poly_size_ok(_hp, _hb)
                             and render_face_polygon(
                             frame, _hp, style=style, blocks=blocks,
                             blur=blur)):

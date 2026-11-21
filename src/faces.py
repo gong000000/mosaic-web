@@ -365,6 +365,41 @@ def _map_box_back(box, rotation, width, height):
     return _clip_box([nx1, ny1, nx2, ny2], width, height, angle=angle)
 
 
+def _map_angle_box_back(box, matrix, width, height, rotation=0.0):
+    """임의 각도로 회전한 프레임의 얼굴 박스를 원본 좌표로 되돌린다.
+
+    박스 크기는 회전 전 얼굴 크기를 유지하고 중심만 역변환한다. 코너를
+    그대로 역변환하면 45도에서 bbox가 1.4배로 커져 과마스크가 된다.
+    """
+    try:
+        x1, y1, x2, y2 = [float(v) for v in box[:4]]
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        inv = cv2.invertAffineTransform(matrix)
+        pt = cv2.transform(np.array([[[cx, cy]]], np.float32), inv)[0][0]
+        w, h = max(4.0, x2 - x1), max(4.0, y2 - y1)
+        angle = float(getattr(box, "angle", 0.0)) - float(rotation)
+        return _clip_box([pt[0] - w / 2.0, pt[1] - h / 2.0,
+                          pt[0] + w / 2.0, pt[1] + h / 2.0],
+                         width, height, angle=angle)
+    except Exception:
+        return None
+
+
+def _rotate_frame_angle(frame_bgr, angle):
+    h, w = frame_bgr.shape[:2]
+    c = (w / 2.0, h / 2.0)
+    m = cv2.getRotationMatrix2D(c, float(angle), 1.0)
+    cos, sin = abs(m[0, 0]), abs(m[0, 1])
+    nw = int(h * sin + w * cos)
+    nh = int(h * cos + w * sin)
+    m[0, 2] += nw / 2.0 - c[0]
+    m[1, 2] += nh / 2.0 - c[1]
+    out = cv2.warpAffine(frame_bgr, m, (nw, nh),
+                         flags=cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_REPLICATE)
+    return out, m
+
+
 def _merge_face_dets(base, extra, iou=0.45):
     out = list(base or [])
     for box, score in extra or []:
@@ -402,15 +437,24 @@ def detect_faces_rotated(frame_bgr, base=None, rotations=(90, 270),
     h, w = frame_bgr.shape[:2]
     extra = []
     for rot in rots:
-        if rot == 90:
-            rframe = cv2.rotate(frame_bgr, cv2.ROTATE_90_CLOCKWISE)
-        elif rot == 180:
-            rframe = cv2.rotate(frame_bgr, cv2.ROTATE_180)
-        else:
-            rframe = cv2.rotate(frame_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        if rot in (90, 180, 270):
+            if rot == 90:
+                rframe = cv2.rotate(frame_bgr, cv2.ROTATE_90_CLOCKWISE)
+            elif rot == 180:
+                rframe = cv2.rotate(frame_bgr, cv2.ROTATE_180)
+            else:
+                rframe = cv2.rotate(frame_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            for box, score in detect_faces(
+                    rframe, score_threshold, max_area):
+                mapped = _map_box_back(box, rot, w, h)
+                if mapped is not None:
+                    extra.append((mapped, score))
+            continue
+        # 45도 같은 임의 각도: 누운 얼굴/기울어진 얼굴 검출
+        rframe, m = _rotate_frame_angle(frame_bgr, rot)
         for box, score in detect_faces(
                 rframe, score_threshold, max_area):
-            mapped = _map_box_back(box, rot, w, h)
+            mapped = _map_angle_box_back(box, m, w, h, rot)
             if mapped is not None:
                 extra.append((mapped, score))
     return _merge_face_dets(base, extra)
@@ -440,7 +484,7 @@ def detect_faces_in_person_crops(frame_bgr, persons, scale=2.0,
         sc = 2.0
     out = []
 
-    def _scan(crop, cx1, cy1, cx2, cy2):
+    def _scan(crop, cx1, cy1, cx2, cy2, angles=(90, 270)):
         if crop.shape[0] < 20 or crop.shape[1] < 20:
             return []
         cw = min(720, max(32, int((cx2 - cx1) * sc)))
@@ -450,7 +494,8 @@ def detect_faces_in_person_crops(frame_bgr, persons, scale=2.0,
         fy = (cy2 - cy1) / float(ch)
         found = []
         for box, score in detect_faces_rotated(
-                big, score_threshold=score_threshold):
+                big, score_threshold=score_threshold,
+                rotations=tuple(angles)):
             x1 = cx1 + float(box[0]) * fx
             y1 = cy1 + float(box[1]) * fy
             x2 = cx1 + float(box[2]) * fx
@@ -466,6 +511,12 @@ def detect_faces_in_person_crops(frame_bgr, persons, scale=2.0,
         bw, bh = px2 - px1, py2 - py1
         if bw < 18 or bh < 24:
             continue
+        # 큰 전경 사람은 YuNet/포즈가 얼굴을 직접 잡는다. 사람 크롭 확대는
+        # 옷/명치/허리 피부를 얼굴로 오검출하기 쉬우므로 건너뛴다.
+        # 단, 가로로 넓은 박스(누운 사람/여러 명)는 얼굴이 위쪽에 없을 수
+        # 있어 크롭 재검출을 허용한다.
+        if bh > 1.5 * bw and (bh > 0.38 * h or bw > 0.35 * w):
+            continue
         m = 0.10 * max(bw, bh)
         cx1 = max(0, int(px1 - m))
         cx2 = min(w, int(px2 + m))
@@ -479,6 +530,12 @@ def detect_faces_in_person_crops(frame_bgr, persons, scale=2.0,
             full2 = min(h, int(py2 + m))
             found += _scan(frame_bgr[max(0, int(py1 - m)):full2, cx1:cx2],
                            cx1, max(0, int(py1 - m)), cx2, full2)
+        # 세로로 긴(서 있는) 사람 박스의 아래 28%에서 나온 '얼굴'은
+        # 신발/바닥 반사/옷자락 오검출일 가능성이 크다.
+        if bh > 1.5 * bw:
+            cut_y = py1 + 0.72 * bh
+            found = [(bx, sc) for bx, sc in found
+                     if (bx[1] + bx[3]) / 2.0 <= cut_y]
         out.extend(found)
     out.sort(key=lambda item: item[1], reverse=True)
     merged = []
@@ -646,13 +703,15 @@ class FaceTracker:
         return [float(box[i]) + float(vel[i]) for i in range(4)]
 
     @staticmethod
-    def _smooth_size(old, new, max_ratio=0.15, min_delta=8.0):
+    def _smooth_size(old, new, max_ratio=0.15, min_delta=8.0,
+                     max_aspect=2.2):
         """검출 박스 크기가 한 프레임에 급변하지 않게 제한한다.
 
         얼굴을 옷/가방으로 잘못 잡은 큰 박스가 한 프레임만 들어와도
         모자이크가 갑자기 커지는 것을 막는다. 중심은 새 검출을 따르고
         폭/높이만 최대 ±15%씩 변한다. 작은 원거리 얼굴은 15%가 몇 px에
-        불과해 금방 뒤처지므로 최소 ±8px은 허용한다.
+        불과해 금방 뒤처지므로 최소 ±8px은 허용한다. 얼굴 박스가 세로로
+        길어지면(몸통 오검출) 가로/세로 비율도 2.2 이내로 제한한다.
         """
         if old is None:
             return [float(v) for v in new]
@@ -665,6 +724,10 @@ class FaceTracker:
         dh = max(oh * r, float(min_delta))
         w = min(ow + dw, max(ow - dw, nw))
         h = min(oh + dh, max(oh - dh, nh))
+        if h > max_aspect * w:
+            h = max_aspect * w
+        elif w > max_aspect * h:
+            w = max_aspect * h
         cx = (float(new[0]) + float(new[2])) / 2.0
         cy = (float(new[1]) + float(new[3])) / 2.0
         return [cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0]
@@ -767,6 +830,13 @@ class FaceTracker:
         """VLM이 찾은 얼굴 박스를 추적 초기값으로 넣는다."""
         if not box:
             return None
+        try:
+            bw = abs(float(box[2]) - float(box[0]))
+            bh = abs(float(box[3]) - float(box[1]))
+        except (TypeError, ValueError, IndexError):
+            return None
+        if bw < 8 or bh < 8 or not (0.45 <= bw / bh <= 2.2):
+            return None
         ang = float(angle or getattr(box, "angle", 0.0))
         best, best_score = None, 0.0
         for track in self.tracks.values():
@@ -804,6 +874,13 @@ class FaceTracker:
                       key=lambda item: float(item[1]), reverse=True)
         for det in dets:
             box, score = det[0], det[1]
+            try:
+                bw = abs(float(box[2]) - float(box[0]))
+                bh = abs(float(box[3]) - float(box[1]))
+            except (TypeError, ValueError, IndexError):
+                continue
+            if bw < 8 or bh < 8 or not (0.45 <= bw / bh <= 2.2):
+                continue
             angle = (float(det[2]) if len(det) > 2
                      else float(getattr(box, "angle", 0.0)))
             best, best_score = None, 0.0

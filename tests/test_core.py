@@ -62,9 +62,9 @@ def test_tracker_holds_big_jump_until_confirmed():
 
 def test_tracker_limits_pending_size_growth():
     t = FaceTracker()
-    t.update([([100, 100, 160, 170], 0.9)])
+    t.update([([100, 100, 200, 170], 0.9)])
     # 높이가 2배로 튄 검출은 확인 전까지 20%만 키워 그린다.
-    t.update([([100, 100, 160, 240], 0.9)])
+    t.update([([100, 100, 200, 240], 0.9)])
     tr = t.active()[0]
     assert tr.pending_box is not None
     assert (tr.box[3] - tr.box[1]) <= 84.1
@@ -949,6 +949,16 @@ def test_region_helpers_limit_area_and_person():
     assert not _face_person_size_ok((100, 100, 300, 500), persons)
 
 
+def test_face_tracker_rejects_body_sized_tall_box():
+    from src.faces import FaceTracker
+    tr = FaceTracker()
+    tr.update([([100, 100, 200, 700], 0.95)])  # 세로로 긴 몸통 박스
+    assert not tr.active()
+    tr.update([([100, 100, 180, 200], 0.95)])
+    assert len(tr.active()) == 1
+    assert FaceTracker().seed([100, 100, 200, 700]) is None
+
+
 def test_face_tracker_smooths_sudden_size_jump():
     from src.faces import FaceTracker
     old = [0, 0, 100, 100]
@@ -977,6 +987,53 @@ def test_small_face_mask_gets_larger_margins():
     assert small[0] > large[0]
     assert small[1] > large[1]
     assert large == (0.14, 0.25, 0.15)
+
+
+def test_crop_face_scan_skips_large_foreground_person(monkeypatch):
+    import src.faces as faces
+    calls = []
+    monkeypatch.setattr(
+        faces, "detect_faces_rotated",
+        lambda *a, **k: calls.append(1) or [])
+    frame = np.zeros((1280, 720, 3), np.uint8)
+    faces.detect_faces_in_person_crops(
+        frame, [[0, 0, 700, 1100]], max_crops=1)
+    assert not calls
+
+
+def test_face_upper_person_gate():
+    from src.pipeline import _face_upper_ok
+    persons = [[0, 0, 100, 500]]
+    assert _face_upper_ok([10, 10, 50, 60], persons)
+    assert not _face_upper_ok([10, 400, 50, 450], persons)
+    # 가로로 넓은(누운/회전) 사람 박스는 세로 위치로 거부하지 않는다.
+    assert _face_upper_ok([10, 80, 50, 100], [[0, 0, 500, 100]])
+    # 사람 박스가 없어도 화면 하단 25%는 반사/오검출로 본다.
+    assert not _face_upper_ok([200, 400, 240, 450], [], frame_h=500)
+    assert _face_upper_ok([200, 100, 240, 150], [], frame_h=500)
+
+
+def test_small_head_fallback_rejects_low_or_bent_person():
+    from src.pipeline import _small_head_fallback_box
+    H = 1280
+    box = _small_head_fallback_box([100, 100, 300, 900], 720, H)
+    assert box is not None
+    assert (box[2] - box[0]) < 0.4 * 200
+    # 바닥 반사/하체 조각
+    assert _small_head_fallback_box([100, 950, 300, 1200], 720, H) is None
+    # 옆으로 누운/가로로 긴 사람 박스
+    assert _small_head_fallback_box([100, 100, 500, 300], 720, H) is None
+
+
+def test_poly_size_rejects_body_sized_hallucination():
+    from src.pipeline import _poly_size_ok
+    box = [100, 100, 180, 200]
+    ok = np.array([[105, 105], [175, 105], [175, 195], [105, 195]],
+                  np.int32)
+    bad = np.array([[100, 100], [400, 100], [400, 900], [100, 900]],
+                   np.int32)
+    assert _poly_size_ok(ok, box)
+    assert not _poly_size_ok(bad, box)
 
 
 def test_face_mesh_falls_back_without_model():
