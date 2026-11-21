@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 
 from .errors import RenderCancelled
-from .faces import detect_faces, detect_faces_rotated
+from .faces import detect_faces, detect_faces_rotated, detect_faces_yolo
 from .models import MODEL_LOCK, get_model
 from .render import (FFmpegFrameWriter, cleanup_tmp, mux_audio_h264,
                      render_region)
@@ -34,6 +34,17 @@ def _env_float(name, default):
         return float(os.environ.get(name, str(default)))
     except (TypeError, ValueError):
         return float(default)
+
+
+def _box_iou(a, b):
+    ax1, ay1, ax2, ay2 = [float(v) for v in a[:4]]
+    bx1, by1, bx2, by2 = [float(v) for v in b[:4]]
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    aa = max(1.0, ax2 - ax1) * max(1.0, ay2 - ay1)
+    ba = max(1.0, bx2 - bx1) * max(1.0, by2 - by1)
+    return inter / max(1.0, aa + ba - inter)
 
 
 def _probe(path):
@@ -111,6 +122,33 @@ def _person_size_ok(box, persons, max_w=0.75, max_h=0.55):
     return True
 
 
+def _face_position_ok(box, persons, score):
+    """감사 보정도 렌더러와 같은 얼굴 위치 게이트를 쓴다.
+
+    팔/가슴/옷자락의 YOLO 오검출을 사후 보정으로 다시 칠하는 것을 막는다.
+    """
+    if not persons:
+        return True
+    try:
+        x1, y1, x2, y2 = [float(v) for v in box[:4]]
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        score = float(score)
+    except (TypeError, ValueError):
+        return False
+    for px1, py1, px2, py2 in persons:
+        pw, ph = px2 - px1, py2 - py1
+        if pw < 8 or ph < 16:
+            continue
+        if not (px1 <= cx <= px2 and py1 <= cy <= py2):
+            continue
+        rel = (cy - py1) / max(1.0, ph)
+        if score >= 0.65:
+            return rel <= 0.60
+        wide = pw > 1.15 * max(1.0, ph)
+        return rel <= (0.30 if wide else 0.18)
+    return True
+
+
 def audit_faces(input_path, output_path, cancel_fn=None):
     """입력/출력 얼굴을 비교해 마스크 누락 의심 항목을 돌려준다."""
     total_in, _fps, _w, _h = _probe(input_path)
@@ -119,7 +157,7 @@ def audit_faces(input_path, output_path, cancel_fn=None):
     if total <= 0 or ow <= 0 or oh <= 0:
         return {"checked": 0, "suspicious": 0, "fixable": 0,
                 "frames": [], "error": "영상 프레임을 읽을 수 없습니다."}
-    max_samples = max(10, _env_int("MOSAIC_FACE_AUDIT_SAMPLES", 120))
+    max_samples = max(10, _env_int("MOSAIC_FACE_AUDIT_SAMPLES", 240))
     step = max(1, total // max_samples)
     threshold = max(0.1, _env_float("MOSAIC_FACE_AUDIT_DIFF", 3.0))
     rotate = os.environ.get("MOSAIC_FACE_ROTATE", "1") != "0"
@@ -147,11 +185,20 @@ def audit_faces(input_path, output_path, cancel_fn=None):
             if cancel_fn is not None and cancel_fn():
                 raise RenderCancelled()
             if idx % step == 0:
-                dets = (detect_faces_rotated(fi) if rotate
-                        else detect_faces(fi))
+                dets = [(b, s, False) for b, s in (
+                    detect_faces_rotated(fi) if rotate
+                    else detect_faces(fi))]
+                try:
+                    for _yb, _ys in detect_faces_yolo(fi):
+                        if any(_box_iou(_yb, _db) > 0.45
+                               for _db, _ds, _iy in dets):
+                            continue
+                        dets.append((_yb, _ys, True))
+                except Exception:
+                    pass
                 persons = (_person_boxes(person_model, fi)
                            if person_model is not None else None)
-                for box, score in dets:
+                for box, score, is_yolo in dets:
                     try:
                         x1, y1, x2, y2 = [int(round(float(v)))
                                           for v in box[:4]]
@@ -164,7 +211,7 @@ def audit_faces(input_path, output_path, cancel_fn=None):
                     if x2 - x1 < 20 or y2 - y1 < 20:
                         continue
                     score = float(score)
-                    if score < 0.70:
+                    if score < (0.55 if is_yolo else 0.70):
                         continue
                     area_ratio = ((x2 - x1) * (y2 - y1)
                                   / float(max(1, ow * oh)))
@@ -180,6 +227,8 @@ def audit_faces(input_path, output_path, cancel_fn=None):
                             continue
                         if not _person_size_ok(box, persons):
                             continue
+                        if not _face_position_ok(box, persons, score):
+                            continue
                     a = fi[y1:y2, x1:x2]
                     b = fo[y1:y2, x1:x2]
                     if a.size == 0 or b.size == 0:
@@ -187,16 +236,30 @@ def audit_faces(input_path, output_path, cancel_fn=None):
                     if a.shape != b.shape:
                         b = cv2.resize(b, (a.shape[1], a.shape[0]))
                     diff = float(np.mean(cv2.absdiff(a, b)))
+                    hh, ww = a.shape[:2]
+                    if hh >= 12 and ww >= 12:
+                        ux1, ux2 = int(ww * 0.15), int(ww * 0.85)
+                        uy1, uy2 = int(hh * 0.08), int(hh * 0.56)
+                        ly1, ly2 = int(hh * 0.44), int(hh * 0.92)
+                        du = float(np.mean(cv2.absdiff(
+                            a[uy1:uy2, ux1:ux2], b[uy1:uy2, ux1:ux2])))
+                        dl = float(np.mean(cv2.absdiff(
+                            a[ly1:ly2, ux1:ux2], b[ly1:ly2, ux1:ux2])))
+                        # 얼굴 위/아래 중 한쪽만 가려진 부분 마스크도 잡는다.
+                        diff = min(diff, du, dl)
                     checked += 1
                     if diff >= threshold:
                         continue
                     row = {"frame": int(idx),
                            "box": [int(x1), int(y1), int(x2), int(y2)],
                            "score": round(score, 3),
+                           "source": "yolo" if is_yolo else "yunet",
                            "diff": round(float(diff), 2)}
                     suspicious.append(row)
                     side = min(x2 - x1, y2 - y1)
-                    if score >= 0.78 and side >= 28:
+                    if side >= 28 and (
+                            (is_yolo and score >= 0.55)
+                            or score >= 0.78):
                         fixable.append(row)
             idx += 1
     finally:
@@ -228,7 +291,14 @@ def fix_audited_faces(output_path, fixes, *, style="pixel", blocks=30,
         return 0
     by_frame = {}
     for row in fixes:
-        by_frame.setdefault(int(row["frame"]), []).append(row["box"])
+        try:
+            frame = int(row["frame"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        for k in range(-2, 3):
+            fidx = frame + k
+            if 0 <= fidx < total:
+                by_frame.setdefault(fidx, []).append(row["box"])
     tmp = output_path + ".auditfix.mp4"
     muxed = output_path + ".audited.mp4"
     cleanup_tmp(tmp)
@@ -246,7 +316,12 @@ def fix_audited_faces(output_path, fixes, *, style="pixel", blocks=30,
                 break
             boxes = by_frame.get(idx)
             if boxes:
+                uniq = []
                 for box in boxes:
+                    if any(_box_iou(box, u) > 0.85 for u in uniq):
+                        continue
+                    uniq.append(box)
+                for box in uniq:
                     x1, y1, x2, y2 = _expand_box(box, w, h)
                     if render_region(frame, x1, y1, x2, y2,
                                      style=style,

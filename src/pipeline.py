@@ -702,12 +702,58 @@ def _face_upper_ok(box, persons, max_frac=0.42, frame_h=None,
                 rel = (cy - py1) / max(1.0, py2 - py1)
                 if rel <= max_frac:
                     continue
-            if any(_overlap_ratio(box, h) > 0.20 for h in heads):
+            if any(_overlap_ratio(box, h) > 0.50 for h in heads):
                 continue
             return False
     if not inside_any and frame_h:
         return cy <= 0.75 * float(frame_h)
     return True
+
+
+def _in_wide_person(box, persons):
+    if not persons:
+        return False
+    try:
+        cx = (float(box[0]) + float(box[2])) / 2.0
+        cy = (float(box[1]) + float(box[3])) / 2.0
+    except (TypeError, ValueError, IndexError):
+        return False
+    for p in persons:
+        try:
+            px1, py1, px2, py2 = [float(v) for v in p[:4]]
+        except (TypeError, ValueError, IndexError):
+            continue
+        if (px1 <= cx <= px2 and py1 <= cy <= py2
+                and (px2 - px1) > 1.15 * max(1.0, py2 - py1)):
+            return True
+    return False
+
+
+def _force_face_ok(box, persons, frame_h, score=0.0):
+    """YOLO 강제 마스크가 얼굴 위치인지 확인한다."""
+    try:
+        cx = (float(box[0]) + float(box[2])) / 2.0
+        cy = (float(box[1]) + float(box[3])) / 2.0
+    except (TypeError, ValueError, IndexError):
+        return False
+    if not persons:
+        return cy <= 0.75 * float(frame_h)
+    for p in persons:
+        try:
+            px1, py1, px2, py2 = [float(v) for v in p[:4]]
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not (px1 <= cx <= px2 and py1 <= cy <= py2):
+            continue
+        rel = (cy - py1) / max(1.0, py2 - py1)
+        # 고신뢰 YOLO 얼굴은 누운 사람/숙인 사람처럼 사람 박스 안에서
+        # 아래쪽에 있어도 그린다. 팔/가슴 오검출은 점수가 낮아 여기까지
+        # 오지 않는다(호출 전 0.55 미만 제외).
+        if score >= 0.65:
+            return rel <= 0.60
+        wide = (px2 - px1) > 1.15 * max(1.0, py2 - py1)
+        return rel <= (0.32 if wide else 0.22)
+    return cy <= 0.75 * float(frame_h)
 
 
 def _face_mask_margins(box):
@@ -1382,16 +1428,37 @@ class MosaicJob:
                         raw_dets = [
                             (b, s) for b, s in raw_dets
                             if _face_person_size_ok(b, last_persons)]
+                    # YOLO 얼굴 검출기: YuNet이 놓친 마스크/누운 얼굴 보완.
+                    # 위쪽(이마)만 잡힌 얼굴은 마스크까지 아래로 확장한다.
+                    # 얼굴 후보 검증에도 같은 결과를 재사용한다(중복 추론 방지).
+                    yolo_raw = []
+                    try:
+                        yolo_raw = detect_faces_yolo(frame)
+                    except Exception:
+                        log.exception("YOLO 얼굴 검출 실패")
                     # VLM 얼굴 후보는 YuNet이 놓친 큰/측면 얼굴을 보완한다.
                     # 옷 무늬/바퀴 오검출을 막기 위해 크기·종횡비를 검증한다.
                     if face_priors:
                         prior_boxes = (face_priors.get(str(idx))
                                        or face_priors.get(idx) or [])
                         h_f, w_f = frame.shape[:2]
+                        _support = list(raw_dets) + list(yolo_raw)
                         for coords in _prior_coords(prior_boxes):
                             bx = [int(round(float(v))) for v in coords[:4]]
                             bw_, bh_ = bx[2] - bx[0], bx[3] - bx[1]
                             if bw_ < 20 or bh_ < 20:
+                                continue
+                            # 큰 얼굴 후보는 실제 검출기(YuNet/YOLO)가
+                            # 받쳐줘야 한다. 머리카락/목/옷을 얼굴로 잡은
+                            # 큰 후보가 통째로 모자이크되는 것을 막는다.
+                            _supported = any(
+                                _overlap_ratio(bx, sb) > 0.30
+                                for sb, _ss in _support)
+                            # 검출기가 이미 잡은 얼굴은 후보 박스(대개 더
+                            # 크고 배경을 포함) 대신 검출기/트랙에 맡긴다.
+                            if _supported:
+                                continue
+                            if min(bw_, bh_) >= 40:
                                 continue
                             ar = (bw_ * bh_) / float(max(1, w_f * h_f))
                             if ar < 0.0005 or ar > 0.05:
@@ -1427,22 +1494,25 @@ class MosaicJob:
                         try:
                             missing = persons_without_faces(
                                 last_persons, raw_dets)
-                            # 가로로 넓은 사람 박스는 여러 명이 겹쳐 있거나
-                            # 누운 사람일 수 있다. 이미 얼굴이 하나 있어도
-                            # 크롭 재검출을 한 번 더 해 누운 얼굴을 찾는다.
-                            for p in last_persons:
-                                try:
-                                    pw = float(p[2]) - float(p[0])
-                                    ph = float(p[3]) - float(p[1])
-                                except (TypeError, ValueError, IndexError):
-                                    continue
-                                if pw > 1.3 * max(1.0, ph) and not any(
-                                        _overlap_ratio(p, q) > 0.80
-                                        for q in missing):
-                                    missing.append(p)
                             if missing:
                                 extra = detect_faces_in_person_crops(
                                     frame, missing, max_crops=10)
+                                # 크롭 확대는 옷/머리카락/손을 얼굴로 오검출하기
+                                # 쉽다. 확실한 검출만 받고, 이미 잡힌 얼굴과
+                                # 겹치는 중복도 버린다. 큰 크롭 검출은 전체
+                                # 프레임 YOLO 검출기가 받쳐줘야 한다.
+                                extra = [
+                                    (eb, es) for eb, es in extra
+                                    if float(es) >= 0.85
+                                    and not any(_overlap_ratio(eb, rb) > 0.35
+                                                for rb, _rs in raw_dets)
+                                    and (
+                                        min(float(eb[2]) - float(eb[0]),
+                                            float(eb[3]) - float(eb[1])) < 40
+                                        or any(
+                                            _overlap_ratio(eb, sb) > 0.30
+                                            and float(ss) >= 0.55
+                                            for sb, ss in yolo_raw))]
                                 if extra:
                                     raw_dets = list(raw_dets) + list(extra)
                                     raw_dets.sort(
@@ -1477,20 +1547,12 @@ class MosaicJob:
                                 raw_dets.append((FaceBox(bx), 0.72))
                         raw_dets.sort(
                             key=lambda item: item[1], reverse=True)
-                    # YOLO 얼굴 검출기: YuNet이 놓친 마스크/누운 얼굴 보완.
-                    # 위쪽(이마)만 잡힌 얼굴은 마스크까지 아래로 확장한다.
                     yolo_force_boxes = []
+                    yolo_force_scores = []
                     try:
-                        for _b, _s in detect_faces_yolo(frame):
-                            if any(_overlap_ratio(_b, _rb) > 0.45
-                                   for _rb, _rs in raw_dets):
-                                continue
-                            if last_persons and not _face_person_size_ok(
-                                    _b, last_persons):
-                                continue
-                            if last_persons and not _face_upper_ok(
-                                    _b, last_persons,
-                                    frame_h=frame.shape[0]):
+                        for _b, _s in yolo_raw:
+                            _wide_b = _in_wide_person(_b, last_persons)
+                            if float(_s) < 0.55:
                                 continue
                             _bw = max(1.0, float(_b[2]) - float(_b[0]))
                             _bh = max(1.0, float(_b[3]) - float(_b[1]))
@@ -1506,7 +1568,7 @@ class MosaicJob:
                                     continue
                                 if (_px1 <= _bcx <= _px2
                                         and _py1 <= _bcy <= _py2
-                                        and _bh <= 0.11 * max(
+                                        and _bh <= 0.09 * max(
                                             1.0, _py2 - _py1)
                                         and (_bcy - _py1) <= 0.15 * max(
                                             1.0, _py2 - _py1)):
@@ -1515,16 +1577,41 @@ class MosaicJob:
                             if _upper:
                                 _sx, _sy, _by = 0.30, 0.10, 1.80
                             else:
-                                _sx, _sy, _by = 0.15, 0.05, 0.10
+                                _sx, _sy, _by = 0.15, 0.05, 0.35
                             _exp = FaceBox([
                                 max(0.0, float(_b[0]) - _sx * _bw),
                                 max(0.0, float(_b[1]) - _sy * _bh),
                                 min(float(_w), float(_b[2]) + _sx * _bw),
                                 min(float(_h), float(_b[3]) + _by * _bh)],
                                 angle=0.0)
+                            # YOLO가 찾은 얼굴은 사람 박스 위치와 무관하게
+                            # 강제로 그린다. 단, YuNet이 이미 정상 위치에서
+                            # 잡은 얼굴은 중복 확장하지 않고, 점수가 낮은
+                            # 팔/가슴 오검출도 제외한다.
+                            if float(_s) >= 0.55:
+                                _covered = False
+                                for _rb, _rs in raw_dets:
+                                    if (_overlap_ratio(_b, _rb) > 0.45
+                                            and (not last_persons
+                                                 or _face_upper_ok(
+                                                     _rb, last_persons,
+                                                     frame_h=frame.shape[0]))):
+                                        _covered = True
+                                        break
+                                if not _covered:
+                                    yolo_force_boxes.append(_exp)
+                                    yolo_force_scores.append(float(_s))
+                            if any(_overlap_ratio(_b, _rb) > 0.45
+                                   for _rb, _rs in raw_dets):
+                                continue
+                            if last_persons and not _face_person_size_ok(
+                                    _b, last_persons):
+                                continue
+                            if last_persons and not _face_upper_ok(
+                                    _b, last_persons,
+                                    frame_h=frame.shape[0]):
+                                continue
                             raw_dets.append((_exp, _s))
-                            if _upper:
-                                yolo_force_boxes.append(_exp)
                         raw_dets.sort(
                             key=lambda item: item[1], reverse=True)
                     except Exception:
@@ -1545,15 +1632,27 @@ class MosaicJob:
                     hold = max(8, int(round(fps * 6.0)))
                     fresh_heads = [t.box for t in head_active if t.misses == 0]
                     persons_now = person_frames.get(idx) or []
-                    _fdict = {
-                        t.tid: list(t.box) for t in active
-                        if _face_upper_ok(t.box, persons_now,
-                                          frame_h=frame.shape[0],
-                                          heads=fresh_heads)
-                        and (t.misses <= hold
-                             or any(_overlap_ratio(t.box, h) > 0.25
-                                    for h in fresh_heads))}
+                    _fdict = {}
+                    for t in active:
+                        if not (t.misses <= hold
+                                or any(_overlap_ratio(t.box, h) > 0.25
+                                       for h in fresh_heads)):
+                            continue
+                        _ok = _face_upper_ok(
+                            t.box, persons_now, max_frac=0.22,
+                            frame_h=frame.shape[0],
+                            heads=fresh_heads)
+                        if not _ok:
+                            _ok = _in_wide_person(t.box, persons_now)
+                        if _ok:
+                            _fdict[t.tid] = list(t.box)
                     for _k, _fb in enumerate(yolo_force_boxes):
+                        _fs = (yolo_force_scores[_k]
+                               if _k < len(yolo_force_scores) else 0.0)
+                        if not _force_face_ok(
+                                _fb, persons_now, frame.shape[0],
+                                score=_fs):
+                            continue
                         _fdict[10 ** 9 + _k] = list(_fb)
                     face_frames.append(_fdict)
                     for t in active:

@@ -1017,6 +1017,26 @@ def test_face_upper_person_gate():
     assert _face_upper_ok([200, 100, 240, 150], [], frame_h=500)
 
 
+def test_force_face_gate_rejects_arm_and_chest():
+    from src.pipeline import _force_face_ok, _in_wide_person
+    upright = [[0, 0, 100, 500]]
+    assert _force_face_ok([10, 10, 50, 60], upright, 500)
+    # 팔/가슴처럼 사람 박스 중간 아래쪽의 YOLO 박스는 버린다.
+    assert not _force_face_ok([10, 110, 50, 150], upright, 500)
+    # 고신뢰 YOLO 얼굴은 누운 사람처럼 사람 박스 중간에 있어도 그린다.
+    assert _force_face_ok([10, 180, 50, 220], upright, 500, score=0.72)
+    assert not _force_face_ok([10, 350, 50, 390], upright, 500,
+                              score=0.72)
+    wide = [[0, 0, 500, 100]]
+    assert _in_wide_person([100, 20, 140, 60], wide)
+    assert not _in_wide_person([100, 20, 140, 60], upright)
+    assert _force_face_ok([100, 5, 140, 30], wide, 500)
+    assert not _force_face_ok([100, 30, 140, 70], wide, 500)
+    # 포즈가 없는 프레임은 화면 상단 75%까지만 허용한다.
+    assert _force_face_ok([100, 100, 140, 140], [], 500)
+    assert not _force_face_ok([100, 400, 140, 440], [], 500)
+
+
 def test_small_head_fallback_rejects_low_or_bent_person():
     from src.pipeline import _small_head_fallback_box
     H = 1280

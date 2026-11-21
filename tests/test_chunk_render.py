@@ -94,9 +94,11 @@ def test_face_audit_detects_and_fixes_unmasked(tmp_path, monkeypatch):
     writer = cv2.VideoWriter(str(src), cv2.VideoWriter_fourcc(*"mp4v"),
                              10, (160, 120))
     assert writer.isOpened()
+    rng = np.random.default_rng(0)
     for _ in range(10):
         frame = np.zeros((120, 160, 3), np.uint8)
-        frame[30:70, 50:90] = (0, 0, 255)
+        frame[30:70, 50:90] = rng.integers(
+            0, 255, (40, 40, 3), dtype=np.uint8)
         writer.write(frame)
     writer.release()
     shutil.copyfile(src, out)
@@ -104,6 +106,9 @@ def test_face_audit_detects_and_fixes_unmasked(tmp_path, monkeypatch):
     monkeypatch.setattr(
         face_audit, "detect_faces_rotated",
         lambda frame, **kwargs: [(FaceBox([50, 30, 90, 70]), 0.95)])
+    monkeypatch.setattr(
+        face_audit, "detect_faces_yolo",
+        lambda frame, **kwargs: [])
     before = face_audit.audit_faces(str(src), str(out))
     assert before["checked"] == 10
     assert before["suspicious"] == 10
@@ -126,9 +131,11 @@ def test_face_audit_person_gate_filters_background(tmp_path, monkeypatch):
     writer = cv2.VideoWriter(str(src), cv2.VideoWriter_fourcc(*"mp4v"),
                              10, (160, 120))
     assert writer.isOpened()
+    rng = np.random.default_rng(0)
     for _ in range(10):
         frame = np.zeros((120, 160, 3), np.uint8)
-        frame[30:70, 50:90] = (0, 0, 255)
+        frame[30:70, 50:90] = rng.integers(
+            0, 255, (40, 40, 3), dtype=np.uint8)
         writer.write(frame)
     writer.release()
     shutil.copyfile(src, out)
@@ -137,6 +144,9 @@ def test_face_audit_person_gate_filters_background(tmp_path, monkeypatch):
     monkeypatch.setattr(
         face_audit, "detect_faces_rotated",
         lambda frame, **kwargs: [(FaceBox([50, 30, 90, 70]), 0.75)])
+    monkeypatch.setattr(
+        face_audit, "detect_faces_yolo",
+        lambda frame, **kwargs: [])
 
     # 사람 박스 밖의 낮은 점수 검출(바퀴/건물 무늬 등)은 감사하지 않는다.
     monkeypatch.setattr(face_audit, "_person_boxes",
