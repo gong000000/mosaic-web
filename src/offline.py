@@ -197,6 +197,48 @@ def find_gap_ranges(raw_frames, filled_frames, fps=30.0):
     return ranges
 
 
+def fill_same_tid_gaps(frames, cuts=(), max_gap=8, max_dist=1.0):
+    """같은 트랙 ID가 잠깐 비었다가 다시 나타난 구간을 선형 보간으로 메운다.
+
+    검출기 미스·게이트 흔들림으로 1~수 프레임이 비면 마스크가 깜빡이며
+    얼굴이 노출된다. bridge_gaps가 서로 다른 ID 사이만 잇는 것과 달리,
+    여기서는 같은 ID의 앞뒤 박스가 가까우면 사이를 메운다.
+    장면 전환을 넘지 않고, 멀리 움직인 경우(다른 사람)는 잇지 않는다.
+    """
+    cuts = set(cuts or ())
+    out = [dict(f) for f in frames]
+    by_tid = {}
+    for i, boxes in enumerate(frames):
+        for tid in boxes:
+            by_tid.setdefault(tid, []).append(i)
+    for tid, idxs in by_tid.items():
+        idxs = sorted(idxs)
+        for a, b in zip(idxs, idxs[1:]):
+            gap = b - a - 1
+            if gap < 1 or gap > max_gap:
+                continue
+            if _cut_between(cuts, a, b):
+                continue
+            try:
+                A = [float(v) for v in frames[a][tid]]
+                B = [float(v) for v in frames[b][tid]]
+            except (KeyError, TypeError, ValueError, IndexError):
+                continue
+            size = max(B[2] - B[0], B[3] - B[1],
+                       A[2] - A[0], A[3] - A[1], 1.0)
+            ca = ((A[0] + A[2]) / 2.0, (A[1] + A[3]) / 2.0)
+            cb = ((B[0] + B[2]) / 2.0, (B[1] + B[3]) / 2.0)
+            d = (((ca[0] - cb[0]) ** 2 + (ca[1] - cb[1]) ** 2) ** 0.5) / size
+            if d > min(2.0, max_dist + 0.3 * (b - a)):
+                continue
+            for k, f in enumerate(range(a + 1, b), 1):
+                if tid in out[f]:
+                    continue
+                t = k / float(b - a)
+                out[f][tid] = [A[j] + (B[j] - A[j]) * t for j in range(4)]
+    return out
+
+
 def nearest_track_values(per_frame, n_frames, cuts=()):
     """트랙별 마지막 관측값을 가장 가까운 프레임에서 가져온다.
 

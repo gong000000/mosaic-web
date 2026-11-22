@@ -41,8 +41,8 @@ from .render import (_face_ratio, render_person_strict, render_person_roi,
 from .flow import RegionFlow, shift_box
 from .face_mesh import FaceMeshRefiner, FacePolyCache
 from .offline import (backfill_and_smooth, bridge_gaps, find_gap_ranges,
-                      missing_track_boxes, nearest_track_values,
-                      temporal_smooth)
+                      fill_same_tid_gaps, missing_track_boxes,
+                      nearest_track_values, temporal_smooth)
 from .manual import apply_manual, normalize_regions
 from .errors import RenderCancelled
 from .select import VLMSelector
@@ -1355,6 +1355,11 @@ class MosaicJob:
             prev_face_active = []
             heads = []
             last_persons, last_persons_idx = [], -10 ** 9
+            # YOLO 강제 박스는 프레임마다 새로 검출되지만, 1~2프레임 미스에도
+            # 마스크가 깜빡이지 않게 슬롯으로 유지한다. 슬롯 ID가 안정적이라
+            # 후처리 보간/평활도 같은 얼굴로 인식한다.
+            force_slots = {}
+            force_next = 0
             cap = cv2.VideoCapture(input_path)
             if not cap.isOpened():
                 raise RuntimeError(f"입력 영상을 열 수 없습니다: {input_path}")
@@ -1371,6 +1376,7 @@ class MosaicJob:
                         head_tracker.reset()
                         prev_face_active = []
                         last_persons = []
+                        force_slots.clear()
                         cuts.add(idx)
                     prev_sig = scene_signature(frame)
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -1646,14 +1652,72 @@ class MosaicJob:
                             _ok = _in_wide_person(t.box, persons_now)
                         if _ok:
                             _fdict[t.tid] = list(t.box)
-                    for _k, _fb in enumerate(yolo_force_boxes):
-                        _fs = (yolo_force_scores[_k]
-                               if _k < len(yolo_force_scores) else 0.0)
+                    # YOLO 강제 박스를 슬롯 ID로 유지한다. 검출기가 1~2프레임
+                    # 놓쳐도 슬롯이 마지막 박스를 들고 있어 깜빡임(노출)이
+                    # 생기지 않는다. 새로 들어온 박스는 위치 게이트를 통과해야
+                    # 슬롯에 들어가고, 유지 중인 박스는 게이트 재검사 없이
+                    # 홀드 기간만 유지한다(사람 박스 흔들림에 깜빡이지 않게).
+                    _force_hold = max(12, int(round(fps * 0.66)))
+                    _fresh_held = []
+                    for _fb, _fs in zip(yolo_force_boxes, yolo_force_scores):
+                        try:
+                            _fss = float(_fs)
+                        except (TypeError, ValueError):
+                            continue
                         if not _force_face_ok(
                                 _fb, persons_now, frame.shape[0],
-                                score=_fs):
+                                score=_fss):
                             continue
-                        _fdict[10 ** 9 + _k] = list(_fb)
+                        _fresh_held.append((list(_fb), _fss))
+                    _used_slots = set()
+                    for _fb, _fs in _fresh_held:
+                        try:
+                            _cx = (float(_fb[0]) + float(_fb[2])) / 2.0
+                            _cy = (float(_fb[1]) + float(_fb[3])) / 2.0
+                            _sz = max(1.0, float(_fb[2]) - float(_fb[0]),
+                                      float(_fb[3]) - float(_fb[1]))
+                        except (TypeError, ValueError, IndexError):
+                            continue
+                        _best_id, _best_d = None, None
+                        for _sid, _s in force_slots.items():
+                            if _sid in _used_slots:
+                                continue
+                            if _s.get("misses", 0) > _force_hold:
+                                continue
+                            try:
+                                _pb = _s["box"]
+                                _px = (float(_pb[0]) + float(_pb[2])) / 2.0
+                                _py = (float(_pb[1]) + float(_pb[3])) / 2.0
+                                _ps = max(1.0, float(_pb[2]) - float(_pb[0]),
+                                          float(_pb[3]) - float(_pb[1]))
+                            except (TypeError, ValueError, IndexError):
+                                continue
+                            _d = (((_cx - _px) ** 2 + (_cy - _py) ** 2) ** 0.5
+                                  / max(1.0, _sz, _ps))
+                            if _d <= 0.8 or _overlap_ratio(_fb, _pb) > 0.15:
+                                if _best_d is None or _d < _best_d:
+                                    _best_d, _best_id = _d, _sid
+                        if _best_id is None:
+                            _best_id = force_next
+                            force_next += 1
+                        force_slots[_best_id] = {
+                            "box": list(_fb), "score": float(_fs),
+                            "misses": 0}
+                        _used_slots.add(_best_id)
+                    for _sid in list(force_slots):
+                        if _sid not in _used_slots:
+                            try:
+                                force_slots[_sid]["misses"] = int(
+                                    force_slots[_sid].get("misses", 0)) + 1
+                            except (TypeError, ValueError):
+                                force_slots[_sid]["misses"] = 1
+                            if force_slots[_sid]["misses"] > _force_hold:
+                                del force_slots[_sid]
+                    for _sid, _s in force_slots.items():
+                        try:
+                            _fdict[10 ** 9 + int(_sid)] = list(_s["box"])
+                        except (TypeError, ValueError, IndexError):
+                            continue
                     face_frames.append(_fdict)
                     for t in active:
                         face_angles[idx][t.tid] = float(
@@ -1683,8 +1747,14 @@ class MosaicJob:
             # (0.2*prev + 0.6*cur + 0.2*next, 미래 프레임을 이미 알고 있음)
             face_s = temporal_smooth(face_s, cuts)
             head_s = temporal_smooth(head_s, cuts)
-            # 오래 못 본 얼굴이 멀리 흘러간 고스트면 2패스에서 mesh 검증을
-            # 거쳐 버린다. 갓 놓친 얼굴(6프레임 이내)은 무조건 그린다.
+            # 같은 ID가 1~수 프레임 비었다가 돌아오면 선형 보간으로 메운다.
+            # 검출기 단발 미스·게이트 흔들림이 그대로 노출(깜빡임)이 되지 않게
+            # 한다. 멀리 움직인 경우는 잇지 않아 고스트를 만들지 않는다.
+            face_s = fill_same_tid_gaps(face_s, cuts, max_gap=8)
+            # 오래 못 보고 멀리 흘러간 박스는 2패스에서 mesh로 먼저 확인한다.
+            # mesh가 얼굴을 찾으면 그 모양으로 그리고, 못 찾아도 마스크를
+            # 빼지 않는다(노출보다 유지 우선). 갓 놓친 얼굴(6프레임 이내)은
+            # mesh 확인 없이 그린다.
             n_frames = len(face_s)
             ghost_skip = [set() for _ in range(n_frames)]
             for i, boxes in enumerate(face_s):
@@ -1859,8 +1929,11 @@ class MosaicJob:
                         bs = mosaic_block_size(side, side, blocks)
                         if tid in ghost_skip[done]:
                             # 오래 못 보고 멀리 흘러간 박스는 날것의 mesh로
-                            # 검증한다. 얼굴이 아니면 배경 고스트로 보고
-                            # 그리지 않는다(캐시 재사용 금지).
+                            # 먼저 검증한다. mesh가 얼굴을 찾으면 그 모양으로
+                            # 그리고, 못 찾았다고 마스크를 빼지 않는다.
+                            # mesh 실패=None은 '얼굴 아님'이 아니라 불확실이라
+                            # 노출(깜빡임)보다 유지가 우선이다. 아래 일반 경로의
+                            # 캐시 모양/박스 마스크로 그린다.
                             raw = None
                             if mesh_refiner is not None:
                                 try:
@@ -1868,21 +1941,17 @@ class MosaicJob:
                                         frame, box)
                                 except Exception:
                                     raw = None
-                            if raw is None:
-                                debug_marks.append((box, (128, 128, 128),
-                                                    f"G{tid}"))
-                                face_cache.drop(tid)
-                                continue
-                            if render_face_polygon(
-                                    frame, raw, style=style, blocks=blocks,
-                                    blur=blur, block_size=bs):
-                                rendered_tids.add(tid)
-                                track_frames[tid] += 1
-                                rendered_cats.add("face")
-                                drawn_faces_frame.append(box)
-                                debug_marks.append(
-                                    (box, (0, 255, 0), f"F{tid}"))
-                                continue
+                            if raw is not None:
+                                if render_face_polygon(
+                                        frame, raw, style=style, blocks=blocks,
+                                        blur=blur, block_size=bs):
+                                    rendered_tids.add(tid)
+                                    track_frames[tid] += 1
+                                    rendered_cats.add("face")
+                                    drawn_faces_frame.append(box)
+                                    debug_marks.append(
+                                        (box, (0, 255, 0), f"F{tid}"))
+                                    continue
                         poly, _fresh = face_cache.polygon(frame, tid, box)
                         if (poly is not None
                                 and _poly_covers_box(
@@ -2090,8 +2159,8 @@ class MosaicJob:
         rs.progress_base = 0.0 if p.fast_person_only else 0.5
         rs.region_flow = RegionFlow()
         rs.face_trk = FaceTracker(
-            max_miss=max(8, int(round(p.fps * 0.80))),
-            seed_miss=max(4, int(round(p.fps * 0.25))))
+            max_miss=max(24, int(round(p.fps * 3.0))),
+            seed_miss=max(8, int(round(p.fps * 1.0))))
         try:
             rs.face_mesh = FaceMeshRefiner.shared()
             if not rs.face_mesh.available():
@@ -2869,6 +2938,26 @@ class MosaicJob:
                             _dets.sort(key=lambda it: it[1], reverse=True)
             except Exception:
                 log.exception("얼굴-사람 게이트 실패")
+            # YuNet이 놓친 마스크/누운/측면 얼굴을 YOLO가 보완한다.
+            # 얼굴+번호판 같은 일반 경로도 깜빡임 없이 가리게 한다.
+            try:
+                _yolo_dets = detect_faces_yolo(r.orig_img)
+                if _yolo_dets:
+                    _merged = list(_dets)
+                    for _yb, _ys in _yolo_dets:
+                        try:
+                            if float(_ys) < 0.55:
+                                continue
+                        except (TypeError, ValueError):
+                            continue
+                        if any(_overlap_ratio(_yb, _b) > 0.45
+                               for _b, _s in _merged):
+                            continue
+                        _merged.append((_yb, _ys))
+                    _merged.sort(key=lambda it: it[1], reverse=True)
+                    _dets = _merged
+            except Exception:
+                log.exception("YOLO 얼굴 보완 실패(사람 경로)")
             face_trk.update(_dets, flow_fn=_ff)
             rs.prev_gray_run = _g
             _fbs = []

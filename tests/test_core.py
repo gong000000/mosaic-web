@@ -1001,6 +1001,33 @@ def test_crop_face_scan_skips_large_foreground_person(monkeypatch):
     assert not calls
 
 
+def test_fill_same_tid_gaps_interpolates_short_holes():
+    from src.offline import fill_same_tid_gaps
+    frames = [
+        {1: [0, 0, 10, 10]},
+        {},
+        {1: [4, 0, 14, 10]},
+    ]
+    out = fill_same_tid_gaps(frames, max_gap=8)
+    assert 1 in out[1]
+    assert out[1][1] == [2.0, 0.0, 12.0, 10.0]
+
+
+def test_fill_same_tid_gaps_skips_far_jumps_and_cuts():
+    from src.offline import fill_same_tid_gaps
+    frames = [
+        {1: [0, 0, 10, 10]},
+        {},
+        {1: [100, 0, 110, 10]},
+    ]
+    out = fill_same_tid_gaps(frames, max_gap=8)
+    assert 1 not in out[1]
+    out2 = fill_same_tid_gaps(
+        [{1: [0, 0, 10, 10]}, {}, {1: [4, 0, 14, 10]}],
+        cuts={2}, max_gap=8)
+    assert 1 not in out2[1]
+
+
 def test_face_upper_person_gate():
     from src.pipeline import _face_upper_ok
     persons = [[0, 0, 100, 500]]
