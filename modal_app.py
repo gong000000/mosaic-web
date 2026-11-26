@@ -154,9 +154,9 @@ def queue_keepalive():
 
 @app.function(
     image=image,
-    # L4를 우선 쓰되, 용량이 없으면 T4로 자동 대체한다.
+    # L4를 우선 쓰되, 용량이 없으면 T4/A10G/L40S/A100으로 자동 대체한다.
     # (L4만 고정하면 Modal 용량이 없을 때 앱이 계속 로딩 상태로 남는다.)
-    gpu=["L4", "T4"],
+    gpu=["L4", "T4", "A10G", "L40S", "A100"],
     cpu=8.0,
     memory=16384,
     timeout=7200,

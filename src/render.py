@@ -120,18 +120,23 @@ class FFmpegFrameWriter:
         return cv2.resize(frame, (self.width, self.height),
                           interpolation=cv2.INTER_AREA)
 
-    def _log_stderr(self, what):
+    def _read_stderr_tail(self, limit=1200):
         try:
             err = getattr(self, "_err", None)
             if err is None:
-                return
+                return ""
             err.seek(0, os.SEEK_END)
             size = err.tell()
-            err.seek(max(0, size - 1500))
-            tail = err.read().decode("utf-8", "replace")
-            log.error("ffmpeg %s: %s", what, tail)
+            err.seek(max(0, size - int(limit)))
+            return err.read().decode("utf-8", "replace").strip()
         except Exception:
-            log.exception("ffmpeg stderr 읽기 실패")
+            return ""
+
+    def _log_stderr(self, what):
+        tail = self._read_stderr_tail()
+        if tail:
+            log.error("ffmpeg %s: %s", what, tail)
+        return tail
 
     def _close_err(self):
         err = getattr(self, "_err", None)
@@ -163,10 +168,11 @@ class FFmpegFrameWriter:
             raise RuntimeError(f"ffmpeg 종료 실패: {e}")
         if (code != 0 or not os.path.exists(self.output_path)
                 or os.path.getsize(self.output_path) == 0):
-            self._log_stderr(f"인코딩 실패 code={code}")
+            tail = self._log_stderr(f"인코딩 실패 code={code}")
             self._close_err()
             cleanup_tmp(self.output_path)
-            raise RuntimeError("ffmpeg H.264 인코딩 실패")
+            detail = f" ({tail[:500]})" if tail else ""
+            raise RuntimeError(f"ffmpeg H.264 인코딩 실패{detail}")
         self._close_err()
         return self.output_path
 

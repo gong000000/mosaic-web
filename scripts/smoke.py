@@ -35,8 +35,11 @@ for m in project_mods:
 try:
     from src.config import CANDS, CATEGORY_TYPE, KO
     assert len(CANDS) == 7, CANDS
-    assert set(CATEGORY_TYPE) == set(CANDS), CATEGORY_TYPE
-    assert set(KO) == set(CANDS), KO
+    # passenger는 UI/CANDS에서는 제외됐지만 내부 호환을 위해
+    # CATEGORY_TYPE/KO에 남아 있을 수 있다. 공개 카테고리는 모두
+    # 두 매핑에 존재해야 한다.
+    assert set(CANDS) <= set(CATEGORY_TYPE), CATEGORY_TYPE
+    assert set(CANDS) <= set(KO), KO
     print("OK category config")
 except Exception as e:
     bad.append("category config")
