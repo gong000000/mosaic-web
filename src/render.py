@@ -204,7 +204,7 @@ def mosaic_block_size(w, h, blocks=30):
     """
     strength = max(1, int(blocks))
     count = max(3.0, min(8.0, 156.0 / max(15.0, float(strength))))
-    return max(4, int(round(min(w, h) / count)))
+    return max(6, int(round(min(w, h) / count)))
 
 
 def render_mosaic(roi, style="pixel", blocks=30, blur=61, block_size=None):
