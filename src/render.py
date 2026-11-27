@@ -518,14 +518,16 @@ def region_pad_for(cat, w, h):
     return 4
 
 
-def render_region(frame, x1, y1, x2, y2, style="pixel", blocks=30, blur=61, pad=6):
+def render_region(frame, x1, y1, x2, y2, style="pixel", blocks=30, blur=61,
+                  pad=6, block_size=None):
     """사람과 무관한 배경 영역(번호판·간판·문서 등)을 사각형으로 가린다."""
     x1c, y1c = max(0, int(x1) - pad), max(0, int(y1) - pad)
     x2c, y2c = min(frame.shape[1], int(x2) + pad), min(frame.shape[0], int(y2) + pad)
     if x2c - x1c < 8 or y2c - y1c < 8:
         return False
     roi = frame[y1c:y2c, x1c:x2c]
-    mos = render_mosaic(roi, style=style, blocks=blocks, blur=blur)
+    mos = render_mosaic(roi, style=style, blocks=blocks, blur=blur,
+                        block_size=block_size)
     out = frame[y1c:y2c, x1c:x2c]
     try:
         alpha = 0.6

@@ -2041,11 +2041,14 @@ class MosaicJob:
                             if not region_has_detail(frame, (x1, y1, x2, y2),
                                                      cat):
                                 continue
+                            bsz = (max(4, min(12, min(x2 - x1, y2 - y1) // 4))
+                                   if cat == "license_plate" else None)
                             if render_region(frame, x1, y1, x2, y2,
                                              style=style, blocks=blocks,
                                              blur=blur,
                                              pad=region_pad_for(
-                                                 cat, x2 - x1, y2 - y1)):
+                                                 cat, x2 - x1, y2 - y1),
+                                             block_size=bsz):
                                 rendered_region_cats.add(cat)
                                 rendered_cats.add(cat)
 
