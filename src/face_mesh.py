@@ -9,6 +9,7 @@ YuNet 박스 + 고정 23점 폴리곤은 모든 사람에게 같은 모양이라
 """
 from __future__ import annotations
 
+import logging
 import os
 import threading
 
@@ -16,6 +17,8 @@ import cv2
 import numpy as np
 
 from .config import ROOT_DIR
+
+log = logging.getLogger("mosaic.face_mesh")
 
 MODEL_PATH = os.path.join(ROOT_DIR, "weights", "face_landmarker.task")
 # 배포 이미지는 /opt/weights에 모델을 빌드 때 내려받는다.
@@ -41,6 +44,7 @@ class FaceMeshRefiner:
     _lock = threading.Lock()
 
     def __init__(self, model_path=None):
+        self._allow_advanced = model_path is None
         if model_path is None:
             if os.path.exists(DEPLOY_MODEL_PATH):
                 model_path = DEPLOY_MODEL_PATH
@@ -54,6 +58,7 @@ class FaceMeshRefiner:
             if os.path.exists(DEPLOY_SKIN_MODEL_PATH) else SKIN_MODEL_PATH)
         self._skin = None
         self._skin_ok = None
+        self.last_advanced = False
 
     @classmethod
     def shared(cls):
@@ -117,9 +122,37 @@ class FaceMeshRefiner:
         return self._skin_ok
 
     def available(self):
-        return self._mesh_available() or self._skin_available()
+        return (self._mesh_available() or self._skin_available()
+                or self._advanced_available())
 
-    def polygon_for_box(self, frame_bgr, box):
+    def _advanced_available(self):
+        if not getattr(self, "_allow_advanced", True):
+            return False
+        try:
+            from .face_seg import FaceSegmentation
+            return FaceSegmentation.shared().available()
+        except Exception:
+            return False
+
+    def _advanced_polygon(self, frame_bgr, box, use_parse=True):
+        if not getattr(self, "_allow_advanced", True):
+            return None
+        try:
+            from .face_seg import FaceSegmentation
+            return FaceSegmentation.shared().polygon_for_box(
+                frame_bgr, box, use_parse=use_parse)
+        except Exception:
+            return None
+
+    def polygon_for_box(self, frame_bgr, box, advanced=True,
+                        use_parse=True):
+        self.last_advanced = False
+        if advanced:
+            ap = self._advanced_polygon(frame_bgr, box,
+                                        use_parse=use_parse)
+            if ap is not None:
+                self.last_advanced = True
+                return ap
         """얼굴 외곽 폴리곤.
 
         mesh는 얼굴 전체를 안정적으로 덮지만 헤어라인·목까지 포함할 수 있고,
@@ -412,12 +445,102 @@ class FacePolyCache:
     같은 점 개수로 리샘플한 뒤 EMA로 섞어 모양 떨림을 없앤다.
     """
 
-    def __init__(self, mesh=None, refresh_every=0, alpha=0.30):
+    def __init__(self, mesh=None, refresh_every=0, alpha=0.30,
+                 advanced=True):
         self.mesh = mesh
         self.refresh_every = max(0, int(refresh_every))
         self.alpha = min(0.9, max(0.05, float(alpha)))
+        self.advanced = bool(advanced)
         self.mem = {}
         self.buckets = {}
+        self._pre_frame = None
+        self._pre = {}
+        self._skip_frame = None
+        self._call_no = 0
+        self.last_advanced = False
+
+    def precompute(self, frame_bgr, items):
+        """Run the expensive mask refiner once per frame for all faces.
+
+        SAM 2.1 is fast after the image embedding is computed, but the
+        embedding must only be built once per frame.  The pipeline calls this
+        before its per-face render loop.
+        """
+        self._pre_frame = frame_bgr
+        self._pre = {}
+        self._skip_frame = None
+        self._call_no += 1
+        items = list(items or [])
+        try:
+            max_parse = max(0, int(os.environ.get(
+                "MOSAIC_FACE_PARSE_MAX_FACES", "6")))
+        except (TypeError, ValueError):
+            max_parse = 6
+        use_parse = (self.advanced and len(items) <= max_parse)
+        try:
+            adv_min = max(0, int(os.environ.get(
+                "MOSAIC_FACE_ADV_MIN_SIDE", "44")))
+        except (TypeError, ValueError):
+            adv_min = 44
+        # A crowded scene (subway, crowd) can contain 20+ faces.  Running the
+        # parser per face every frame is slower than the rest of the render
+        # combined.  SAM 2 still refines the shape; the relative polygon from
+        # the previous frame is projected onto the new boxes on skipped frames.
+        # New tracks have no cache entry, so they are always computed.
+        if self.advanced and self.mem:
+            try:
+                every = int(os.environ.get(
+                    "MOSAIC_FACE_MASK_EVERY",
+                    "1" if len(items) <= 6 else "3"))
+            except (TypeError, ValueError):
+                every = 1 if len(items) <= 6 else 3
+            every = max(1, every)
+            if every > 1 and self._call_no % every != 0:
+                self._skip_frame = frame_bgr
+                return
+        if self.advanced:
+            try:
+                from .gpu_client import enabled as _remote_on
+                from .gpu_client import remote_face_masks
+                if _remote_on() and items:
+                    _boxes = [b for _tid, b in items]
+                    _polys = remote_face_masks(
+                        frame_bgr, _boxes, use_parse=use_parse)
+                    if (_polys is not None
+                            and all(p is not None for p in _polys)):
+                        for (tid, box), poly in zip(items, _polys):
+                            self._pre[tid] = (
+                                [float(v) for v in box], poly, True)
+                        if self._pre:
+                            return
+            except Exception:
+                log.exception("GPU worker 얼굴 마스크 실패 - 로컬 대체")
+        if self.mesh is None:
+            return
+        for tid, box in items:
+            try:
+                bx = [float(v) for v in box]
+            except (TypeError, ValueError):
+                continue
+            if bx[2] - bx[0] < 4 or bx[3] - bx[1] < 4:
+                continue
+            _adv_item = (self.advanced
+                         and min(bx[2] - bx[0], bx[3] - bx[1]) >= adv_min)
+            try:
+                poly = self.mesh.polygon_for_box(
+                    frame_bgr, bx, advanced=_adv_item,
+                    use_parse=(use_parse and _adv_item))
+            except TypeError:
+                try:
+                    poly = self.mesh.polygon_for_box(frame_bgr, bx)
+                except Exception:
+                    poly = None
+            except Exception:
+                poly = None
+            if poly is not None:
+                self._pre[tid] = (
+                    bx, poly,
+                    bool(getattr(self.mesh, "last_advanced", False)))
 
     def stable_side(self, tid, w, h):
         """트랙별 모자이크 블록 크기 기준(짧은 축)을 안정화한다.
@@ -443,16 +566,39 @@ class FacePolyCache:
         if bx[2] - bx[0] < 4 or bx[3] - bx[1] < 4:
             return None, False
         m = self.mem.get(tid)
-        # 1) 캐시가 있고 아직 새로 돌릴 때가 아니면 현재 박스에 투영만.
-        if m is not None and not force and m["age"] < self.refresh_every:
+        if (self._skip_frame is frame_bgr and m is not None
+                and not force):
+            self.last_advanced = bool(m.get("advanced", False))
+            return _from_rel(m["rel"], bx), False
+        # 1) Precomputed polygon for this exact frame (SAM 2.1 embedding is
+        #    built once, then each face is predicted from the same image).
+        poly = None
+        adv = False
+        if self._pre_frame is frame_bgr:
+            hit = self._pre.get(tid)
+            if hit is not None:
+                poly = hit[1]
+                adv = bool(hit[2]) if len(hit) > 2 else False
+        # 2) Cached relative polygon; the current box moves it, so the mask
+        #    follows optical-flow-corrected boxes without rerunning the mesh.
+        if poly is None and m is not None and not force \
+                and m["age"] < self.refresh_every:
             m["age"] += 1
             m["box"] = bx
+            self.last_advanced = bool(m.get("advanced", False))
             return _from_rel(m["rel"], bx), False
-        # 2) mesh 새로 시도.
-        poly = None
-        if self.mesh is not None:
+        # 3) Fresh mesh / SAM / face-parsing mask.
+        if poly is None and self.mesh is not None:
             try:
-                poly = self.mesh.polygon_for_box(frame_bgr, bx)
+                poly = self.mesh.polygon_for_box(
+                    frame_bgr, bx, advanced=self.advanced)
+                adv = bool(getattr(self.mesh, "last_advanced", False))
+            except TypeError:
+                try:
+                    poly = self.mesh.polygon_for_box(frame_bgr, bx)
+                    adv = bool(getattr(self.mesh, "last_advanced", False))
+                except Exception:
+                    poly = None
             except Exception:
                 poly = None
         if poly is not None:
@@ -462,22 +608,27 @@ class FacePolyCache:
                 if m is not None and m["age"] <= 4:
                     try:
                         old_proj = _from_rel(m["rel"], bx)
-                        blend = _poly_iou(old_proj, poly) >= 0.72
+                        blend = _poly_iou(old_proj, poly) >= 0.55
                     except Exception:
                         blend = False
                 if blend:
                     rel = (1.0 - self.alpha) * m["rel"] + self.alpha * rel_new
+                    adv = adv or bool(m.get("advanced", False))
                 else:
                     rel = rel_new
-                self.mem[tid] = {"rel": rel, "box": bx, "age": 0}
+                self.mem[tid] = {"rel": rel, "box": bx, "age": 0,
+                                 "advanced": adv}
                 if len(self.mem) > 128:
                     self.mem.pop(next(iter(self.mem)))
+                self.last_advanced = adv
                 return _from_rel(rel, bx), True
         # 3) mesh 실패 → 옛 상대 모양을 현재 박스에 투영(고정형 점프 방지).
         if m is not None:
             m["age"] += 1
             m["box"] = bx
+            self.last_advanced = bool(m.get("advanced", False))
             return _from_rel(m["rel"], bx), False
+        self.last_advanced = False
         return None, False
 
     def drop(self, tid):

@@ -4,6 +4,7 @@ __pycache__/
 .ruff_cache/
 .pytest_cache/
 *.pt
+weights/sam2.1_hiera_tiny.pt
 !weights/yolo11n-seg.pt
 !weights/license-plate-finetune-v1n.pt
 *.pb

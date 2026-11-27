@@ -42,15 +42,33 @@ image = (
     # FFmpeg는 imageio-ffmpeg가 정적 바이너리를 제공하므로 따로 설치하지 않는다.
     .apt_install("libgl1", "libglib2.0-0", "libxcb1", "libegl1", "libgles2")
     .pip_install_from_requirements(str(ROOT / "requirements-gpu.txt"))
+    .env({"HF_HOME": "/opt/hf"})
     # 큰 seg 모델과 pose 모델 가중치를 이미지 빌드 때 받아 둔다(런타임 지연 방지).
     # 받기에 실패해도 빌드는 계속되고, 앱이 nano 모델로 대체한다.
     .run_commands(
+        # ByteTrack adapter: no-deps so supervision cannot replace OpenCV 5.
+        "pip install --no-deps supervision==0.25.1 "
+        "pydeprecate==0.16.0 defusedxml==0.7.1",
+        "pip install --no-deps "
+        "git+https://github.com/facebookresearch/sam2.git",
+        # Face-parsing weights are downloaded once at build time.
+        "mkdir -p /opt/hf && HF_HOME=/opt/hf python -c \"from transformers "
+        "import SegformerImageProcessor, SegformerForSemanticSegmentation; "
+        "n='jonathandinu/face-parsing'; "
+        "SegformerImageProcessor.from_pretrained(n); "
+        "SegformerForSemanticSegmentation.from_pretrained(n)\"",
         "mkdir -p /opt/weights",
         "python -c \"from ultralytics import YOLO; "
         "YOLO('/opt/weights/yolo11m-seg.pt'); "
         "YOLO('/opt/weights/yolo11s-seg.pt'); "
         "YOLO('/opt/weights/yolo11n-pose.pt')\"",
         # 얼굴 랜드마크 모델(약 3.7MB). 없어도 고정 얼굴형으로 동작한다.
+        # SAM 2.1 tiny (156MB) ? advanced face outlines.
+        "python -c \"import urllib.request, os; "
+        "p='/opt/weights/sam2.1_hiera_tiny.pt'; "
+        "os.path.exists(p) or urllib.request.urlretrieve("
+        "'https://huggingface.co/facebook/sam2.1-hiera-tiny/resolve/main/"
+        "sam2.1_hiera_tiny.pt', p)\"",
         "python -c \"import urllib.request, os; "
         "p='/opt/weights/face_landmarker.task'; "
         "os.path.exists(p) or urllib.request.urlretrieve("
@@ -88,6 +106,8 @@ image = (
             ".git/**",
             ".venv",
             ".venv/**",
+            ".venv_sam2",
+            ".venv_sam2/**",
             ".env",
             ".env.*",
             "users.db",
@@ -96,6 +116,12 @@ image = (
             "outputs/**",
             "docs",
             "docs/**",
+            "report_assets",
+            "report_assets/**",
+            "Mosaic_*.docx",
+            "Mosaic_*.hwpx",
+            "Mosaic_*.pdf",
+            "weights/sam2*.pt",
             ".ruff_cache",
             ".ruff_cache/**",
             ".pytest_cache",

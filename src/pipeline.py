@@ -43,6 +43,9 @@ from .face_mesh import FaceMeshRefiner, FacePolyCache
 from .offline import (backfill_and_smooth, bridge_gaps, find_gap_ranges,
                       fill_same_tid_gaps, missing_track_boxes,
                       nearest_track_values, temporal_smooth)
+from .one_euro import smooth_boxes_one_euro
+from .bytetrack_adapter import make_face_tracker
+from .ocr import (OcrLineCache, plate_text_boxes, project_text_boxes)
 from .manual import apply_manual, normalize_regions
 from .errors import RenderCancelled
 from .select import VLMSelector
@@ -109,6 +112,36 @@ def _dedupe_boxes(boxes, thresh=0.55):
         if not dup:
             out.append(b)
     return out
+
+
+def _plate_paint_boxes(plates, text_boxes):
+    """Use OCR text-line boxes where available; keep full boxes otherwise.
+
+    The plate tracker still tracks the complete plate.  Only the render list is
+    replaced, so a text box that drifts for one frame cannot leave the rest of
+    the plate exposed.
+    """
+    plates = [list(b) for b in (plates or [])]
+    texts = [list(b) for b in (text_boxes or [])]
+    if not plates or not texts:
+        return plates
+    out = []
+    for pb in plates:
+        covered = False
+        for tb in texts:
+            ix1, iy1 = max(pb[0], tb[0]), max(pb[1], tb[1])
+            ix2, iy2 = min(pb[2], tb[2]), min(pb[3], tb[3])
+            inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+            pa = max(1.0, (pb[2] - pb[0]) * (pb[3] - pb[1]))
+            if inter / pa >= 0.10:
+                covered = True
+                break
+        if covered:
+            out.extend(tb for tb in texts if _overlap_ratio(tb, pb) > 0.10)
+        else:
+            out.append(pb)
+    return [list(d["xyxy"]) for d in
+            _dedupe_boxes([{"xyxy": b} for b in out])]
 
 
 def _prior_coords(boxes):
@@ -671,6 +704,20 @@ def _poly_size_ok(poly, box, max_scale=1.6, max_area=2.2):
         return False
 
 
+def _poly_face_ok(poly, box, min_cov=0.45):
+    """SAM 2.1/face-parsing 마스크용 검증.
+
+    기존 mesh hull은 머리카락까지 포함해 '얼굴 박스 + 여백'을 80% 이상
+    덮어야 했지만, 새 마스크는 일부러 머리카락·목을 뺀다. 그래서
+    패딩된 머리 박스가 아니라 실제 검출 박스에 대한 커버리지로 검사한다.
+    """
+    if not _poly_size_ok(poly, box, max_scale=1.45, max_area=1.45):
+        return False
+    if not _poly_covers_box(poly, box, float(min_cov)):
+        return False
+    return True
+
+
 def _face_upper_ok(box, persons, max_frac=0.42, frame_h=None,
                    heads=None):
     """사람 박스 안의 얼굴이 상단에 있는지 확인한다.
@@ -788,7 +835,11 @@ def _render_face_box(frame, box, style, blocks, blur, angle=0.0,
         except Exception:
             poly = None
         if poly is not None:
-            if not _poly_covers_box(
+            _adv = bool(getattr(mesh, "last_advanced", False))
+            if _adv:
+                if not _poly_face_ok(poly, box, 0.45):
+                    poly = None
+            elif not _poly_covers_box(
                     poly, _padded_head_box(frame, box), 0.80):
                 poly = None
         if poly is not None and not _poly_size_ok(poly, box):
@@ -1149,6 +1200,10 @@ class _RenderState:
     plate_updated: int = -10 ** 9
     plate_tracker: Any = None
     prev_gray_plate: Any = None
+    plate_text_refs: Any = field(default_factory=list)
+    plate_paint_dets: Any = field(default_factory=list)
+    plate_ocr_updated: int = -10 ** 9
+    ocr_line_cache: Any = None
 
 
 @dataclass
@@ -1300,9 +1355,10 @@ class MosaicJob:
         # VLM face 박스는 신뢰할 수 있는 위치가 아니다. 사람 몸통·손·배경을
         # 얼굴로 크게 잡은 박스를 추적 초기값으로 넣으면 거대한 모자이크가
         # 생기므로, 얼굴 위치는 로컬 YuNet/포즈 보완만 사용한다.
-        tracker = FaceTracker(
+        tracker = make_face_tracker(
             max_miss=max(10, int(round(fps * 6.5))),
-            seed_miss=max(6, int(round(fps * 1.0))))
+            seed_miss=max(6, int(round(fps * 1.0))),
+            frame_rate=fps)
         pose_model = None
         head_model = None
         if os.environ.get("MOSAIC_HEAD_POSE", "1") != "0":
@@ -1789,6 +1845,12 @@ class MosaicJob:
             # 검출기 단발 미스·게이트 흔들림이 그대로 노출(깜빡임)이 되지 않게
             # 한다. 멀리 움직인 경우는 잇지 않아 고스트를 만들지 않는다.
             face_s = fill_same_tid_gaps(face_s, cuts, max_gap=8)
+            if os.environ.get("MOSAIC_ONEEURO", "1") != "0":
+                try:
+                    face_s = smooth_boxes_one_euro(face_s, cuts, fps=fps)
+                    head_s = smooth_boxes_one_euro(head_s, cuts, fps=fps)
+                except Exception:
+                    log.exception("One Euro 얼굴 박스 평활 실패")
             # 오래 못 보고 멀리 흘러간 박스는 2패스에서 mesh로 먼저 확인한다.
             # mesh가 얼굴을 찾으면 그 모양으로 그리고, 못 찾아도 마스크를
             # 빼지 않는다(노출보다 유지 우선). 갓 놓친 얼굴(6프레임 이내)은
@@ -1844,8 +1906,14 @@ class MosaicJob:
             if not cap.isOpened():
                 raise RuntimeError(f"입력 영상을 열 수 없습니다: {input_path}")
             region_flow = RegionFlow()
-            face_cache = FacePolyCache(mesh_refiner)
-            head_cache = FacePolyCache(mesh_refiner)
+            face_cache = FacePolyCache(mesh_refiner, advanced=True)
+            head_cache = FacePolyCache(mesh_refiner, advanced=False)
+            try:
+                doc_ocr_cache = OcrLineCache(
+                    refresh_every=max(1, int(os.environ.get(
+                        "MOSAIC_OCR_DOC_EVERY", "8"))))
+            except Exception:
+                doc_ocr_cache = None
             plate_dets: list = []
             plate_updated = -10 ** 9
             _detect_plates = None
@@ -1854,6 +1922,14 @@ class MosaicJob:
             _plate_tracker = None
             plate_every = 2
             veh_model = None
+            plate_text_refs = []
+            plate_paint_dets = []
+            plate_ocr_updated = -10 ** 9
+            try:
+                plate_ocr_every = max(1, int(os.environ.get(
+                    "MOSAIC_OCR_EVERY", "6")))
+            except (TypeError, ValueError):
+                plate_ocr_every = 6
             try:
                 from .plates import _every as _plate_every
                 from .plates import detect_plates as _detect_plates
@@ -1940,6 +2016,33 @@ class MosaicJob:
                     if (_plate_tracker is None and plate_dets
                             and done - plate_updated > 30):
                         plate_dets = []
+                    # OCR text-line masks: run on the plate crop only, not the
+                    # whole frame.  Between OCR passes the lines are shifted
+                    # with the tracked plate, and a plate without a text box
+                    # keeps its full-box mask as a safe fallback.
+                    if plate_dets and "license_plate" in targets:
+                        try:
+                            if (not plate_text_refs
+                                    or done - plate_ocr_updated
+                                    >= plate_ocr_every):
+                                refs = []
+                                for _pb in plate_dets:
+                                    _tb = plate_text_boxes(frame, _pb)
+                                    if _tb:
+                                        refs.append((list(_pb), _tb))
+                                plate_text_refs = refs
+                                plate_ocr_updated = done
+                            _proj = project_text_boxes(
+                                plate_text_refs, plate_dets)
+                            plate_paint_dets = _plate_paint_boxes(
+                                plate_dets, _proj)
+                        except Exception:
+                            log.exception("번호판 OCR 마스크 실패")
+                            plate_text_refs = []
+                            plate_paint_dets = list(plate_dets)
+                    elif not plate_dets:
+                        plate_text_refs = []
+                        plate_paint_dets = []
                     orig_frame = (frame.copy() if self.manual_regions
                                   else None)
                     # 첫 프레임은 트랙 초기화 전이라 일부 얼굴이 빠질 수
@@ -1955,6 +2058,10 @@ class MosaicJob:
                             (kv[1][1] + kv[1][3]) / 2.0,
                             -((kv[1][2] - kv[1][0])
                               * (kv[1][3] - kv[1][1]))))
+                    try:
+                        face_cache.precompute(frame, ordered_faces)
+                    except Exception:
+                        log.exception("얼굴 마스크 사전 계산 실패")
                     for tid, box in ordered_faces:
                         # 위쪽(얼굴) 박스를 먼저 그린다. 몸통/가슴으로
                         # 내려간 중복 트랙이 얼굴 마스크를 밀어내지 않게 한다.
@@ -1994,10 +2101,15 @@ class MosaicJob:
                                         (box, (0, 255, 0), f"F{tid}"))
                                     continue
                         poly, _fresh = face_cache.polygon(frame, tid, box)
-                        if (poly is not None
-                                and _poly_covers_box(
-                                    poly, _padded_head_box(frame, box), 0.80)
-                                and _poly_size_ok(poly, box)):
+                        _adv = bool(getattr(face_cache, "last_advanced", False))
+                        _poly_ok = (
+                            _poly_face_ok(poly, box, 0.45)
+                            if _adv else
+                            (poly is not None
+                             and _poly_covers_box(
+                                 poly, _padded_head_box(frame, box), 0.80)
+                             and _poly_size_ok(poly, box)))
+                        if _poly_ok:
                             if render_face_polygon(
                                     frame, poly, style=style, blocks=blocks,
                                     blur=blur, block_size=bs):
@@ -2055,16 +2167,34 @@ class MosaicJob:
                             region_flow, cat, region_samples.get(cat),
                             sidx, done, stride)
                         if cat == "license_plate" and plate_dets:
+                            _paint = plate_paint_dets or plate_dets
                             try:
                                 boxes = RegionFlow.merge(
                                     boxes,
                                     [dict(xyxy=list(b), conf=0.9,
                                           category="license_plate",
                                           region_type="region",
-                                          source="local-plate")
-                                     for b in plate_dets])
+                                          source="local-plate-ocr"
+                                          if plate_paint_dets
+                                          else "local-plate")
+                                     for b in _paint])
                             except Exception:
                                 pass
+                        if cat in ("address", "id_card", "phone_screen",
+                                   "name_tag") and doc_ocr_cache is not None:
+                            _expanded = []
+                            for _b in boxes:
+                                _lb = doc_ocr_cache.lines_for(
+                                    frame, cat, _b["xyxy"], done)
+                                if _lb:
+                                    for _xy in _lb:
+                                        _item = dict(_b)
+                                        _item["xyxy"] = list(_xy)
+                                        _item["ocr_line"] = True
+                                        _expanded.append(_item)
+                                else:
+                                    _expanded.append(_b)
+                            boxes = _expanded
                         for b in _dedupe_boxes(boxes):
                             x1, y1, x2, y2 = b["xyxy"]
                             if not plausible_box(cat, x1, y1, x2, y2, W, H):
@@ -2073,23 +2203,27 @@ class MosaicJob:
                                     (x1, y1, x2, y2), W, H,
                                     region_max_area):
                                 continue
+                            _ocr_line = bool(b.get("ocr_line"))
                             # 옷/가방 위 텍스트가 주소·간판으로 잡히면
                             # 사람 몸통을 크게 덮는다. 사람 박스 안 영역은
-                            # 배경 간판/문서로 보지 않는다.
-                            if persons_now and _region_on_person(
-                                    (x1, y1, x2, y2), persons_now):
+                            # 배경 간판/문서로 보지 않는다. 단, OCR이 실제
+                            # 글자선을 확인한 경우에는 손에 든 문서도 가린다.
+                            if (persons_now and not _ocr_line
+                                    and _region_on_person(
+                                        (x1, y1, x2, y2), persons_now)):
                                 continue
                             if not region_has_detail(frame, (x1, y1, x2, y2),
                                                      cat):
                                 continue
                             bsz = (max(4, min(12, min(x2 - x1, y2 - y1) // 4))
                                    if cat == "license_plate" else None)
-                            if render_region(frame, x1, y1, x2, y2,
-                                             style=style, blocks=blocks,
-                                             blur=blur,
-                                             pad=region_pad_for(
-                                                 cat, x2 - x1, y2 - y1),
-                                             block_size=bsz):
+                            if render_region(
+                                    frame, x1, y1, x2, y2,
+                                    style=style, blocks=blocks,
+                                    blur=blur,
+                                    pad=(1 if _ocr_line else region_pad_for(
+                                        cat, x2 - x1, y2 - y1)),
+                                    block_size=bsz):
                                 rendered_region_cats.add(cat)
                                 rendered_cats.add(cat)
 
@@ -2202,9 +2336,16 @@ class MosaicJob:
         rs.MAX_MISS = 4 if plan.blanket_cats else 8
         rs.progress_base = 0.0 if p.fast_person_only else 0.5
         rs.region_flow = RegionFlow()
-        rs.face_trk = FaceTracker(
+        try:
+            rs.ocr_line_cache = OcrLineCache(
+                refresh_every=max(1, int(os.environ.get(
+                    "MOSAIC_OCR_DOC_EVERY", "8"))))
+        except Exception:
+            rs.ocr_line_cache = None
+        rs.face_trk = make_face_tracker(
             max_miss=max(24, int(round(p.fps * 3.0))),
-            seed_miss=max(8, int(round(p.fps * 1.0))))
+            seed_miss=max(8, int(round(p.fps * 1.0))),
+            frame_rate=p.fps)
         try:
             rs.face_mesh = FaceMeshRefiner.shared()
             if not rs.face_mesh.available():
@@ -2212,11 +2353,11 @@ class MosaicJob:
         except Exception:
             rs.face_mesh = None
         try:
-            rs.face_poly_cache = FacePolyCache(rs.face_mesh)
+            rs.face_poly_cache = FacePolyCache(rs.face_mesh, advanced=True)
         except Exception:
             rs.face_poly_cache = None
         try:
-            rs.head_poly_cache = FacePolyCache(rs.face_mesh)
+            rs.head_poly_cache = FacePolyCache(rs.face_mesh, advanced=False)
         except Exception:
             rs.head_poly_cache = None
         try:
@@ -2929,10 +3070,15 @@ class MosaicJob:
             except Exception:
                 bs = None
             poly, _fresh = cache.polygon(fc.frame, tid, fbox)
-            if (poly is not None
-                    and _poly_covers_box(
-                        poly, _padded_head_box(fc.frame, fbox), 0.80)
-                    and _poly_size_ok(poly, fbox)
+            _adv = bool(getattr(cache, "last_advanced", False))
+            _poly_ok = (
+                _poly_face_ok(poly, fbox, 0.45)
+                if _adv else
+                (poly is not None
+                 and _poly_covers_box(
+                     poly, _padded_head_box(fc.frame, fbox), 0.80)
+                 and _poly_size_ok(poly, fbox)))
+            if (_poly_ok
                     and render_face_polygon(
                     fc.frame, poly, style=self.style, blocks=self.blocks,
                     blur=self.blur, block_size=bs)):
@@ -3016,6 +3162,16 @@ class MosaicJob:
         except Exception:
             log.exception("얼굴 검출 실패(사람 경로)")
             fc.faces_now = []
+        if fc.faces_now:
+            try:
+                cache = getattr(rs, "face_poly_cache", None)
+                if cache is not None:
+                    cache.precompute(
+                        fc.frame,
+                        [(getattr(b, "tid", -i - 1), b)
+                         for i, b in enumerate(fc.faces_now)])
+            except Exception:
+                log.exception("얼굴 마스크 사전 계산 실패(사람 경로)")
         if "face" in plan.blanket_cats:
             for _fb in fc.faces_now:
                 self._draw_face(p, rs, fc, _fb)
@@ -3391,18 +3547,67 @@ class MosaicJob:
                 and getattr(rs, "plate_tracker", None) is None \
                 and rs.done - getattr(rs, "plate_updated", 0) > 30:
             rs.plate_dets = []
+        if "license_plate" in plan.region_cats \
+                and getattr(rs, "plate_dets", None):
+            try:
+                try:
+                    every = max(1, int(os.environ.get(
+                        "MOSAIC_OCR_EVERY", "6")))
+                except (TypeError, ValueError):
+                    every = 6
+                if (not getattr(rs, "plate_text_refs", None)
+                        or rs.done - getattr(rs, "plate_ocr_updated",
+                                            -10 ** 9) >= every):
+                    refs = []
+                    for _pb in rs.plate_dets:
+                        _tb = plate_text_boxes(fc.r.orig_img, _pb)
+                        if _tb:
+                            refs.append((list(_pb), _tb))
+                    rs.plate_text_refs = refs
+                    rs.plate_ocr_updated = rs.done
+                proj = project_text_boxes(
+                    getattr(rs, "plate_text_refs", []), rs.plate_dets)
+                rs.plate_paint_dets = _plate_paint_boxes(
+                    rs.plate_dets, proj)
+            except Exception:
+                log.exception("번호판 OCR 마스크 실패")
+                rs.plate_text_refs = []
+                rs.plate_paint_dets = list(rs.plate_dets)
+        else:
+            rs.plate_text_refs = []
+            rs.plate_paint_dets = []
         for cat in plan.region_cats:
             boxes = _flow_region_boxes(
                 rs.region_flow, cat, p.region_samples.get(cat),
                 fc.sidx, rs.done, p.keyframe_stride)
+            if cat in ("address", "id_card", "phone_screen", "name_tag") \
+                    and getattr(rs, "ocr_line_cache", None) is not None:
+                _expanded = []
+                for _b in boxes:
+                    _lb = rs.ocr_line_cache.lines_for(
+                        fc.r.orig_img, cat, _b["xyxy"], rs.done)
+                    if _lb:
+                        for _xy in _lb:
+                            _item = dict(_b)
+                            _item["xyxy"] = list(_xy)
+                            _item["ocr_line"] = True
+                            _expanded.append(_item)
+                    else:
+                        _expanded.append(_b)
+                boxes = _expanded
             if cat == "license_plate" and getattr(rs, "plate_dets", None):
                 try:
+                    _paint = (getattr(rs, "plate_paint_dets", None)
+                              or rs.plate_dets)
                     boxes = RegionFlow.merge(
                         boxes,
                         [dict(xyxy=list(b), conf=0.9,
                               category="license_plate",
-                              region_type="region", source="local-plate")
-                         for b in rs.plate_dets])
+                              region_type="region",
+                              source="local-plate-ocr"
+                              if getattr(rs, "plate_paint_dets", None)
+                              else "local-plate")
+                         for b in _paint])
                 except Exception:
                     pass
             persons_now = []
@@ -3417,17 +3622,20 @@ class MosaicJob:
                     continue
                 # 옷/가방/몸통 위 간판·휴대폰 박스가 사람을 크게 덮으면
                 # 배경 영역으로 보지 않는다. (얼굴만 모드와 같은 기준)
-                if persons_now and _region_on_person(
-                        (x1, y1, x2, y2), persons_now):
+                _ocr_line = bool(b.get("ocr_line"))
+                if (persons_now and not _ocr_line
+                        and _region_on_person(
+                            (x1, y1, x2, y2), persons_now)):
                     continue
                 if not region_has_detail(frame, (x1, y1, x2, y2),
                                          cat):
                     continue
-                if render_region(frame, x1, y1, x2, y2,
-                                 style=self.style, blocks=self.blocks,
-                                 blur=self.blur,
-                                 pad=region_pad_for(
-                                     cat, x2 - x1, y2 - y1)):
+                if render_region(
+                        frame, x1, y1, x2, y2,
+                        style=self.style, blocks=self.blocks,
+                        blur=self.blur,
+                        pad=(1 if _ocr_line else region_pad_for(
+                            cat, x2 - x1, y2 - y1))):
                     rs.rendered_region_cats.add(cat)
                     rs.rendered_cats.add(cat)
                     fc.debug_boxes.append(
