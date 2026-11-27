@@ -104,15 +104,27 @@ class FaceMeshRefiner:
             crop = frame_bgr[cy1:cy2, cx1:cx2]
             if min(crop.shape[:2]) < MIN_SIDE:
                 return None
+            # 작은 얼굴은 원본 crop 그대로 넣으면 FaceLandmarker가
+            # 놓치기 쉽다. 최소 192px까지 확대한 뒤 좌표를 원래
+            # 프레임 좌표로 되돌린다. (검출 결과만 확대, 원본은 유지)
+            scale = max(1.0, min(3.0, 192.0 / max(1.0, min(crop.shape[:2]))))
+            if scale > 1.05:
+                crop_for_mesh = cv2.resize(
+                    crop, None, fx=scale, fy=scale,
+                    interpolation=cv2.INTER_CUBIC)
+            else:
+                crop_for_mesh = crop
+                scale = 1.0
             import mediapipe as mp
-            rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            rgb = cv2.cvtColor(crop_for_mesh, cv2.COLOR_BGR2RGB)
             res = self._landmarker.detect(
                 mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
             if not res.face_landmarks:
                 return None
             fl = res.face_landmarks[0]
             pts = np.array(
-                [[p.x * (cx2 - cx1) + cx1, p.y * (cy2 - cy1) + cy1]
+                [[p.x * (cx2 - cx1) / scale + cx1,
+                  p.y * (cy2 - cy1) / scale + cy1]
                  for p in fl], np.float32)
             hull = cv2.convexHull(pts.reshape(-1, 1, 2)).reshape(-1, 2)
             if len(hull) < 8:
