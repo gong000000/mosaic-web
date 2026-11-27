@@ -9,6 +9,8 @@ line boxes stay inside their plate, and the GPU client degrades to ``None``.
 import numpy as np
 
 from src.bytetrack_adapter import (bytetrack_available, make_face_tracker)
+from src.face_mesh import FacePolyCache, _poly_area
+from src.face_seg import _choose_face_polygon
 from src.faces import FaceTracker
 from src.gpu_client import remote_face_masks, remote_ocr_lines, worker_url
 from src.ocr import _dedupe, _pad_line, project_text_boxes
@@ -109,3 +111,38 @@ def test_gpu_client_disabled_returns_none(monkeypatch):
     frame = np.zeros((32, 32, 3), np.uint8)
     assert remote_face_masks(frame, [[0, 0, 10, 10]]) is None
     assert remote_ocr_lines(frame, [0, 0, 10, 10], "doc") is None
+
+
+def test_glasses_prefer_parser_polygon():
+    box = [100, 100, 200, 200]
+    sam = np.array([[130, 140], [130, 160], [140, 170], [160, 170],
+                    [170, 160], [170, 140], [160, 130], [140, 130]])
+    parse = np.array([[98, 110], [98, 190], [110, 202], [190, 202],
+                      [202, 190], [202, 110], [190, 98], [110, 98]])
+    glasses = _choose_face_polygon(sam, parse, 0.05, box)
+    no_glasses = _choose_face_polygon(sam, parse, 0.0, box)
+    assert glasses is not None and no_glasses is not None
+    assert _poly_area(glasses) > _poly_area(sam) * 2.0
+
+
+class _JumpMesh:
+    def __init__(self):
+        self.calls = 0
+        self.last_advanced = True
+
+    def polygon_for_box(self, frame, box, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return np.array([[130, 130], [170, 130], [170, 170], [130, 170]])
+        return np.array([[105, 105], [195, 105], [195, 195], [105, 195]])
+
+
+def test_mask_area_cannot_jump_up():
+    frame = np.zeros((320, 320, 3), np.uint8)
+    box = [100, 100, 200, 200]
+    cache = FacePolyCache(_JumpMesh(), advanced=True)
+    first, _ = cache.polygon(frame, 1, box, force=True)
+    second, _ = cache.polygon(frame, 1, box, force=True)
+    a1, a2 = _poly_area(first), _poly_area(second)
+    assert a1 > 0 and a2 > 0
+    assert a2 <= a1 * 1.35

@@ -377,6 +377,29 @@ def _poly_iou(a, b):
     return inter / max(1.0, aa + ba - inter)
 
 
+def _poly_area(poly):
+    try:
+        return abs(float(cv2.contourArea(
+            np.asarray(poly, np.float32).reshape(-1, 1, 2))))
+    except Exception:
+        return 0.0
+
+
+def _scale_poly_to_area(poly, box, target_area):
+    """Scale a polygon around the face-box centre to a target area."""
+    area = _poly_area(poly)
+    if area <= 1.0 or target_area <= 1.0:
+        return poly
+    try:
+        f = (float(target_area) / area) ** 0.5
+        x1, y1, x2, y2 = [float(v) for v in box[:4]]
+        c = np.array([[(x1 + x2) / 2.0, (y1 + y2) / 2.0]], np.float32)
+        p = np.asarray(poly, np.float32).reshape(-1, 2)
+        return np.round(c + (p - c) * f).astype(np.int32)
+    except Exception:
+        return poly
+
+
 def _resample_closed(poly, n=48):
     """닫힌 폴리곤을 둘레 길이 기준 n개 점으로 다시 샘플링.
 
@@ -602,6 +625,34 @@ class FacePolyCache:
             except Exception:
                 poly = None
         if poly is not None:
+            # A SAM/parser mask can occasionally jump to hair, a hand or a
+            # larger head outline for one frame.  Clamp the area against the
+            # previous frame so the mosaic cannot blink or suddenly grow.
+            if m is not None:
+                try:
+                    old_proj = _from_rel(m["rel"], bx)
+                    old_area = _poly_area(old_proj)
+                    new_area = _poly_area(poly)
+                    if old_area > 1.0 and new_area > 1.0:
+                        try:
+                            max_grow = float(os.environ.get(
+                                "MOSAIC_FACE_MASK_MAX_GROW", "1.20"))
+                        except (TypeError, ValueError):
+                            max_grow = 1.20
+                        try:
+                            min_keep = float(os.environ.get(
+                                "MOSAIC_FACE_MASK_MIN_GROW", "0.85"))
+                        except (TypeError, ValueError):
+                            min_keep = 0.85
+                        ratio = new_area / old_area
+                        if ratio > max_grow:
+                            poly = _scale_poly_to_area(
+                                poly, bx, old_area * max_grow)
+                        elif ratio < min_keep:
+                            poly = _scale_poly_to_area(
+                                poly, bx, old_area)
+                except Exception:
+                    pass
             rel_new = _resample_closed(_to_rel(poly, bx), 48)
             if rel_new is not None:
                 blend = False

@@ -69,11 +69,16 @@ def _decode(image_b64):
 
 @app.get("/health")
 def health():
+    # Health intentionally warms the models: the first dashboard/keepalive
+    # probe should prove that SAM 2.1 and face parsing actually load, not just
+    # that the FastAPI process is alive.
     seg = FaceSegmentation.shared()
+    sam2 = bool(seg._sam_available())
+    face_parse = bool(seg._parse_available())
     return {
         "ok": True,
-        "sam2": bool(getattr(seg, "_sam_ok", False)),
-        "face_parse": bool(getattr(seg, "_parse_ok", False)),
+        "sam2": sam2,
+        "face_parse": face_parse,
         "device": getattr(seg, "_dev", "cpu"),
     }
 

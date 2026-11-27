@@ -34,8 +34,11 @@ SAM2_CONFIG = os.environ.get(
 SAM2_MAX_SIDE = 1280
 SAM2_MIN_SCORE = 0.45
 
-# face-parsing label ids used by jonathandinu/face-parsing
+# face-parsing label ids used by jonathandinu/face-parsing.
+# 3 = eye_g (glasses).  It is intentionally included: an intersection with
+# SAM2 can otherwise remove the glasses and expose the eyes.
 PARSE_FACE_IDS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 15})
+GLASSES_MIN_FRAC = 0.004
 
 
 def _env_on(name, default="1"):
@@ -181,6 +184,35 @@ def _intersect_polygons(a, b):
     return poly + np.array([x1, y1], np.int32)
 
 
+def _choose_face_polygon(sam, parse, glasses_frac, box):
+    """Choose a safe face polygon, keeping glasses covered.
+
+    SAM 2 commonly excludes spectacle frames/lenses from its box mask.  When
+    the parser reports the ``eye_g`` class, prefer the parser polygon (it has
+    the glasses class) and grow it slightly instead of intersecting with SAM.
+    Otherwise keep the existing intersection behaviour for a tighter contour.
+    """
+    if parse is not None and float(glasses_frac) >= GLASSES_MIN_FRAC:
+        p = _grow_polygon(parse, box, ratio=0.025)
+        if _polygon_quality(p, box):
+            return p
+    if sam is not None and parse is not None:
+        # Intersection removes hair/hat/neck from SAM while keeping the
+        # outer boundary the parser may under-segment.
+        inter = _intersect_polygons(sam, parse)
+        if inter is not None:
+            inter = _grow_polygon(inter, box, ratio=0.012)
+            if _polygon_quality(inter, box):
+                return inter
+    if parse is not None and _polygon_quality(parse, box):
+        parse = _grow_polygon(parse, box, ratio=0.020)
+        if _polygon_quality(parse, box):
+            return parse
+    if sam is not None:
+        return _grow_polygon(sam, box, ratio=0.010)
+    return None
+
+
 class FaceSegmentation:
     """Lazy SAM 2.1 + face-parsing wrapper shared by all render threads."""
 
@@ -199,6 +231,7 @@ class FaceSegmentation:
         self._parse_ok = None
         self._dev = "cpu"
         self._run_lock = threading.RLock()
+        self.last_parse_glasses = 0.0
 
     @classmethod
     def shared(cls):
@@ -357,6 +390,7 @@ class FaceSegmentation:
     def face_parse_polygon(self, frame_bgr, box):
         if not self._parse_available():
             return None
+        self.last_parse_glasses = 0.0
         try:
             h, w = frame_bgr.shape[:2]
             bb = _clip_box(box, w, h)
@@ -382,6 +416,7 @@ class FaceSegmentation:
                     logits, size=crop.shape[:2], mode="bilinear",
                     align_corners=False)
                 lab = up.argmax(1)[0].detach().cpu().numpy()
+            self.last_parse_glasses = float(np.mean(lab == 3))
             mask = np.isin(lab, list(PARSE_FACE_IDS)).astype(np.uint8)
             if int(mask.sum()) < 0.15 * mask.size:
                 return None
@@ -405,27 +440,13 @@ class FaceSegmentation:
         self._sam_available()
         if use_parse and self._parse_ok is None:
             self._parse_available()
+        self.last_parse_glasses = 0.0
         sam = (self.sam2_polygon(frame_bgr, box)
                if (use_sam2 and self._sam_ok) else None)
         parse = (self.face_parse_polygon(frame_bgr, box)
                  if (use_parse and self._parse_ok) else None)
-        if sam is not None and parse is not None:
-            # Intersection removes hair/hat/neck from SAM while keeping the
-            # outer boundary the parser may under-segment.
-            inter = _intersect_polygons(sam, parse)
-            if inter is not None:
-                inter = _grow_polygon(inter, box, ratio=0.012)
-                if _polygon_quality(inter, box):
-                    return inter
-        if parse is not None and _polygon_quality(parse, box):
-            # The parser gives the cleanest hair/neck boundary.  Grow a
-            # little to cover the jaw/ear edge that is often one pixel thin.
-            parse = _grow_polygon(parse, box, ratio=0.020)
-            if _polygon_quality(parse, box):
-                return parse
-        if sam is not None:
-            return _grow_polygon(sam, box, ratio=0.010)
-        return None
+        return _choose_face_polygon(sam, parse,
+                                    self.last_parse_glasses, box)
 
 
 def _grow_polygon(poly, box, ratio=0.015):

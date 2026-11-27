@@ -40,7 +40,7 @@ image = (
     # ultralytics가 opencv-python(GUI)을 의존성으로 함께 설치하므로
     # libGL/libxcb가 필요하다. mediapipe 랜드마크는 libEGL을 쓴다.
     # FFmpeg는 imageio-ffmpeg가 정적 바이너리를 제공하므로 따로 설치하지 않는다.
-    .apt_install("libgl1", "libglib2.0-0", "libxcb1", "libegl1", "libgles2")
+    .apt_install("git", "libgl1", "libglib2.0-0", "libxcb1", "libegl1", "libgles2")
     .pip_install_from_requirements(str(ROOT / "requirements-gpu.txt"))
     .env({"HF_HOME": "/opt/hf"})
     # 큰 seg 모델과 pose 모델 가중치를 이미지 빌드 때 받아 둔다(런타임 지연 방지).
@@ -52,11 +52,12 @@ image = (
         "pip install --no-deps "
         "git+https://github.com/facebookresearch/sam2.git",
         # Face-parsing weights are downloaded once at build time.
-        "mkdir -p /opt/hf && HF_HOME=/opt/hf python -c \"from transformers "
-        "import SegformerImageProcessor, SegformerForSemanticSegmentation; "
-        "n='jonathandinu/face-parsing'; "
-        "SegformerImageProcessor.from_pretrained(n); "
-        "SegformerForSemanticSegmentation.from_pretrained(n)\"",
+        # Download the parser files without importing transformers at build
+        # time: on a CPU-only builder transformers 5.x can touch the CUDA
+        # accelerator while importing.  Runtime containers have the GPU.
+        "mkdir -p /opt/hf && HF_HOME=/opt/hf python -c \"from "
+        "huggingface_hub import snapshot_download; "
+        "snapshot_download('jonathandinu/face-parsing')\"",
         "mkdir -p /opt/weights",
         "python -c \"from ultralytics import YOLO; "
         "YOLO('/opt/weights/yolo11m-seg.pt'); "
@@ -214,6 +215,8 @@ def queue_keepalive():
         # 작업이 도는 동안 브라우저가 닫혀 있어도 컨테이너가 scale-down
         # 되지 않도록 스스로 health 요청을 보낸다.
         "MOSAIC_PUBLIC_URL": PUBLIC_URL,
+        # Optional separate GPU refiner; empty means in-process fallback.
+        "MOSAIC_GPU_WORKER": os.environ.get("MOSAIC_GPU_WORKER", ""),
         "PYTHONUNBUFFERED": "1",
     },
 )

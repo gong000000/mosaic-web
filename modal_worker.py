@@ -22,7 +22,7 @@ app = modal.App(APP_NAME)
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("libgl1", "libglib2.0-0", "libxcb1", "libegl1", "libgles2",
+    .apt_install("git", "libgl1", "libglib2.0-0", "libxcb1", "libegl1", "libgles2",
                  "ffmpeg")
     .pip_install_from_requirements(str(ROOT / "requirements-worker.txt"))
     # SAM 2 is a research repo; install without dependencies so it cannot
@@ -36,11 +36,8 @@ image = (
         "os.path.exists(p) or urllib.request.urlretrieve("
         "'https://huggingface.co/facebook/sam2.1-hiera-tiny/resolve/main/"
         "sam2.1_hiera_tiny.pt', p)\"",
-        "HF_HOME=/opt/hf python -c \"from transformers import "
-        "SegformerImageProcessor, SegformerForSemanticSegmentation; "
-        "n='jonathandinu/face-parsing'; "
-        "SegformerImageProcessor.from_pretrained(n); "
-        "SegformerForSemanticSegmentation.from_pretrained(n)\"",
+        "HF_HOME=/opt/hf python -c \"from huggingface_hub import "
+        "snapshot_download; snapshot_download('jonathandinu/face-parsing')\"",
     )
     .add_local_dir(
         str(ROOT / "src"),
