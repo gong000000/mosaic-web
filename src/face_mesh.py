@@ -120,16 +120,28 @@ class FaceMeshRefiner:
         return self._mesh_available() or self._skin_available()
 
     def polygon_for_box(self, frame_bgr, box):
-        """얼굴 외곽 폴리곤. mesh 우선, 실패하면 피부 세그멘테이션 fallback.
+        """얼굴 외곽 폴리곤.
 
-        피부 세그멘테이션은 종이/손을 얼굴 피부로 오인할 수 있어 단독으로
-        사용하지 않는다. mesh가 실패한 경우에만, 얼굴 박스 중앙을 실제로
-        포함하는 피부 폴리곤일 때 fallback으로 사용한다.
+        mesh는 얼굴 전체를 안정적으로 덮지만 헤어라인·목까지 포함할 수 있고,
+        피부 세그멘테이션은 얼굴형은 정확하지만 종이/손을 오인할 수 있다.
+        둘 다 있으면 mesh 안에 충분히 겹치는 피부 폴리곤만 채택해
+        커버리지는 mesh로 보장하고 모양은 피부 마스크로 조인다.
         """
-        poly = self._mesh_polygon(frame_bgr, box)
-        if poly is not None:
-            return poly
-        return self._skin_polygon(frame_bgr, box)
+        mesh = self._mesh_polygon(frame_bgr, box)
+        skin = self._skin_polygon(frame_bgr, box)
+        if mesh is not None and skin is not None:
+            try:
+                sc = skin.mean(axis=0)
+                inside = cv2.pointPolygonTest(
+                    mesh.reshape(-1, 1, 2),
+                    (float(sc[0]), float(sc[1])), False) >= 0
+                if inside and _poly_iou(mesh, skin) >= 0.25:
+                    return skin
+            except Exception:
+                pass
+        if mesh is not None:
+            return mesh
+        return skin
 
     def _mesh_polygon(self, frame_bgr, box):
         """FaceLandmarker 478점 hull. 실패하면 None."""
