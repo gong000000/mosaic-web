@@ -384,7 +384,9 @@ def analyze_first_frame_items(frame, model, conf, imgsz,
                 box = dict(box)
                 box["xyxy"] = tightened
             # 주소·문서는 글자 위치에 맞춰 한 번 더 조인다. EAST가 글자를
-            # 못 찾으면 VLM 박스를 유지한다(노출 방지).
+            # 찾으면 그 영역만 남기고, 사람 위에 있는데 글자도 없으면
+            # 종이/부채/옷 로고를 문서로 오검출한 것으로 보고 제외한다.
+            refined = None
             try:
                 from .texts import REFINE_CATS, refine_box_with_text
                 if cat in REFINE_CATS:
@@ -397,6 +399,17 @@ def analyze_first_frame_items(frame, model, conf, imgsz,
                         box["source"] = "vlm+text"
             except Exception:
                 pass
+            if (refined is None
+                    and cat in ("address", "id_card", "phone_screen")
+                    and os.environ.get("MOSAIC_ADDRESS_EAST", "1") != "0"
+                    and cand):
+                try:
+                    from .pipeline import _region_on_person
+                    if _region_on_person(box["xyxy"],
+                                         [c["xyxy"] for c in cand]):
+                        continue
+                except Exception:
+                    pass
         if cat in prompt_set:
             box = dict(box)
             box["matches_prompt"] = True
