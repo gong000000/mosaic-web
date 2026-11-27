@@ -21,6 +21,13 @@ MODEL_PATH = os.path.join(ROOT_DIR, "weights", "face_landmarker.task")
 # 배포 이미지는 /opt/weights에 모델을 빌드 때 내려받는다.
 DEPLOY_MODEL_PATH = "/opt/weights/face_landmarker.task"
 
+# 얼굴 피부/머리카락/옷을 분리하는 경량 MediaPipe multiclass 모델.
+# mesh가 실패한 얼굴에서도 '얼굴 피부' 클래스만 골라 얼굴형 마스크를 만든다.
+SKIN_MODEL_PATH = os.path.join(
+    ROOT_DIR, "weights", "selfie_multiclass_256x256.tflite")
+DEPLOY_SKIN_MODEL_PATH = "/opt/weights/selfie_multiclass_256x256.tflite"
+SKIN_CLASS = 3  # selfie_multiclass: 0 bg, 1 hair, 2 body-skin, 3 face-skin, 4 clothes
+
 # hull을 얼마나 부풀릴지. 랜드마크 hull은 피부에 딱 붙어서 이마·헤어라인이
 # 남으면 재검출·신원 파악이 가능하므로 25% 키워 모발 경계까지 덮는다.
 GROW_RATIO = 0.25
@@ -42,6 +49,11 @@ class FaceMeshRefiner:
         self.model_path = model_path
         self._landmarker = None
         self._ok = None
+        self._skin_model_path = (
+            DEPLOY_SKIN_MODEL_PATH
+            if os.path.exists(DEPLOY_SKIN_MODEL_PATH) else SKIN_MODEL_PATH)
+        self._skin = None
+        self._skin_ok = None
 
     @classmethod
     def shared(cls):
@@ -50,7 +62,7 @@ class FaceMeshRefiner:
                 cls._instance = cls()
             return cls._instance
 
-    def available(self):
+    def _mesh_available(self):
         if self._ok is not None:
             return self._ok
         if not os.path.exists(self.model_path):
@@ -79,12 +91,49 @@ class FaceMeshRefiner:
             self._ok = False
         return self._ok
 
-    def polygon_for_box(self, frame_bgr, box):
-        """얼굴 박스에서 외곽 폴리곤(프레임 좌표). 실패하면 None.
+    def _skin_available(self):
+        if self._skin_ok is not None:
+            return self._skin_ok
+        if os.environ.get("MOSAIC_FACE_SKIN", "1") == "0":
+            self._skin_ok = False
+            return False
+        if not os.path.exists(self._skin_model_path):
+            self._skin_ok = False
+            return False
+        try:
+            from mediapipe.tasks.python import vision
+            from mediapipe.tasks.python.core import base_options as bopts
+            opts = vision.ImageSegmenterOptions(
+                base_options=bopts.BaseOptions(
+                    model_asset_path=self._skin_model_path),
+                running_mode=vision.RunningMode.IMAGE,
+                output_category_mask=True,
+                output_confidence_masks=False)
+            self._skin = vision.ImageSegmenter.create_from_options(opts)
+            self._skin_ok = True
+        except Exception:
+            self._skin = None
+            self._skin_ok = False
+        return self._skin_ok
 
-        박스보다 살짝 넓게 잘라 랜드마커에 주고, hull을 12% 키워 돌려준다.
+    def available(self):
+        return self._mesh_available() or self._skin_available()
+
+    def polygon_for_box(self, frame_bgr, box):
+        """얼굴 외곽 폴리곤. mesh 우선, 실패하면 피부 세그멘테이션 fallback.
+
+        피부 세그멘테이션은 종이/손을 얼굴 피부로 오인할 수 있어 단독으로
+        사용하지 않는다. mesh가 실패한 경우에만, 얼굴 박스 중앙을 실제로
+        포함하는 피부 폴리곤일 때 fallback으로 사용한다.
         """
-        if not self.available():
+        poly = self._mesh_polygon(frame_bgr, box)
+        if poly is not None:
+            return poly
+        return self._skin_polygon(frame_bgr, box)
+
+    def _mesh_polygon(self, frame_bgr, box):
+        """FaceLandmarker 478점 hull. 실패하면 None."""
+        if not self._mesh_available():
             return None
         try:
             x1, y1, x2, y2 = [int(v) for v in box]
@@ -148,6 +197,107 @@ class FaceMeshRefiner:
             if px2 > x2 + 0.5 * bw or py2 > y2 + 0.6 * bh:
                 return None
             return poly
+        except Exception:
+            return None
+
+    def _skin_polygon(self, frame_bgr, box):
+        """얼굴 피부 클래스만 골라 얼굴형 폴리곤을 만든다.
+
+        mesh가 실패한 작은/측면 얼굴에서도 머리카락·옷을 제외한
+        실제 피부 영역을 얻기 위한 fallback이다. 실패하면 None.
+        """
+        if not self._skin_available():
+            return None
+        try:
+            h, w = frame_bgr.shape[:2]
+            x1, y1, x2, y2 = [int(v) for v in box]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            bw, bh = x2 - x1, y2 - y1
+            if bw < 20 or bh < 20:
+                return None
+            pad = int(0.18 * max(bw, bh))
+            cx1, cy1 = max(0, x1 - pad), max(0, y1 - pad)
+            cx2, cy2 = min(w, x2 + pad), min(h, y2 + pad)
+            crop = frame_bgr[cy1:cy2, cx1:cx2]
+            if min(crop.shape[:2]) < 24:
+                return None
+            inp = cv2.resize(crop, (256, 256), interpolation=cv2.INTER_CUBIC)
+            import mediapipe as mp
+            res = self._skin.segment(
+                mp.Image(image_format=mp.ImageFormat.SRGB,
+                         data=cv2.cvtColor(inp, cv2.COLOR_BGR2RGB)))
+            mask = res.category_mask.numpy_view()
+            if mask.ndim == 3:
+                mask = mask[:, :, 0]
+            skin = (mask == SKIN_CLASS).astype(np.uint8) * 255
+            if int((skin > 0).sum()) < 0.01 * skin.size:
+                return None
+            # 얼굴 중앙과 가까운 connected component를 고른다.
+            n, labels, stats, cents = cv2.connectedComponentsWithStats(
+                skin, 8)
+            if n <= 1:
+                return None
+            cx, cy = 128.0, 128.0
+            best = None
+            best_score = -1.0
+            for lab in range(1, n):
+                area = int(stats[lab, cv2.CC_STAT_AREA])
+                if area < 0.01 * skin.size:
+                    continue
+                dist = ((cents[lab][0] - cx) ** 2
+                        + (cents[lab][1] - cy) ** 2) ** 0.5
+                score = area / (1.0 + dist * 2.0)
+                if score > best_score:
+                    best, best_score = lab, score
+            if best is None:
+                return None
+            face = (labels == best).astype(np.uint8) * 255
+            face = cv2.morphologyEx(
+                face, cv2.MORPH_CLOSE,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+            # 눈/입/안경으로 생긴 구멍을 메운다.
+            contours, _ = cv2.findContours(
+                face, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                return None
+            cnt = max(contours, key=cv2.contourArea)
+            filled = np.zeros_like(face)
+            cv2.drawContours(filled, [cnt], -1, 255, -1)
+            if cv2.contourArea(cnt) < 0.12 * face.size:
+                return None
+            filled = cv2.dilate(
+                filled, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+            contours, _ = cv2.findContours(
+                filled, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                return None
+            cnt = max(contours, key=cv2.contourArea)
+            eps = 0.006 * cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, max(1.0, eps), True).reshape(-1, 2)
+            if len(approx) < 6:
+                return None
+            sx, sy = (cx2 - cx1) / 256.0, (cy2 - cy1) / 256.0
+            poly = np.empty_like(approx)
+            poly[:, 0] = np.round(approx[:, 0] * sx + cx1).astype(np.int32)
+            poly[:, 1] = np.round(approx[:, 1] * sy + cy1).astype(np.int32)
+            # 박스에서 지나치게 벗어나면 오검출로 보고 버린다.
+            px1, py1 = poly[:, 0].min(), poly[:, 1].min()
+            px2, py2 = poly[:, 0].max(), poly[:, 1].max()
+            if px1 < x1 - 0.35 * bw or py1 < y1 - 0.45 * bh:
+                return None
+            if px2 > x2 + 0.35 * bw or py2 > y2 + 0.45 * bh:
+                return None
+            # 종이/손을 얼굴 피부로 오인한 경우를 막는다:
+            # 얼굴 박스 중앙을 포함하고, 박스 면적의 20% 이상이어야 한다.
+            center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+            if cv2.pointPolygonTest(
+                    poly.reshape(-1, 1, 2), center, False) < 0:
+                return None
+            area = abs(cv2.contourArea(poly.reshape(-1, 1, 2)))
+            if area < 0.20 * float(max(1, bw * bh)):
+                return None
+            return poly.astype(np.int32)
         except Exception:
             return None
 

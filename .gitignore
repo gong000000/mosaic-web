@@ -19,3 +19,4 @@ outputs/job_inputs/
 *.log
 users.db
 !weights/yolov11n-face.pt
+weights/selfie_multiclass_256x256.tflite

@@ -1087,8 +1087,9 @@ def test_poly_size_rejects_body_sized_hallucination():
     assert not _poly_size_ok(bad, box)
 
 
-def test_face_mesh_falls_back_without_model():
+def test_face_mesh_falls_back_without_model(monkeypatch):
     from src.face_mesh import FaceMeshRefiner
+    monkeypatch.setenv("MOSAIC_FACE_SKIN", "0")
     ref = FaceMeshRefiner(model_path="/nonexistent/model.task")
     assert not ref.available()
     assert ref.polygon_for_box(np.zeros((100, 100, 3), np.uint8),

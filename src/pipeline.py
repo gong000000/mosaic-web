@@ -1429,11 +1429,12 @@ class MosaicJob:
                     if last_persons and idx - last_persons_idx <= 8:
                         h_f, w_f = frame.shape[:2]
                         raw_dets = filter_faces_by_person(
-                            raw_dets, last_persons, min_score=0.95,
+                            raw_dets, last_persons, min_score=0.90,
                             frame_area=float(w_f * h_f))
                         raw_dets = [
                             (b, s) for b, s in raw_dets
-                            if _face_person_size_ok(b, last_persons)]
+                            if (float(s) >= 0.90
+                                or _face_person_size_ok(b, last_persons))]
                     # YOLO 얼굴 검출기: YuNet이 놓친 마스크/누운 얼굴 보완.
                     # 위쪽(이마)만 잡힌 얼굴은 마스크까지 아래로 확장한다.
                     # 얼굴 후보 검증에도 같은 결과를 재사용한다(중복 추론 방지).
@@ -1718,6 +1719,43 @@ class MosaicJob:
                             _fdict[10 ** 9 + int(_sid)] = list(_s["box"])
                         except (TypeError, ValueError, IndexError):
                             continue
+                    # 첫 프레임은 트랙 초기화가 끝나기 전이라 일부 얼굴이
+                    # 빠질 수 있다. 고신뢰 로컬 검출은 첫 프레임부터 바로
+                    # 마스크해 초기 노출을 막는다.
+                    if idx == 0:
+                        for _b, _s in raw_dets:
+                            try:
+                                if float(_s) < 0.90:
+                                    continue
+                            except (TypeError, ValueError):
+                                continue
+                            if any(_overlap_ratio(_b, list(_bb)) > 0.45
+                                   for _bb in _fdict.values()):
+                                continue
+                            _fdict[10 ** 9 + force_next] = list(_b)
+                            force_next += 1
+                        # 분석 단계의 얼굴 prior는 첫 프레임에서 트랙이
+                        # 아직 초기화되지 않은 얼굴까지 즉시 가리기 위해
+                        # 한 번만 사용한다.
+                        try:
+                            _p0 = (face_priors.get("0")
+                                   or face_priors.get(0) or [])
+                            for _coords in _prior_coords(_p0):
+                                _bx = [int(round(float(v)))
+                                       for v in _coords[:4]]
+                                _bw = _bx[2] - _bx[0]
+                                _bh = _bx[3] - _bx[1]
+                                if _bw < 20 or _bh < 20:
+                                    continue
+                                if not (0.50 <= _bw / float(_bh) <= 2.0):
+                                    continue
+                                if any(_overlap_ratio(_bx, list(_bb)) > 0.45
+                                       for _bb in _fdict.values()):
+                                    continue
+                                _fdict[10 ** 9 + force_next] = _bx
+                                force_next += 1
+                        except Exception:
+                            pass
                     face_frames.append(_fdict)
                     for t in active:
                         face_angles[idx][t.tid] = float(
@@ -1904,7 +1942,10 @@ class MosaicJob:
                         plate_dets = []
                     orig_frame = (frame.copy() if self.manual_regions
                                   else None)
-                    faces_now = face_s[done]
+                    # 첫 프레임은 트랙 초기화 전이라 일부 얼굴이 빠질 수
+                    # 있다. 다음 프레임의 트랙을 한 번 빌려 초기 노출을 막는다.
+                    _fidx = (1 if done == 0 and len(face_s) > 1 else done)
+                    faces_now = face_s[_fidx]
                     max_active = max(max_active, len(faces_now))
                     debug_marks = []
                     drawn_faces_frame = []

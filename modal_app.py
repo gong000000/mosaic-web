@@ -57,6 +57,13 @@ image = (
         "'https://storage.googleapis.com/mediapipe-models/"
         "face_landmarker/face_landmarker/float16/1/"
         "face_landmarker.task', p)\"",
+        # 얼굴 피부/머리카락/옷 분리(약 16MB, Apache-2.0).
+        "python -c \"import urllib.request, os; "
+        "p='/opt/weights/selfie_multiclass_256x256.tflite'; "
+        "os.path.exists(p) or urllib.request.urlretrieve("
+        "'https://storage.googleapis.com/mediapipe-models/"
+        "image_segmenter/selfie_multiclass_256x256/float32/1/"
+        "selfie_multiclass_256x256.tflite', p)\"",
         # 번호판 전용 검출기(YOLO11n, 약 5.5MB, AGPL-3.0).
         # 없어도 VLM 앵커만으로 동작한다.
         "python -c \"import urllib.request, os; "
