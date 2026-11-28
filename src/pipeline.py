@@ -2048,7 +2048,33 @@ class MosaicJob:
                     # 첫 프레임은 트랙 초기화 전이라 일부 얼굴이 빠질 수
                     # 있다. 다음 프레임의 트랙을 한 번 빌려 초기 노출을 막는다.
                     _fidx = (1 if done == 0 and len(face_s) > 1 else done)
-                    faces_now = face_s[_fidx]
+                    faces_now = dict(face_s[_fidx])
+                    # Tail safety: the tracker can drop a face on the last
+                    # frames because there is no future frame to interpolate
+                    # from.  That is exactly when a viewer pauses/ends the
+                    # video, so re-detect the last half-second and mask any
+                    # face the tracker missed.  Existing tracks are kept.
+                    try:
+                        _tail = max(5, int(round(float(fps) * 0.5)))
+                    except (TypeError, ValueError):
+                        _tail = 5
+                    if (done >= len(face_s) - _tail
+                            and os.environ.get(
+                                "MOSAIC_FACE_TAIL_SAFETY", "1") != "0"):
+                        try:
+                            _known = [list(b) for b in faces_now.values()]
+                            for _i, (_tb, _ts) in enumerate(
+                                    detect_faces(frame)):
+                                if not any(
+                                        _overlap_ratio(_tb, _kb) > 0.35
+                                        for _kb in _known):
+                                    _ntid = (2_000_000_000 + done * 100
+                                             + _i)
+                                    faces_now[_ntid] = [
+                                        float(v) for v in _tb]
+                                    _known.append(list(_tb))
+                        except Exception:
+                            log.exception("끝 프레임 얼굴 안전 재검출 실패")
                     max_active = max(max_active, len(faces_now))
                     debug_marks = []
                     drawn_faces_frame = []
