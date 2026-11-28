@@ -1,4 +1,4 @@
-﻿--extra-index-url https://download.pytorch.org/whl/cu126
+--extra-index-url https://download.pytorch.org/whl/cu126
 torch==2.6.0
 torchvision==0.21.0
 opencv-python-headless==5.0.0.93
@@ -14,4 +14,4 @@ fastapi==0.165.0
 uvicorn==0.54.0
 pydantic==2.14.0
 requests==2.34.2
-python-multipart==0.0.20
+python-multipart==0.0.31
