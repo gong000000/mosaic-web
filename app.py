@@ -362,7 +362,9 @@ def _render_job_card(job, pos, user):
                     st.caption(
                         f"얼굴 마스크 점검 실패: {audit.get('error')}")
             worker = (audit.get("worker") or {}) if isinstance(audit, dict) else {}
-            if worker.get("enabled"):
+            if worker and not worker.get("enabled"):
+                st.caption("?? ?? ? GPU worker ???")
+            elif worker.get("enabled"):
                 if worker.get("used") and not worker.get("fallback"):
                     st.caption(
                         "정밀 모드 · GPU worker "

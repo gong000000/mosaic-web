@@ -47,6 +47,8 @@ def available():
 
 def _get_engine():
     global _ENGINE, _ENGINE_ERR
+    if os.environ.get("MOSAIC_APP_HEAVY", "1") == "0":
+        return None
     if _ENGINE is not None:
         return _ENGINE
     if _ENGINE_ERR or not _enabled():

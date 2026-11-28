@@ -55,27 +55,12 @@ image = (
         # ByteTrack adapter: no-deps so supervision cannot replace OpenCV 5.
         "pip install --no-deps supervision==0.25.1 "
         "pydeprecate==0.16.0 defusedxml==0.7.1",
-        "pip install --no-deps "
-        "git+https://github.com/facebookresearch/sam2.git",
-        # Face-parsing weights are downloaded once at build time.
-        # Download the parser files without importing transformers at build
-        # time: on a CPU-only builder transformers 5.x can touch the CUDA
-        # accelerator while importing.  Runtime containers have the GPU.
-        "mkdir -p /opt/hf && HF_HOME=/opt/hf python -c \"from "
-        "huggingface_hub import snapshot_download; "
-        "snapshot_download('jonathandinu/face-parsing')\"",
         "mkdir -p /opt/weights",
         "python -c \"from ultralytics import YOLO; "
         "YOLO('/opt/weights/yolo11m-seg.pt'); "
         "YOLO('/opt/weights/yolo11s-seg.pt'); "
         "YOLO('/opt/weights/yolo11n-pose.pt')\"",
         # 얼굴 랜드마크 모델(약 3.7MB). 없어도 고정 얼굴형으로 동작한다.
-        # SAM 2.1 tiny (156MB) ? advanced face outlines.
-        "python -c \"import urllib.request, os; "
-        "p='/opt/weights/sam2.1_hiera_tiny.pt'; "
-        "os.path.exists(p) or urllib.request.urlretrieve("
-        "'https://huggingface.co/facebook/sam2.1-hiera-tiny/resolve/main/"
-        "sam2.1_hiera_tiny.pt', p)\"",
         "python -c \"import urllib.request, os; "
         "p='/opt/weights/face_landmarker.task'; "
         "os.path.exists(p) or urllib.request.urlretrieve("
@@ -222,7 +207,10 @@ def queue_keepalive():
         # 작업이 도는 동안 브라우저가 닫혀 있어도 컨테이너가 scale-down
         # 되지 않도록 스스로 health 요청을 보낸다.
         "MOSAIC_PUBLIC_URL": PUBLIC_URL,
-        # Optional separate GPU refiner; empty means in-process fallback.
+        # The app owns UI/queue/render only.  Heavy SAM2/OCR models live in
+        # mosaic-refiner; if it is unavailable, use the lightweight mesh/box
+        # fallback rather than loading a second copy in this container.
+        "MOSAIC_APP_HEAVY": "0",
         "MOSAIC_GPU_WORKER": os.environ.get("MOSAIC_GPU_WORKER", ""),
         "PYTHONUNBUFFERED": "1",
     },

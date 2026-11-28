@@ -45,6 +45,12 @@ def _env_on(name, default="1"):
     return os.environ.get(name, default) != "0"
 
 
+def _app_heavy():
+    # The deployed Streamlit app sets this to 0 and delegates SAM2/parser to
+    # the worker; local/CLI usage keeps the in-process models by default.
+    return os.environ.get("MOSAIC_APP_HEAVY", "1") != "0"
+
+
 def _clip_box(box, w, h):
     try:
         x1, y1, x2, y2 = [int(round(float(v))) for v in box[:4]]
@@ -247,6 +253,8 @@ class FaceSegmentation:
     # SAM 2.1
     # ------------------------------------------------------------------
     def _sam_available(self):
+        if not _app_heavy():
+            return False
         if self._sam_ok is not None:
             return self._sam_ok
         self._sam_ok = False
@@ -358,6 +366,8 @@ class FaceSegmentation:
     # Face parsing
     # ------------------------------------------------------------------
     def _parse_available(self):
+        if not _app_heavy():
+            return False
         if self._parse_ok is not None:
             return self._parse_ok
         self._parse_ok = False
@@ -437,6 +447,8 @@ class FaceSegmentation:
     def polygon_for_box(self, frame_bgr, box, use_parse=True,
                         use_sam2=True):
         """Best available face polygon, or None for the mesh fallback."""
+        if not _app_heavy():
+            return None
         self._sam_available()
         if use_parse and self._parse_ok is None:
             self._parse_available()

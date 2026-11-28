@@ -146,3 +146,13 @@ def test_mask_area_cannot_jump_up():
     a1, a2 = _poly_area(first), _poly_area(second)
     assert a1 > 0 and a2 > 0
     assert a2 <= a1 * 1.35
+
+
+def test_app_heavy_off_skips_local_models(monkeypatch):
+    monkeypatch.setenv("MOSAIC_APP_HEAVY", "0")
+    from src.face_seg import FaceSegmentation
+    from src import ocr
+    frame = np.zeros((80, 80, 3), np.uint8)
+    assert FaceSegmentation.shared().polygon_for_box(
+        frame, [10, 10, 50, 50]) is None
+    assert ocr.available() is False
