@@ -26,7 +26,7 @@ from .render import strip_audio
 from .render_service import MosaicSettings, RenderPlan
 from . import history as H
 from . import chunk_render
-from . import face_audit
+from . import face_audit, gpu_client
 
 log = logging.getLogger("mosaic.jobqueue")
 
@@ -500,6 +500,7 @@ class RenderQueue:
 
             if self.is_cancel_requested(job_id):
                 raise RenderCancelled()
+            gpu_client.reset_stats()
             stats = chunk_render.render_resumable(
                 plan, job["input_path"], output_path,
                 model_name=payload.get("model_name") or "yolo11m-seg.pt",
@@ -516,6 +517,7 @@ class RenderQueue:
                 cancel_fn=lambda: self.is_cancel_requested(job_id))
             if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
                 raise RuntimeError("결과 영상이 만들어지지 않았습니다.")
+            worker_stats = gpu_client.snapshot()
             selected = payload.get("selected_cats") or []
             if ("face" in selected
                     and os.environ.get("MOSAIC_FACE_AUDIT", "1") != "0"):
@@ -535,6 +537,7 @@ class RenderQueue:
                             preset=payload.get("preset") or "veryfast",
                             strip_audio=bool(payload.get("strip_audio")))
                         audit["fixed"] = int(fixed)
+                    audit["worker"] = worker_stats
                     if audit.get("checked") or audit.get("error"):
                         self.set_audit(job_id, audit)
                 except RenderCancelled:

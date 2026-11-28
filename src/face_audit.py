@@ -198,6 +198,15 @@ def audit_faces(input_path, output_path, cancel_fn=None):
                     pass
                 persons = (_person_boxes(person_model, fi)
                            if person_model is not None else None)
+                # A correctly masked face should not still be detectable in
+                # the rendered frame.  Check the output too; this catches the
+                # "last frames lost tracking" case where mean diff alone is
+                # just above the threshold.
+                try:
+                    out_dets = (detect_faces_rotated(fo) if rotate
+                                else detect_faces(fo))
+                except Exception:
+                    out_dets = []
                 for box, score, is_yolo in dets:
                     try:
                         x1, y1, x2, y2 = [int(round(float(v)))
@@ -247,14 +256,18 @@ def audit_faces(input_path, output_path, cancel_fn=None):
                             a[ly1:ly2, ux1:ux2], b[ly1:ly2, ux1:ux2])))
                         # 얼굴 위/아래 중 한쪽만 가려진 부분 마스크도 잡는다.
                         diff = min(diff, du, dl)
+                    visible = (diff < 8.0 and any(
+                        _box_iou(box, ob) >= 0.40 and float(oscore) >= 0.60
+                        for ob, oscore in out_dets))
                     checked += 1
-                    if diff >= threshold:
+                    if diff >= threshold and not visible:
                         continue
                     row = {"frame": int(idx),
                            "box": [int(x1), int(y1), int(x2), int(y2)],
                            "score": round(score, 3),
                            "source": "yolo" if is_yolo else "yunet",
-                           "diff": round(float(diff), 2)}
+                           "diff": round(float(diff), 2),
+                           "visible_in_output": bool(visible)}
                     suspicious.append(row)
                     side = min(x2 - x1, y2 - y1)
                     if side >= 28 and (

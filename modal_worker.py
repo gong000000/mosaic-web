@@ -25,6 +25,12 @@ image = (
     .apt_install("git", "libgl1", "libglib2.0-0", "libxcb1", "libegl1", "libgles2",
                  "ffmpeg")
     .pip_install_from_requirements(str(ROOT / "requirements-worker.txt"))
+    # rapidocr/transformers can pull OpenCV 5.1 transitively.  Keep the
+    # project-wide 5.0.0 pin that EAST/YuNet were validated against.
+    .run_commands(
+        "pip uninstall -y opencv-python opencv-python-headless || true",
+        "pip install --no-deps opencv-python-headless==5.0.0.93",
+    )
     # SAM 2 is a research repo; install without dependencies so it cannot
     # replace the project's pinned OpenCV/Torch wheels.
     .run_commands(
@@ -67,6 +73,8 @@ _worker_env = {
     timeout=1800,
     scaledown_window=300,
     max_containers=2,
+    # Shared with mosaic-web: the worker rejects requests without this token.
+    secrets=[modal.Secret.from_name("mosaic-worker-token")],
     env=_worker_env,
 )
 @modal.asgi_app(label="refiner")

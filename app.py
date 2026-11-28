@@ -361,6 +361,23 @@ def _render_job_card(job, pos, user):
                 else:
                     st.caption(
                         f"얼굴 마스크 점검 실패: {audit.get('error')}")
+            worker = (audit.get("worker") or {}) if isinstance(audit, dict) else {}
+            if worker.get("enabled"):
+                if worker.get("used") and not worker.get("fallback"):
+                    st.caption(
+                        "정밀 모드 · GPU worker "
+                        f"(얼굴 {int(worker.get('face_success') or 0)}회, "
+                        f"OCR {int(worker.get('ocr_success') or 0)}회)")
+                elif worker.get("used"):
+                    st.warning(
+                        "일부 폴백 · GPU worker 일부 실패 "
+                        f"(성공 {int(worker.get('face_success') or 0)} / "
+                        f"실패 {int(worker.get('face_failures') or 0)}"
+                        f"{', ' + str(worker.get('last_error')) if worker.get('last_error') else ''})")
+                else:
+                    st.caption(
+                        "안전 모드 · GPU worker 미사용 "
+                        f"({worker.get('last_error') or 'worker disabled'})")
             out_name = os.path.basename(out)
 
             def _after_download(jid=jid, name=out_name, path=out):

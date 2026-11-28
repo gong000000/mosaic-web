@@ -14,6 +14,7 @@ deployed as the ASGI app in ``modal_worker.py``.
 from __future__ import annotations
 
 import base64
+import hmac
 import logging
 import os
 import time
@@ -50,7 +51,15 @@ class OcrRequest(BaseModel):
 
 def _check_token(token):
     want = os.environ.get("MOSAIC_WORKER_TOKEN", "").strip()
-    if want and str(token or "").strip() != want:
+    if not want:
+        # Secure by default: an unconfigured worker is not usable.  Local
+        # development can opt in explicitly with MOSAIC_WORKER_ALLOW_ANON=1.
+        if os.environ.get("MOSAIC_WORKER_ALLOW_ANON", "0") == "1":
+            return
+        raise HTTPException(status_code=503,
+                            detail="worker token is not configured")
+    got = str(token or "").strip()
+    if not got or not hmac.compare_digest(got, want):
         raise HTTPException(status_code=401, detail="invalid worker token")
 
 
@@ -116,7 +125,8 @@ def ocr_lines(req: OcrRequest, x_worker_token: str = Header(default="")):
     else:
         boxes = document_text_boxes(
             frame, req.region or [0, 0, frame.shape[1], frame.shape[0]])
-    return {"boxes": [[int(v) for v in b] for b in boxes]}
+    return {"boxes": [[int(v) for v in b] for b in boxes],
+            "backend": "rapidocr"}
 
 
 @app.get("/")

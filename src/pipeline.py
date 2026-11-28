@@ -562,6 +562,38 @@ def _detect_heads_pose(model, frame, conf=0.18, imgsz=640, kconf=0.35,
     return out
 
 
+def _tail_face_guard(frame, faces_now, done, total, fps,
+                     detector=None):
+    """Re-detect faces on the final half-second.
+
+    The tracker/backfill cannot interpolate past the last frame, so faces
+    can disappear exactly when the viewer pauses at the end.  This helper
+    adds any untracked detection for the tail frames.
+    """
+    if os.environ.get("MOSAIC_FACE_TAIL_SAFETY", "1") == "0":
+        return dict(faces_now)
+    try:
+        tail = max(5, int(round(float(fps) * 0.5)))
+    except (TypeError, ValueError):
+        tail = 5
+    if int(done) < int(total) - tail:
+        return dict(faces_now)
+    out = dict(faces_now)
+    known = [list(b) for b in out.values()]
+    fn = detector or detect_faces
+    try:
+        dets = fn(frame)
+    except Exception:
+        return out
+    for i, (tb, _ts) in enumerate(dets):
+        if any(_overlap_ratio(tb, kb) > 0.35 for kb in known):
+            continue
+        out[2_000_000_000 + int(done) * 100 + i] = [
+            float(v) for v in tb]
+        known.append(list(tb))
+    return out
+
+
 def _faces_in_person(faces, box, margin=0.12):
     """사람 박스(약간 확장) 안에 중심이 있는 얼굴 박스 목록."""
     x1, y1, x2, y2 = [float(v) for v in box]
@@ -2049,32 +2081,8 @@ class MosaicJob:
                     # 있다. 다음 프레임의 트랙을 한 번 빌려 초기 노출을 막는다.
                     _fidx = (1 if done == 0 and len(face_s) > 1 else done)
                     faces_now = dict(face_s[_fidx])
-                    # Tail safety: the tracker can drop a face on the last
-                    # frames because there is no future frame to interpolate
-                    # from.  That is exactly when a viewer pauses/ends the
-                    # video, so re-detect the last half-second and mask any
-                    # face the tracker missed.  Existing tracks are kept.
-                    try:
-                        _tail = max(5, int(round(float(fps) * 0.5)))
-                    except (TypeError, ValueError):
-                        _tail = 5
-                    if (done >= len(face_s) - _tail
-                            and os.environ.get(
-                                "MOSAIC_FACE_TAIL_SAFETY", "1") != "0"):
-                        try:
-                            _known = [list(b) for b in faces_now.values()]
-                            for _i, (_tb, _ts) in enumerate(
-                                    detect_faces(frame)):
-                                if not any(
-                                        _overlap_ratio(_tb, _kb) > 0.35
-                                        for _kb in _known):
-                                    _ntid = (2_000_000_000 + done * 100
-                                             + _i)
-                                    faces_now[_ntid] = [
-                                        float(v) for v in _tb]
-                                    _known.append(list(_tb))
-                        except Exception:
-                            log.exception("끝 프레임 얼굴 안전 재검출 실패")
+                    faces_now = _tail_face_guard(
+                        frame, faces_now, done, len(face_s), fps)
                     max_active = max(max_active, len(faces_now))
                     debug_marks = []
                     drawn_faces_frame = []
@@ -2129,7 +2137,10 @@ class MosaicJob:
                         poly, _fresh = face_cache.polygon(frame, tid, box)
                         _adv = bool(getattr(face_cache, "last_advanced", False))
                         _poly_ok = (
-                            _poly_face_ok(poly, box, 0.45)
+                            _poly_face_ok(
+                                poly, box,
+                                float(os.environ.get(
+                                    "MOSAIC_FACE_MIN_COVER", "0.58")))
                             if _adv else
                             (poly is not None
                              and _poly_covers_box(
@@ -2153,6 +2164,24 @@ class MosaicJob:
                             track_frames[tid] += 1
                             rendered_cats.add("face")
                             drawn_faces_frame.append(box)
+                        elif os.environ.get(
+                                "MOSAIC_FACE_FAIL_CLOSED", "1") != "0":
+                            # Last-resort privacy guard: if both the polygon
+                            # and the normal box renderer fail, paint a solid
+                            # rectangle.  Never leave a detected face clear.
+                            try:
+                                fx1 = max(0, int(box[0]))
+                                fy1 = max(0, int(box[1]))
+                                fx2 = min(W - 1, int(box[2]))
+                                fy2 = min(H - 1, int(box[3]))
+                                if fx2 > fx1 and fy2 > fy1:
+                                    frame[fy1:fy2 + 1, fx1:fx2 + 1] = 0
+                                    rendered_tids.add(tid)
+                                    track_frames[tid] += 1
+                                    rendered_cats.add("face")
+                                    drawn_faces_frame.append(box)
+                            except Exception:
+                                log.exception("얼굴 fail-closed 렌더 실패")
                         debug_marks.append((box, (0, 255, 0), f"F{tid}"))
                     if DRAW_HEAD_FALLBACK:
                         for tid, head in head_s[done].items():

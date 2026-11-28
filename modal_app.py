@@ -42,6 +42,12 @@ image = (
     # FFmpeg는 imageio-ffmpeg가 정적 바이너리를 제공하므로 따로 설치하지 않는다.
     .apt_install("git", "libgl1", "libglib2.0-0", "libxcb1", "libegl1", "libgles2")
     .pip_install_from_requirements(str(ROOT / "requirements-gpu.txt"))
+    # rapidocr/transformers can pull OpenCV 5.1 transitively.  Keep the
+    # project-wide 5.0.0 pin that EAST/YuNet were validated against.
+    .run_commands(
+        "pip uninstall -y opencv-python opencv-python-headless || true",
+        "pip install --no-deps opencv-python-headless==5.0.0.93",
+    )
     .env({"HF_HOME": "/opt/hf"})
     # 큰 seg 모델과 pose 모델 가중치를 이미지 빌드 때 받아 둔다(런타임 지연 방지).
     # 받기에 실패해도 빌드는 계속되고, 앱이 nano 모델로 대체한다.
@@ -202,7 +208,8 @@ def queue_keepalive():
     volumes={DATA_DIR: data_volume},
     # GEMINI_API_KEY 는 Modal Named Secret(mosaic-gemini) 에서 읽는다.
     secrets=[modal.Secret.from_name("mosaic-gemini"),
-             modal.Secret.from_name("mosaic-admin")],
+             modal.Secret.from_name("mosaic-admin"),
+             modal.Secret.from_name("mosaic-worker-token")],
     env={
         "MOSAIC_DATA_DIR": DATA_DIR,
         "MOSAIC_SKIP_DOTENV": "1",
