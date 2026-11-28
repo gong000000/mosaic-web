@@ -19,6 +19,7 @@ import tempfile
 import time
 
 import cv2
+import numpy as np
 import streamlit as st
 
 from src.config import (CANDS, CATEGORY_TYPE, DEFAULT_GROUPS,
@@ -257,6 +258,35 @@ def _fmt_size(path):
     return f"{size / 1024:.0f} KB"
 
 
+def _scrub_frame(input_path, output_path, frame_idx, overlay=True):
+    """Read one input/output frame and highlight pixels changed by the mask."""
+    if not os.path.exists(input_path) or not os.path.exists(output_path):
+        return None, 0
+    ca = cv2.VideoCapture(input_path)
+    cb = cv2.VideoCapture(output_path)
+    ca.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+    cb.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+    ok_a, a = ca.read()
+    ok_b, b = cb.read()
+    ca.release()
+    cb.release()
+    if not ok_a or not ok_b or a is None or b is None:
+        return None, 0
+    if a.shape != b.shape:
+        b = cv2.resize(b, (a.shape[1], a.shape[0]))
+    changed = 0.0
+    if overlay:
+        d = cv2.absdiff(a, b).max(axis=2)
+        m = (d > 8).astype(np.uint8) * 255
+        m = cv2.dilate(m, np.ones((3, 3), np.uint8), iterations=1)
+        green = np.zeros_like(b)
+        green[:, :, 1] = 255
+        blend = cv2.addWeighted(b, 0.55, green, 0.45, 0)
+        b = np.where(m[:, :, None] > 0, blend, b)
+        changed = float((m > 0).mean() * 100.0)
+    return cv2.cvtColor(b, cv2.COLOR_BGR2RGB), changed
+
+
 def _job_audit(job):
     try:
         data = json.loads(job.get("audit") or "{}")
@@ -363,7 +393,7 @@ def _render_job_card(job, pos, user):
                         f"얼굴 마스크 점검 실패: {audit.get('error')}")
             worker = (audit.get("worker") or {}) if isinstance(audit, dict) else {}
             if worker and not worker.get("enabled"):
-                st.caption("?? ?? ? GPU worker ???")
+                st.caption("안전 모드 · GPU worker 미설정")
             elif worker.get("enabled"):
                 if worker.get("used") and not worker.get("fallback"):
                     st.caption(
@@ -380,6 +410,26 @@ def _render_job_card(job, pos, user):
                     st.caption(
                         "안전 모드 · GPU worker 미사용 "
                         f"({worker.get('last_error') or 'worker disabled'})")
+            with st.expander("프레임 검사 · 마스크 오버레이", expanded=False):
+                _inp = job.get("input_path") or ""
+                if not _inp or not os.path.exists(_inp):
+                    st.caption("입력 영상이 보관 기간 만료로 삭제되어 비교할 수 없습니다.")
+                else:
+                    _cap = cv2.VideoCapture(out)
+                    _total = int(_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    _cap.release()
+                    if _total > 0:
+                        _idx = st.slider("프레임", 0, max(0, _total - 1),
+                                         max(0, _total - 1), key=f"scrub_{jid}")
+                        _ov = st.checkbox("마스크 오버레이", value=True,
+                                          key=f"ov_{jid}")
+                        _img, _pct = _scrub_frame(_inp, out, _idx, overlay=_ov)
+                        if _img is not None:
+                            st.image(_img, caption=(
+                                f"{_idx} / {_total - 1} · 변경 픽셀 {_pct:.1f}%"
+                                if _ov else f"{_idx} / {_total - 1}"))
+                        else:
+                            st.caption("프레임을 읽을 수 없습니다.")
             out_name = os.path.basename(out)
 
             def _after_download(jid=jid, name=out_name, path=out):

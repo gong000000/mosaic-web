@@ -397,15 +397,23 @@ class FaceSegmentation:
             self._parse_ok = False
         return self._parse_ok
 
-    def face_parse_polygon(self, frame_bgr, box):
-        if not self._parse_available():
-            return None
-        self.last_parse_glasses = 0.0
-        try:
-            h, w = frame_bgr.shape[:2]
+    def face_parse_polygons(self, frame_bgr, boxes):
+        """Batch face parsing for several boxes (one SegFormer forward).
+
+        Glasses (``eye_g``) are kept.  Returns ``[(polygon, glasses_frac)]``
+        with ``(None, 0.0)`` for boxes that could not be parsed.
+        """
+        boxes = list(boxes or [])
+        n = len(boxes)
+        results = [(None, 0.0) for _ in range(n)]
+        if not n or not self._parse_available():
+            return results
+        h, w = frame_bgr.shape[:2]
+        items = []
+        for i, box in enumerate(boxes):
             bb = _clip_box(box, w, h)
             if bb is None:
-                return None
+                continue
             x1, y1, x2, y2 = bb
             bw, bh = x2 - x1, y2 - y1
             pad = int(0.30 * max(bw, bh))
@@ -413,37 +421,85 @@ class FaceSegmentation:
             cx2, cy2 = min(w, x2 + pad), min(h, y2 + pad)
             crop = frame_bgr[cy1:cy2, cx1:cx2]
             if crop.size == 0:
-                return None
+                continue
+            items.append((i, crop, (x1 - cx1, y1 - cy1,
+                                    x2 - cx1, y2 - cy1), (cx1, cy1)))
+        if not items:
+            return results
+        try:
             import torch
             import torch.nn.functional as F
-            rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-            inputs = self._parse_proc(
-                images=rgb, return_tensors="pt")
-            inputs = {k: v.to(self._dev) for k, v in inputs.items()}
-            with self._run_lock, torch.inference_mode():
-                logits = self._parse_model(**inputs).logits
-                up = F.interpolate(
-                    logits, size=crop.shape[:2], mode="bilinear",
-                    align_corners=False)
-                lab = up.argmax(1)[0].detach().cpu().numpy()
-            self.last_parse_glasses = float(np.mean(lab == 3))
-            mask = np.isin(lab, list(PARSE_FACE_IDS)).astype(np.uint8)
-            if int(mask.sum()) < 0.15 * mask.size:
-                return None
-            poly = _polygon_from_mask(mask, box=(x1 - cx1, y1 - cy1,
-                                                x2 - cx1, y2 - cy1),
-                                      dilate=1, approx=0.0025)
-            if poly is None:
-                return None
-            poly = poly + np.array([cx1, cy1], np.int32)
-            if not _polygon_quality(poly, box):
-                return None
-            return poly
         except Exception:
-            log.exception("face-parsing prediction failed")
-            return None
+            return results
+        try:
+            batch_size = int(os.environ.get(
+                "MOSAIC_FACE_PARSE_BATCH", "8"))
+        except (TypeError, ValueError):
+            batch_size = 8
+        batch_size = max(1, min(16, batch_size))
+        try:
+            for at in range(0, len(items), batch_size):
+                chunk = items[at:at + batch_size]
+                rgbs = [cv2.cvtColor(it[1], cv2.COLOR_BGR2RGB)
+                        for it in chunk]
+                inputs = self._parse_proc(
+                    images=rgbs, return_tensors="pt")
+                inputs = {k: v.to(self._dev) for k, v in inputs.items()}
+                with self._run_lock, torch.inference_mode():
+                    logits = self._parse_model(**inputs).logits
+                for j, (i, crop, local_box, off) in enumerate(chunk):
+                    up = F.interpolate(
+                        logits[j:j + 1], size=crop.shape[:2],
+                        mode="bilinear", align_corners=False)
+                    lab = up.argmax(1)[0].detach().cpu().numpy()
+                    glasses = float(np.mean(lab == 3))
+                    mask = np.isin(
+                        lab, list(PARSE_FACE_IDS)).astype(np.uint8)
+                    if int(mask.sum()) < 0.15 * mask.size:
+                        continue
+                    poly = _polygon_from_mask(
+                        mask, box=local_box, dilate=1, approx=0.0025)
+                    if poly is None:
+                        continue
+                    poly = poly + np.array(off, np.int32)
+                    if not _polygon_quality(poly, boxes[i]):
+                        continue
+                    results[i] = (poly, glasses)
+        except Exception:
+            log.exception("face-parsing batch prediction failed")
+        return results
 
-    # ------------------------------------------------------------------
+    def face_parse_polygon(self, frame_bgr, box):
+        result = self.face_parse_polygons(frame_bgr, [box])
+        if not result:
+            return None
+        poly, glasses = result[0]
+        self.last_parse_glasses = float(glasses)
+        return poly
+
+    def polygons_for_boxes(self, frame_bgr, boxes, use_parse=True,
+                           use_sam2=True):
+        """Batch SAM2 + parser, preserving the glasses-safe policy."""
+        boxes = list(boxes or [])
+        if not boxes or not _app_heavy():
+            return [None for _ in boxes]
+        self._sam_available()
+        if use_parse and self._parse_ok is None:
+            self._parse_available()
+        sams = []
+        for box in boxes:
+            sams.append(self.sam2_polygon(frame_bgr, box)
+                        if (use_sam2 and self._sam_ok) else None)
+        if use_parse and self._parse_ok:
+            parsed = self.face_parse_polygons(frame_bgr, boxes)
+        else:
+            parsed = [(None, 0.0) for _ in boxes]
+        out = []
+        for box, sam, (parse, glasses) in zip(boxes, sams, parsed):
+            out.append(_choose_face_polygon(
+                sam, parse, glasses, box))
+        return out
+
     def polygon_for_box(self, frame_bgr, box, use_parse=True,
                         use_sam2=True):
         """Best available face polygon, or None for the mesh fallback."""

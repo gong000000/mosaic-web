@@ -98,17 +98,27 @@ def face_masks(req: FaceRequest, x_worker_token: str = Header(default="")):
     frame = _decode(req.image_b64)
     t0 = time.time()
     seg = FaceSegmentation.shared()
+    try:
+        polys = seg.polygons_for_boxes(
+            frame, req.boxes, use_parse=req.use_parse,
+            use_sam2=req.use_sam2)
+    except Exception:
+        log.exception("worker batch face mask failed")
+        polys = []
+    if len(polys) != len(req.boxes):
+        polys = []
+        for box in req.boxes:
+            try:
+                polys.append(seg.polygon_for_box(
+                    frame, box, use_parse=req.use_parse,
+                    use_sam2=req.use_sam2))
+            except Exception:
+                log.exception("worker face mask failed box=%s", box)
+                polys.append(None)
     out = []
-    for box in req.boxes:
-        try:
-            poly = seg.polygon_for_box(
-                frame, box, use_parse=req.use_parse,
-                use_sam2=req.use_sam2)
-            out.append(None if poly is None else
-                       [[int(v) for v in p] for p in np.asarray(poly)])
-        except Exception:
-            log.exception("worker face mask failed box=%s", box)
-            out.append(None)
+    for poly in polys:
+        out.append(None if poly is None else
+                   [[int(v) for v in p] for p in np.asarray(poly)])
     return {"polygons": out,
             "ms": round((time.time() - t0) * 1000.0, 1),
             "backend": "sam2+parse"}

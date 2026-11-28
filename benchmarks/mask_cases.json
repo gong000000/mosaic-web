@@ -1,0 +1,94 @@
+{
+  "cases": [
+    {
+      "id": "glasses_face_55",
+      "video": "FACE_VIDEO",
+      "frame": 55,
+      "box": [
+        658,
+        243,
+        729,
+        332
+      ],
+      "tags": [
+        "glasses",
+        "hat"
+      ]
+    },
+    {
+      "id": "hat_dance_60",
+      "video": "DANCE_VIDEO",
+      "frame": 60,
+      "box": [
+        351,
+        406,
+        399,
+        476
+      ],
+      "tags": [
+        "hat",
+        "small"
+      ]
+    },
+    {
+      "id": "small_subway_105",
+      "video": "SUBWAY_VIDEO",
+      "frame": 105,
+      "box": [
+        626,
+        246,
+        674,
+        302
+      ],
+      "tags": [
+        "hat",
+        "small",
+        "glasses"
+      ]
+    },
+    {
+      "id": "small_street_0",
+      "video": "STREET_VIDEO",
+      "frame": 0,
+      "box": [
+        177,
+        508,
+        243,
+        592
+      ],
+      "tags": [
+        "small"
+      ]
+    },
+    {
+      "id": "profile_proxy_subway_20",
+      "video": "SUBWAY_VIDEO",
+      "frame": 20,
+      "box": [
+        645,
+        276,
+        696,
+        336
+      ],
+      "tags": [
+        "profile_proxy",
+        "small"
+      ]
+    },
+    {
+      "id": "false_positive_street",
+      "video": "STREET_VIDEO",
+      "frame": 0,
+      "box": [
+        0,
+        0,
+        220,
+        220
+      ],
+      "tags": [
+        "false_positive"
+      ],
+      "expect_faces": 0
+    }
+  ]
+}
